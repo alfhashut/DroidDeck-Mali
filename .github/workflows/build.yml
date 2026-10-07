@@ -3,7 +3,7 @@ run-name: ${{ github.event_name == 'pull_request' && format('building pr {0} on 
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, mali-gpu-experiment ]
     paths-ignore:
       - '**/*.md'
       - 'LICENSE'
@@ -31,11 +31,39 @@ env:
   PRELOAD_CACHE_VERSION: v3
 
 jobs:
+  gamescope:
+    name: Build experimental Gamescope
+    if: ${{ (github.ref_name == 'mali-gpu-experiment' || github.head_ref == 'mali-gpu-experiment') && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Build in Arch Linux ARM
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/work" -w /work menci/archlinuxarm:base-devel bash tools/gamescope/build-in-arch.sh
+          sudo chown -R "$(id -u):$(id -g)" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gamescope-patched
+          path: |
+            gamescope.tzst
+            gamescope.tzst.sha256
+          if-no-files-found: error
+
   build:
     name: Build APK
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    needs: gamescope
+    # Normal branches use the pinned release, so their Gamescope job is skipped.
+    if: ${{ !cancelled() && (needs.gamescope.result == 'success' || needs.gamescope.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      GAMESCOPE_FROM_SOURCE: ${{ needs.gamescope.result == 'success' }}
     outputs:
       variants: ${{ steps.variants.outputs.list }}
     steps:
@@ -173,7 +201,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: app/src/main/assets/linuxfs
-          key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ hashFiles('app/src/main/cpp/fakeinput_steam.cpp', 'tools/linuxfs/preload/*.c', 'tools/linuxfs/build-x86-preloads.sh', 'tools/linuxfs/fex/*', 'tools/linuxfs/clipboard/*.c', 'tools/linuxfs/ssbs/*.c', 'tools/proot/fastpath/*.c', 'tools/linuxfs/overlay/usr/local/bin/*', 'tools/linuxfs/overlay/usr/bin/**', 'tools/linuxfs/desktop/*', 'tools/gamescope/release.env', 'tools/wlroots/release.env', 'tools/linuxfs/uruntime.env', 'tools/linuxfs/licenses/*', 'tools/mangoapp/*', 'tools/msitools/**') }}
+          key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ env.GAMESCOPE_FROM_SOURCE }}-${{ hashFiles('app/src/main/cpp/fakeinput_steam.cpp', 'tools/linuxfs/preload/*.c', 'tools/linuxfs/build-x86-preloads.sh', 'tools/linuxfs/fex/*', 'tools/linuxfs/clipboard/*.c', 'tools/linuxfs/ssbs/*.c', 'tools/proot/fastpath/*.c', 'tools/linuxfs/overlay/usr/local/bin/*', 'tools/linuxfs/overlay/usr/bin/**', 'tools/linuxfs/desktop/*', 'tools/gamescope/release.env', 'tools/gamescope/patches/*.patch', 'tools/gamescope/build-in-arch.sh', 'tools/gamescope/runtime-sonames.txt', '.github/workflows/build-gamescope.yml', '.github/workflows/build.yml', 'tools/wlroots/release.env', 'tools/linuxfs/uruntime.env', 'tools/linuxfs/licenses/*', 'tools/mangoapp/*', 'tools/msitools/**') }}
 
       - name: Build libfakeinput.so and libblsession.so (glibc aarch64)
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -208,7 +236,7 @@ jobs:
           for f in tools/linuxfs/overlay/usr/bin/* tools/linuxfs/overlay/usr/bin/steamos-polkit-helpers/*; do
             [ -f "$f" ] && install -Dm644 "$f" "$D/${f#tools/linuxfs/overlay/}"
           done
-          if [ -f tools/gamescope/release.env ]; then
+          if [ "$GAMESCOPE_FROM_SOURCE" != true ] && [ -f tools/gamescope/release.env ]; then
             . tools/gamescope/release.env
             gh release download "${GAMESCOPE_TAG}" -R "${GAMESCOPE_REPO:-${GITHUB_REPOSITORY}}" -p gamescope.tzst -O gamescope.tzst
             echo "${GAMESCOPE_SHA256}  gamescope.tzst" | sha256sum -c -
@@ -278,6 +306,23 @@ jobs:
           install -Dm644 tools/linuxfs/desktop/panel.conf "$D/etc/xdg/lxqt/panel.conf"
           install -Dm644 tools/linuxfs/desktop/firefox-droiddeck.js "$D/usr/lib/firefox/defaults/pref/droiddeck.js"
           ls -lR "$D"
+
+      - name: Download current Gamescope build
+        if: env.GAMESCOPE_FROM_SOURCE == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: gamescope-patched
+          path: gamescope-component
+
+      # Always overlay the same-run component, including after a preload cache hit.
+      - name: Stage current Gamescope build
+        if: env.GAMESCOPE_FROM_SOURCE == 'true'
+        run: |
+          set -euo pipefail
+          (cd gamescope-component && sha256sum -c gamescope.tzst.sha256)
+          mkdir -p app/src/main/assets/linuxfs
+          tar --use-compress-program=unzstd -xf gamescope-component/gamescope.tzst -C app/src/main/assets/linuxfs
+          grep -a -q -F -- 'vk-enumerate-only' app/src/main/assets/linuxfs/usr/local/bin/gamescope
 
       - name: Build the x86 preloads FEX guests load (glibc 2.31)
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -432,6 +477,20 @@ jobs:
           set -o pipefail
           ./gradlew assembleRelease --console=plain -PndkVersion="$NDK_VERSION" 2>&1 | tee /tmp/build.log
           python3 tools/release/check_session_assets.py app/build/outputs/apk/release/app-release.apk
+
+      - name: Check experimental Gamescope in the APK
+        if: env.GAMESCOPE_FROM_SOURCE == 'true'
+        run: |
+          python3 - <<'PY'
+          import sys
+          import zipfile
+          with zipfile.ZipFile("app/build/outputs/apk/release/app-release.apk") as apk:
+              name = "assets/linuxfs/usr/local/bin/gamescope"
+              result = "MISSING" if name not in apk.namelist() else (
+                  "NEW" if b"vk-enumerate-only" in apk.read(name) else "OLD")
+          print(result)
+          sys.exit(0 if result == "NEW" else 1)
+          PY
 
       - name: Steam import and game environment tests
         run: python3 -m unittest discover -s tools/tests -p 'test_*.py'
