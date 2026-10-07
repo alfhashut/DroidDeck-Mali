@@ -14,15 +14,16 @@ class SystemVulkanBrokerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val status = TextView(this).apply {
-            text = "Mali Vulkan checkpoint 1\nStarting Android broker…"
+            text = "Mali Vulkan query checkpoints\nStarting Android broker…"
             setTextIsSelectable(true)
         }
         val probe = Button(this).apply { text = "Run probe via Linux/proot"; isEnabled = false }
+        val icd = Button(this).apply { text = "Run Vulkan ICD test"; isEnabled = false }
         val stop = Button(this).apply { text = "Stop broker and close"; setOnClickListener { finish() } }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
-            addView(probe); addView(stop); addView(status)
+            addView(probe); addView(icd); addView(stop); addView(status)
         }
         setContentView(ScrollView(this).apply { addView(content) })
         worker.execute {
@@ -30,8 +31,9 @@ class SystemVulkanBrokerActivity : Activity() {
                 val socket = SystemVulkanBroker.start(applicationContext)
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = "Android broker listening\nSocket: $socket\n\nPress Run probe via Linux/proot. The Linux runtime must be installed. No normal session is started."
+                        status.text = "Android broker listening\nSocket: $socket\n\nChoose the boundary probe or the query-only Vulkan ICD test. The Linux runtime must be installed. No normal session is started."
                         probe.isEnabled = true
+                        icd.isEnabled = true
                     }
                 }
             } catch (t: Throwable) {
@@ -41,6 +43,7 @@ class SystemVulkanBrokerActivity : Activity() {
         }
         probe.setOnClickListener {
             probe.isEnabled = false
+            icd.isEnabled = false
             status.text = "Querying Android Vulkan from the glibc probe via Linux/proot…"
             worker.execute {
                 val output = try {
@@ -50,7 +53,27 @@ class SystemVulkanBrokerActivity : Activity() {
                     "Probe via Linux/proot failed: $t"
                 }
                 runOnUiThread {
-                    if (!isDestroyed && !isFinishing) { status.text = output; probe.isEnabled = true }
+                    if (!isDestroyed && !isFinishing) {
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true
+                    }
+                }
+            }
+        }
+        icd.setOnClickListener {
+            probe.isEnabled = false
+            icd.isEnabled = false
+            status.text = "Querying Android Vulkan through glibc libvulkan.so.1 and the proxy ICD via Linux/proot…"
+            worker.execute {
+                val output = try {
+                    SystemVulkanBroker.runIcdTest(applicationContext)
+                } catch (t: Throwable) {
+                    Log.e("MaliVulkanBroker", "ICD test failed", t)
+                    "Vulkan ICD test via Linux/proot failed: $t"
+                }
+                runOnUiThread {
+                    if (!isDestroyed && !isFinishing) {
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true
+                    }
                 }
             }
         }

@@ -293,12 +293,13 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" app/src/main/assets/linuxfs
           ls -l app/src/main/assets/linuxfs/x86_64 app/src/main/assets/linuxfs/i386
 
-      - name: Build the opt-in Mali Vulkan boundary probe (glibc aarch64)
+      - name: Build the opt-in Mali Vulkan probes and query ICD (glibc aarch64)
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross >/dev/null
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross libvulkan-dev >/dev/null
           tools/mali-vulkan/build-probe.sh
+          tools/mali-vulkan/build-icd.sh
 
       - name: Bundle the droiddeck-esync packs
         env:

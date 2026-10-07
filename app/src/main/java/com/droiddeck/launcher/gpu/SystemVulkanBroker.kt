@@ -8,7 +8,7 @@ import com.droiddeck.launcher.runtime.LinuxRuntime
 import java.io.File
 import java.io.IOException
 
-/** Checkpoint 1 only. Call explicitly, off the main thread; normal sessions never start this. */
+/** Opt-in Vulkan query experiments. Call off the main thread; normal sessions never start this. */
 object SystemVulkanBroker {
     private const val TAG = "MaliVulkanBroker"
     private var socket: File? = null
@@ -50,6 +50,39 @@ object SystemVulkanBroker {
         }
         Log.i(TAG, "glibc probe via Linux/proot exit=$code")
         return "$output\nprobe via Linux/proot exit code=$code"
+    }
+
+    /** Uses the guest's normal libvulkan.so.1, with the proxy selected for this command only. */
+    @Synchronized
+    fun runIcdTest(context: Context): String {
+        val path = socket ?: throw IOException("Broker is not running")
+        if (!LinuxRuntime.isInstalled(context)) {
+            return "Linux runtime is not installed or is being removed.\n" +
+                "Install the Linux runtime in DroidDeck, then retry. The Android broker is still running."
+        }
+        val directory = path.parentFile
+        for (name in listOf("vulkan_loader_test", "libdroiddeck_mali_proxy.so", "mali_proxy_icd.json")) {
+            val file = File(directory, name)
+            context.assets.open("mali-vulkan/$name").use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            }
+            Os.chmod(file.path, if (name == "vulkan_loader_test") 0x1c0 else 0x180) // 0700 / 0600
+        }
+        val manifest = File(directory, "mali_proxy_icd.json")
+        val binary = File(directory, "vulkan_loader_test")
+        Log.i(TAG, "starting normal-loader ICD test via Linux/proot: ${binary.path}")
+        val output = StringBuilder()
+        // GuestCommand supplies a clean guest environment. /usr/bin/env sets these only
+        // for this child; older loaders use VK_ICD_FILENAMES, newer ones VK_DRIVER_FILES.
+        val command = listOf("/usr/bin/env", "VK_DRIVER_FILES=${manifest.path}",
+            "VK_ICD_FILENAMES=${manifest.path}", "MALI_VULKAN_BROKER_SOCKET=${path.path}",
+            "VK_LOADER_LAYERS_DISABLE=*", "VK_LOADER_DEBUG=error,warn,driver", binary.path)
+        val code = GuestCommand.run(context, command) { line ->
+            output.append(line).append('\n')
+            Log.i(TAG, "ICD/proot: $line")
+        }
+        Log.i(TAG, "Vulkan ICD test via Linux/proot exit=$code")
+        return "$output\nVulkan ICD test via Linux/proot exit code=$code"
     }
 
     @Synchronized
