@@ -135,6 +135,16 @@
             android:permission="android.permission.DUMP"
             android:theme="@style/SessionTheme" />
 
+        <!-- Explicit adb-only checkpoint; never started by the launcher or a normal session. -->
+        <activity
+            android:name=".gpu.SystemVulkanBrokerActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize"
+            android:theme="@style/SessionTheme" />
+
         <activity
             android:name=".SessionActivity"
             android:exported="false"

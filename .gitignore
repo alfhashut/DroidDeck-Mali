@@ -16,6 +16,7 @@ app/src/main/jniLibs/arm64-v8a/.proot-inputs
 app/src/main/jniLibs/arm64-v8a/libproot-loader.so
 app/src/main/jniLibs/arm64-v8a/libdirectaudiorelay.so
 app/src/main/assets/droiddeck-esync/
+app/src/main/assets/mali-vulkan/
 
 # Kotlin compiler session files (build-tool state, never source).
 .kotlin/
