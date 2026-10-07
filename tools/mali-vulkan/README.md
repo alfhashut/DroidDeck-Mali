@@ -2,7 +2,8 @@
 
 This experiment starts only through a shell-protected debug Activity. Normal sessions and driver
 selection are unchanged. Checkpoint 1 uses a direct socket probe; checkpoint 2 adds a query-only
-ICD selected explicitly for its test command. There is no Gamescope patch, rendering, or fd passing.
+ICD selected explicitly for its test command. Checkpoint 3 adds an opt-in enumeration-only Gamescope
+diagnostic. There is no rendering or fd passing.
 The broker loads the phone's installed `/system/lib64/libvulkan.so`; no vendor libraries are bundled.
 
 ## Build
@@ -33,7 +34,8 @@ adb logcat -s MaliVulkanBroker:I '*:S'
 
 For a package variant, replace the package before `/`; the Activity's class name stays the same.
 The Activity requires `android.permission.DUMP`, like the existing shell debug trampoline. It has
-no launcher entry and does not start Steam, Gamescope, the compositor, or a Linux session.
+no launcher entry. Opening it starts only the broker; Gamescope runs only through its diagnostic
+button. It does not start Steam, the Android compositor, or a normal Linux session.
 
 Install the Linux runtime through DroidDeck if it is not already installed. Keep the debug screen
 open and press **Run probe via Linux/proot**. A missing or removing runtime produces a clear message
@@ -83,7 +85,7 @@ deviceType: 1
 
 Direct execution as an Android-app child exited 159 / SIGSYS, consistent with the inherited Android
 app seccomp policy. The existing proot execution path was subsequently validated on the real phone:
-the same properties were returned with `probe via Linux/proot exit code=0`. Both debug actions use
+the same properties were returned with `probe via Linux/proot exit code=0`. All debug actions use
 this path; they do not remove or bypass Android's seccomp filter.
 
 ## Protocol and validation
@@ -153,7 +155,9 @@ proxy manifest, plus `MALI_VULKAN_BROKER_SOCKET`. These variables affect only th
 Implicit layers are disabled via `VK_LOADER_LAYERS_DISABLE=*` on loaders supporting that variable.
 The normal freedreno/Turnip manifest and every normal session's environment are unchanged.
 
-Expected phone acceptance output (host mocks alone cannot validate this):
+Checkpoint 2 also passed on the real Mali-G52: the normal runtime `libvulkan.so.1` loaded the
+proxy ICD, reached Android system Vulkan through the broker, and exited 0. Checkpoint 1 still passed.
+Validated phone output:
 
 ```text
 glibc libvulkan.so.1: vkCreateInstance=0
@@ -237,4 +241,105 @@ These new host tests use the actual broker source with test-only mocked Android 
 They cover the real host Vulkan loader, negotiation/export symbols, dispatch magic, unsupported operations,
 stable local handles, full property round trips, version-1 regression, concurrent instances, disconnect/stop,
 invalid IDs/API versions, malformed/fragmented responses, and backend errors/cleanup. Mock properties
-are explicitly named `HOST TEST ONLY`; this is not evidence that phone checkpoint 2 has passed.
+are explicitly named `HOST TEST ONLY`; the real-phone checkpoint-2 result above is separate.
+
+## Checkpoint 3: Gamescope enumeration only
+
+**Run Gamescope Vulkan enumeration test** launches the actual staged `/usr/local/bin/gamescope`
+through `GuestCommand`, with `--vk-enumerate-only` and the same command-local ICD/socket overrides
+as checkpoint 2. The original two buttons remain available. The output and exit code appear in the
+screen and logcat. A missing runtime or Gamescope produces a clear message. An old binary rejecting
+the option reports its output/exit code and asks for the rebuilt Gamescope artifact.
+
+`tools/gamescope/patches/0113-vulkan-enumerate-only.patch` targets the exact existing Gamescope
+3.16.29 build, after DroidDeck's other patches. The standalone option returns at the start of `main`,
+before scripts, tracing, X11, backend selection, or renderer initialization. It is also registered in
+the ordinary option parser and help text. The diagnostic translation unit links the same normal
+Vulkan loader as Gamescope and calls only `vkCreateInstance`, `vkEnumeratePhysicalDevices`,
+`vkGetPhysicalDeviceProperties`, and `vkDestroyInstance`. It requests API 1.0 with no layers or
+extensions, prints the real device API version, retries incomplete enumeration, and destroys the
+instance on success or any later query error. It does not call the existing Vulkan renderer path.
+No logical device, queues, shaders/resources, memory, synchronization, WSI, or presentation is added.
+The ordinary startup path remains unchanged when the option is absent.
+
+### Build and package the actual patched Gamescope
+
+The current `tools/gamescope/release.env` still pins `gamescope-3.16.29-p8`, which predates this
+diagnostic. Adding the source patch alone does **not** update that already-published binary.
+Do not test an APK containing only the old component. Build a fresh `gamescope.tzst` using the
+existing Gamescope component workflow (artifact-only, no release required), or on an ARM64 build
+host using the same container command from the repository root:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work menci/archlinuxarm:base-devel \
+  bash tools/gamescope/build-in-arch.sh
+```
+
+The script applies the full patch stack and builds the real Gamescope executable with the existing
+Arch package options. Before packing it, it checks `--help` and exercises the diagnostic's instance
+creation failure with an explicitly missing ICD, without requiring a CI GPU or Wayland server.
+The existing runtime dependency-closure check still applies.
+
+For a local checkpoint-3 APK, stage that freshly built component **after** any normal asset download
+that would restore p8, and **before** Gradle packages the APK:
+
+```sh
+mkdir -p app/src/main/assets/linuxfs
+tar --use-compress-program=unzstd -xf gamescope.tzst -C app/src/main/assets/linuxfs
+tools/mali-vulkan/build-probe.sh
+tools/mali-vulkan/build-icd.sh
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.droiddeck.launcher/com.droiddeck.launcher.gpu.SystemVulkanBrokerActivity
+adb logcat -s MaliVulkanBroker:I '*:S'
+```
+
+Use the usual Android build prerequisites and the same signing key as the installed app. If using
+the component workflow artifact, unzip its download first to obtain `gamescope.tzst`. Neither the
+release pin nor normal driver selection is changed by this checkpoint. `GuestCommand`'s existing
+`SessionFiles.stage` installs the APK's binary into an already-installed runtime before invoking it.
+
+### Phone acceptance
+
+With the Linux runtime installed, press **Run probe via Linux/proot**, then **Run Vulkan ICD test**
+to recheck checkpoints 1/2. Press **Run Gamescope Vulkan enumeration test**. Expect:
+
+```text
+gamescope: Vulkan enumeration-only (instance API 1.0, no extensions)
+gamescope: enumeration-only vkCreateInstance = VK_SUCCESS
+gamescope: physical-device count = 1
+Device 0
+deviceName: Mali-G52
+vendorID: 0x000013b5
+deviceID: 0x74021000
+apiVersion: 1.1.131
+driverVersion: 109051904
+deviceType: 1
+gamescope: destroyed enumeration-only Vulkan instance
+Gamescope Vulkan enumeration via Linux/proot exit code=0
+```
+
+There should be no renderer/device/backend startup messages or Wayland presentation errors.
+Broker logs should show only instance creation, enumeration/properties, and destruction/loader
+closure. Repeat all three actions and close the screen to verify cleanup. Retain merged output,
+exit code, and logcat on failure. Do not start Steam or a normal session for this test.
+
+### Patch and diagnostic checks
+
+With a pristine Gamescope 3.16.29 source tree and the checkpoint-2 host test prerequisites:
+
+```sh
+GAMESCOPE_SOURCE=/path/to/gamescope-3.16.29 python3 tools/gamescope/test_vk_enumerate_only.py
+python3 tools/mali-vulkan/test_probe.py
+python3 tools/mali-vulkan/test_icd.py
+bash -n tools/gamescope/build-in-arch.sh
+git diff --check
+```
+
+The Gamescope tests apply every carried patch with zero fuzz, compile the real diagnostic translation
+unit with Gamescope's C++20/no-exceptions flags, verify its four Vulkan symbol references, check early
+entry placement, and exercise success/error/zero-device/incomplete enumeration and cleanup. They
+also run that translation unit through the normal host Vulkan loader, proxy ICD, and mocked Android
+broker. This focused harness is not the complete Gamescope executable: the component build's actual
+binary checks and the real-phone test above remain necessary. Set `VULKAN_HEADERS`/`JAVA_HOME` as in
+checkpoint 2 if needed. No proprietary phone libraries are used in host tests or committed.

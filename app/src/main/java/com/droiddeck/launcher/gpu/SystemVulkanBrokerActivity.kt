@@ -19,11 +19,12 @@ class SystemVulkanBrokerActivity : Activity() {
         }
         val probe = Button(this).apply { text = "Run probe via Linux/proot"; isEnabled = false }
         val icd = Button(this).apply { text = "Run Vulkan ICD test"; isEnabled = false }
+        val gamescope = Button(this).apply { text = "Run Gamescope Vulkan enumeration test"; isEnabled = false }
         val stop = Button(this).apply { text = "Stop broker and close"; setOnClickListener { finish() } }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
-            addView(probe); addView(icd); addView(stop); addView(status)
+            addView(probe); addView(icd); addView(gamescope); addView(stop); addView(status)
         }
         setContentView(ScrollView(this).apply { addView(content) })
         worker.execute {
@@ -31,9 +32,10 @@ class SystemVulkanBrokerActivity : Activity() {
                 val socket = SystemVulkanBroker.start(applicationContext)
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = "Android broker listening\nSocket: $socket\n\nChoose the boundary probe or the query-only Vulkan ICD test. The Linux runtime must be installed. No normal session is started."
+                        status.text = "Android broker listening\nSocket: $socket\n\nChoose the boundary probe, Vulkan ICD test, or Gamescope enumeration test. The Linux runtime must be installed. No normal session is started."
                         probe.isEnabled = true
                         icd.isEnabled = true
+                        gamescope.isEnabled = true
                     }
                 }
             } catch (t: Throwable) {
@@ -44,6 +46,7 @@ class SystemVulkanBrokerActivity : Activity() {
         probe.setOnClickListener {
             probe.isEnabled = false
             icd.isEnabled = false
+            gamescope.isEnabled = false
             status.text = "Querying Android Vulkan from the glibc probe via Linux/proot…"
             worker.execute {
                 val output = try {
@@ -54,7 +57,7 @@ class SystemVulkanBrokerActivity : Activity() {
                 }
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = output; probe.isEnabled = true; icd.isEnabled = true
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true
                     }
                 }
             }
@@ -62,6 +65,7 @@ class SystemVulkanBrokerActivity : Activity() {
         icd.setOnClickListener {
             probe.isEnabled = false
             icd.isEnabled = false
+            gamescope.isEnabled = false
             status.text = "Querying Android Vulkan through glibc libvulkan.so.1 and the proxy ICD via Linux/proot…"
             worker.execute {
                 val output = try {
@@ -72,7 +76,26 @@ class SystemVulkanBrokerActivity : Activity() {
                 }
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = output; probe.isEnabled = true; icd.isEnabled = true
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true
+                    }
+                }
+            }
+        }
+        gamescope.setOnClickListener {
+            probe.isEnabled = false
+            icd.isEnabled = false
+            gamescope.isEnabled = false
+            status.text = "Enumerating Android Vulkan from Gamescope via Linux/proot (no renderer/backend initialization)…"
+            worker.execute {
+                val output = try {
+                    SystemVulkanBroker.runGamescopeEnumeration(applicationContext)
+                } catch (t: Throwable) {
+                    Log.e("MaliVulkanBroker", "Gamescope enumeration failed", t)
+                    "Gamescope Vulkan enumeration via Linux/proot failed: $t"
+                }
+                runOnUiThread {
+                    if (!isDestroyed && !isFinishing) {
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true
                     }
                 }
             }

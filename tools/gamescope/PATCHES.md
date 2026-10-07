@@ -39,5 +39,15 @@ library list, before anything is published.
   then focus is handed over again. `GAMESCOPE_RESTORE_FOCUS_WINDOW` on the root window asks for the
   same restore from outside (the session script's resume watcher).
 
+- `0113-vulkan-enumerate-only.patch` - this app: an opt-in `--vk-enumerate-only` diagnostic in
+  Gamescope 3.16.29 itself. The standalone option returns at the start of `main`, before scripts,
+  X11, tracing, renderer/backend, or Wayland setup. The ordinary option parser also recognizes it
+  before initialization. A separate translation unit calls only core Vulkan 1.0 instance creation,
+  physical-device enumeration/properties, and instance destruction through the normal loader.
+  It requests no extensions and prints the driver's real physical-device API version. No logical
+  device, queues, shaders/resources, WSI, or presentation are initialized. Without the option,
+  normal Gamescope startup is unchanged. The package build checks the option in the actual binary
+  and exercises its failure path using an explicitly missing ICD (no GPU required).
+
 Sixteen more of Armada's patches are DRM/lease/HDR-on-KMS work for a native display, which this
 app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the runtime has.

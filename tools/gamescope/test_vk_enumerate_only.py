@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Apply the complete DroidDeck patch stack to pristine Gamescope 3.16.29 and test its diagnostic.
+
+GAMESCOPE_SOURCE must name that source tree. This builds the diagnostic translation unit;
+the real packaged executable is smoke-tested by build-in-arch.sh, and on the phone.
+"""
+import importlib.util
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent
+MALI = ROOT.parent / "mali-vulkan"
+
+
+class EnumerationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = os.environ.get("GAMESCOPE_SOURCE")
+        if not source:
+            raise RuntimeError("Set GAMESCOPE_SOURCE to a pristine Gamescope 3.16.29 source tree")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="gamescope-enum-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.directory = Path(cls.temporary.name)
+        cls.source = cls.directory / "source"
+        shutil.copytree(source, cls.source, ignore=shutil.ignore_patterns(".git", "build", "builddir"))
+        cls.patch_output = ""
+        for patch in sorted((ROOT / "patches").glob("*.patch")):
+            if patch.name == "0113-vulkan-enumerate-only.patch":
+                # Validate added source whitespace, excluding the patch's context prefixes.
+                subprocess.run(["git", "apply", "--check", "--whitespace=error", str(patch)],
+                               cwd=cls.source, check=True, capture_output=True)
+            result = subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--no-backup-if-mismatch",
+                                     "-i", str(patch)], cwd=cls.source, capture_output=True, text=True, check=True)
+            cls.patch_output += result.stdout
+        cls.flags = ["-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
+                     "-fno-exceptions", "-ffast-math", "-I" + str(cls.source / "src"),
+                     "-I" + os.environ.get("VULKAN_HEADERS", "/usr/include")]
+        cls.compiler = shlex.split(os.environ.get("CXX", "c++"))
+        cls.unit = cls.source / "src/vulkan_enumerate_only.cpp"
+        cls.main = cls.directory / "diagnostic_main.cpp"
+        cls.main.write_text('#include "vulkan_enumerate_only.hpp"\nint main() { return vulkan_enumerate_only(); }\n')
+        cls.object = cls.directory / "diagnostic.o"
+        subprocess.run(cls.compiler + cls.flags + ["-c", str(cls.unit), "-o", str(cls.object)], check=True)
+        cls.mock = cls.directory / "mock-diagnostic"
+        subprocess.run(cls.compiler + cls.flags + [str(cls.object), str(cls.main),
+                       str(ROOT / "tests/mock_enumeration.cpp"), "-o", str(cls.mock)], check=True)
+        cls.normal = cls.directory / "normal-loader-diagnostic"
+        subprocess.run(cls.compiler + cls.flags + [str(cls.object), str(cls.main), "-l:libvulkan.so.1",
+                       "-o", str(cls.normal)], check=True)
+        # Reuse checkpoint 2's actual proxy/broker host fixture without changing its tests.
+        spec = importlib.util.spec_from_file_location("checkpoint2_fixture", MALI / "test_icd.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.IcdTests.setUpClass()
+        cls.addClassCleanup(module.IcdTests.doClassCleanups)
+        cls.checkpoint2 = module.IcdTests("test_normal_loader")
+
+    def run_mock(self, mode):
+        return subprocess.run([str(self.mock)], env=dict(os.environ, ENUM_TEST_MODE=mode),
+                              capture_output=True, text=True, timeout=10)
+
+    def test_patch_stack_and_early_entry(self):
+        self.assertNotIn("fuzz", self.patch_output)
+        main = (self.source / "src/main.cpp").read_text()
+        body = main[main.index("int main(int argc, char **argv)"):]
+        first_return = body.index("return vulkan_enumerate_only();")
+        self.assertLess(first_return, body.index("g_argc = argc;"))
+        parser_return = body.index("return vulkan_enumerate_only();", first_return + 1)
+        for initialization in ("HasCapSysNice()", "RaiseFdLimit()", "gpuvis_trace_init()", "RunDefaultScripts()",
+                               "XInitThreads()", "auto_select_backend()", "CheckWaylandPresentationTime()",
+                               "gamescope::IBackend::Set<", "vulkan_init_formats()", "vulkan_make_output()"):
+            self.assertLess(parser_return, body.index(initialization))
+        self.assertIn('{ "vk-enumerate-only", no_argument, nullptr, 0 }', main)
+        self.assertIn("'vulkan_enumerate_only.cpp'", (self.source / "src/meson.build").read_text())
+        subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--reverse", "--dry-run", "-i",
+                        str(ROOT / "patches/0113-vulkan-enumerate-only.patch")],
+                       cwd=self.source, check=True, capture_output=True)
+
+    def test_only_four_instance_query_calls(self):
+        symbols = subprocess.check_output(["nm", "-u", str(self.object)], text=True)
+        self.assertEqual({line.split()[-1] for line in symbols.splitlines() if line.split()[-1].startswith("vk")},
+                         {"vkCreateInstance", "vkDestroyInstance", "vkEnumeratePhysicalDevices", "vkGetPhysicalDeviceProperties"})
+        for forbidden in ("wl_display", "wlserver", "vulkan_init", "GetBackend", "CreateDevice", "QueueSubmit"):
+            self.assertNotIn(forbidden, symbols)
+
+    def test_multiple_devices_and_honest_version(self):
+        result = self.run_mock("success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for value in ("instance API 1.0, no extensions", "physical-device count = 2", "HOST MOCK GPU 0",
+                      "HOST MOCK GPU 1", "vendorID: 0x000013b5", "deviceID: 0x74021000", "apiVersion: 1.1.131",
+                      "driverVersion: 109051904", "deviceType: 1", "destroys=1 lists=1 properties=2"):
+            self.assertIn(value, result.stdout)
+
+    def test_create_error_has_no_destroy_or_device_output(self):
+        result = self.run_mock("create-error")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("vkCreateInstance failed: -9", result.stderr)
+        self.assertIn("destroys=0 lists=0 properties=0", result.stdout)
+        self.assertNotIn("deviceName:", result.stdout)
+
+    def test_enumeration_errors_destroy_instance(self):
+        for mode in ("count-error", "list-error", "always-incomplete"):
+            with self.subTest(mode=mode):
+                result = self.run_mock(mode)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("physical-device query failed:", result.stderr)
+                self.assertIn("destroys=1", result.stdout)
+                self.assertNotIn("deviceName:", result.stdout)
+                if mode == "always-incomplete":
+                    self.assertIn("lists=4", result.stdout)
+
+    def test_incomplete_list_retries_without_partial_output(self):
+        result = self.run_mock("retry")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("destroys=1 lists=2 properties=2", result.stdout)
+        self.assertEqual(result.stdout.count("deviceName:"), 2)
+
+    def test_zero_devices_is_an_honest_successful_diagnostic(self):
+        result = self.run_mock("zero")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("physical-device count = 0", result.stdout)
+        self.assertIn("destroys=1 lists=0 properties=0", result.stdout)
+
+    def test_normal_loader_proxy_broker_path(self):
+        fixture = self.checkpoint2
+        with fixture.broker() as socket:
+            manifest = str(fixture.manifest)
+            env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=socket, VK_DRIVER_FILES=manifest,
+                       VK_ICD_FILENAMES=manifest, VK_LOADER_LAYERS_DISABLE="*",
+                       DISPLAY="invalid-for-enumeration", WAYLAND_DISPLAY="invalid-for-enumeration")
+            result = subprocess.run([str(self.normal)], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for value in ("vkCreateInstance = VK_SUCCESS", "physical-device count = 1", "HOST TEST ONLY",
+                          "vendorID: 0x000013b5", "deviceID: 0x74021000", "apiVersion: 1.1.131",
+                          "destroyed enumeration-only Vulkan instance"):
+                self.assertIn(value, result.stdout)
+        self.assertIn("creates=1 destroys=1 closes=1", fixture.cleanup_output)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

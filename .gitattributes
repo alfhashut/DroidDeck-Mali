@@ -1,0 +1,2 @@
+# Unified-patch context prefixes legitimately put a space before source tabs/empty lines.
+tools/gamescope/patches/0113-vulkan-enumerate-only.patch whitespace=-space-before-tab,-blank-at-eol
