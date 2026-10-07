@@ -10,7 +10,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vulkan/vk_icd.h>
-#include "properties.h"
+#include "capability_transport.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
 #endif
@@ -21,12 +21,16 @@
 struct proxy_device {
     VK_LOADER_DATA loader;
     VkPhysicalDeviceProperties properties;
+    struct proxy_instance *owner;
+    uint32_t id;
+    struct mb_capabilities capabilities;
 };
 struct proxy_instance {
     VK_LOADER_DATA loader;
     int fd, listed;
     pthread_mutex_t lock;
     uint32_t count;
+    uint32_t wire_version;
     struct proxy_device devices[MB_MAX_DEVICES];
 };
 _Static_assert(offsetof(struct proxy_instance, loader) == 0, "instance dispatch word");
@@ -34,14 +38,15 @@ _Static_assert(offsetof(struct proxy_device, loader) == 0, "physical-device disp
 
 /* A connection owns the remote instance; IDs only have meaning on that connection. */
 static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *request,
-                    uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes) {
+                    uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
     uint8_t header[MB_HEADER_BYTES];
     mb_session_header(header, op, request_bytes);
+    mb_put_u32(header + 4, s->wire_version);
     if (mb_write(s->fd, header, sizeof(header)) || mb_write(s->fd, request, request_bytes) ||
         mb_read(s->fd, header, sizeof(header))) goto broken;
     uint32_t bytes = mb_get_u32(header + 12);
-    if (mb_get_u32(header) != MB_MAGIC || mb_get_u32(header + 4) != MB_SESSION_VERSION ||
-        mb_get_u32(header + 8) != op || bytes < MB_PREFIX_BYTES || bytes > MB_MAX_PAYLOAD) goto broken;
+    if (mb_get_u32(header) != MB_MAGIC || mb_get_u32(header + 4) != s->wire_version ||
+        mb_get_u32(header + 8) != op || bytes < MB_PREFIX_BYTES || bytes > capacity) goto broken;
     if (mb_read(s->fd, reply, bytes)) goto broken;
     *reply_bytes = bytes;
     if (mb_get_u32(reply) == MB_OK && mb_get_u32(reply + 4) == VK_SUCCESS) return VK_SUCCESS;
@@ -51,6 +56,8 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
     if (result == (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY) return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (result == (uint32_t)VK_ERROR_OUT_OF_DEVICE_MEMORY) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (result == (uint32_t)VK_ERROR_INCOMPATIBLE_DRIVER) return VK_ERROR_INCOMPATIBLE_DRIVER;
+    if (result == (uint32_t)VK_ERROR_FORMAT_NOT_SUPPORTED) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (result == (uint32_t)VK_ERROR_FEATURE_NOT_PRESENT) return VK_ERROR_FEATURE_NOT_PRESENT;
     return VK_ERROR_INITIALIZATION_FAILED;
 broken:
     LOG("socket/protocol failure on opcode=%u: %s", op, strerror(errno));
@@ -58,6 +65,8 @@ broken:
     shutdown(s->fd, SHUT_RDWR);
     return VK_ERROR_INITIALIZATION_FAILED;
 }
+
+static VkResult cap_InstanceExtensions(const char *, uint32_t *, VkExtensionProperties *);
 
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreateInfo *info,
         const VkAllocationCallbacks *allocator, VkInstance *out) {
@@ -76,7 +85,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
         if (++nodes > 16 || p->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO)
             return VK_ERROR_INITIALIZATION_FAILED;
     }
-    if (info->enabledExtensionCount) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (info->enabledExtensionCount) {
+        if (!mb_capability_mode()) return VK_ERROR_EXTENSION_NOT_PRESENT;
+        VkExtensionProperties extensions[4]; uint32_t count = 4;
+        VkResult result = cap_InstanceExtensions(NULL, &count, extensions);
+        if (result != VK_SUCCESS) return result;
+        for (uint32_t i = 0; i < info->enabledExtensionCount; ++i)
+            if (!mb_has_extension(extensions, count, info->ppEnabledExtensionNames[i])) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
     if (info->enabledLayerCount) return VK_ERROR_LAYER_NOT_PRESENT;
     uint32_t api = info->pApplicationInfo ? info->pApplicationInfo->apiVersion : 0;
     if (!api) api = VK_API_VERSION_1_0;
@@ -91,6 +107,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
     }
     struct proxy_instance *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->wire_version = mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION;
     s->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     strcpy(address.sun_path, path);
     struct timeval timeout = { .tv_sec = 10 };
@@ -104,7 +121,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
     if (pthread_mutex_init(&s->lock, NULL)) { close(s->fd); free(s); return VK_ERROR_OUT_OF_HOST_MEMORY; }
     uint8_t request[4], reply[MB_MAX_PAYLOAD]; uint32_t bytes;
     mb_put_u32(request, api);
-    VkResult result = rpc(s, MB_CREATE, request, sizeof(request), reply, &bytes);
+    VkResult result = rpc(s, MB_CREATE, request, sizeof(request), reply, &bytes, sizeof(reply));
     if (result == VK_SUCCESS && (bytes != MB_PREFIX_BYTES || mb_get_u32(reply + 8)))
         result = VK_ERROR_INITIALIZATION_FAILED;
     if (result != VK_SUCCESS) { close(s->fd); pthread_mutex_destroy(&s->lock); free(s); return result; }
@@ -120,7 +137,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_DestroyInstance(VkInstance instance, con
     struct proxy_instance *s = (struct proxy_instance *)instance;
     uint8_t reply[MB_MAX_PAYLOAD]; uint32_t bytes;
     pthread_mutex_lock(&s->lock);
-    VkResult result = rpc(s, MB_DESTROY, NULL, 0, reply, &bytes);
+    VkResult result = rpc(s, MB_DESTROY, NULL, 0, reply, &bytes, sizeof(reply));
     if (result == VK_SUCCESS && (bytes != MB_PREFIX_BYTES || mb_get_u32(reply + 8)))
         LOG("invalid destroy acknowledgement");
     close(s->fd);
@@ -132,7 +149,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_DestroyInstance(VkInstance instance, con
 
 static VkResult cache_devices(struct proxy_instance *s) {
     uint8_t reply[MB_MAX_PAYLOAD]; uint32_t bytes;
-    VkResult result = rpc(s, MB_LIST, NULL, 0, reply, &bytes);
+    VkResult result = rpc(s, MB_LIST, NULL, 0, reply, &bytes, sizeof(reply));
     if (result != VK_SUCCESS) return result;
     uint32_t count = mb_get_u32(reply + 8), ids[MB_MAX_DEVICES];
     if (count > MB_MAX_DEVICES || bytes != MB_PREFIX_BYTES + count * 4) return VK_ERROR_INITIALIZATION_FAILED;
@@ -142,12 +159,27 @@ static VkResult cache_devices(struct proxy_instance *s) {
     }
     for (uint32_t i = 0; i < count; ++i) {
         uint8_t request[4]; mb_put_u32(request, ids[i]);
-        result = rpc(s, MB_PROPERTIES, request, sizeof(request), reply, &bytes);
+        result = rpc(s, MB_PROPERTIES, request, sizeof(request), reply, &bytes, sizeof(reply));
         if (result != VK_SUCCESS) return result;
         if (bytes != MB_PREFIX_BYTES + MB_PROPERTIES_BYTES || mb_get_u32(reply + 8) != 1 ||
             mb_decode_properties(reply + MB_PREFIX_BYTES, &s->devices[i].properties))
             return VK_ERROR_INITIALIZATION_FAILED;
         set_loader_magic_value(&s->devices[i]);
+        s->devices[i].owner = s; s->devices[i].id = ids[i];
+        if (s->wire_version == MB_CAP_VERSION) {
+            uint8_t *wide = malloc(MB_CAP_MAX_PAYLOAD);
+            if (!wide) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            result = rpc(s, MB_CAPS, request, sizeof(request), wide, &bytes, MB_CAP_MAX_PAYLOAD);
+            if (result == VK_SUCCESS && (bytes != MB_PREFIX_BYTES + MB_PROPERTIES_BYTES + MB_CAPS_BYTES ||
+                mb_get_u32(wide + 8) != 1 || mb_decode_properties(wide + MB_PREFIX_BYTES, &s->devices[i].properties) ||
+                mb_decode_capabilities(wide + MB_PREFIX_BYTES + MB_PROPERTIES_BYTES, &s->devices[i].capabilities)))
+            {
+                LOG("invalid capability snapshot; no proxy device published");
+                result = VK_ERROR_INITIALIZATION_FAILED;
+            }
+            free(wide);
+            if (result != VK_SUCCESS) return result;
+        }
     }
     /* Properties are immutable for an instance. Fetch before publishing any handles,
      * so a failed RPC can be reported by enumeration rather than a void query. */
@@ -183,37 +215,49 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_EnumerateInstanceVersion(uint32_t *v
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_EnumerateInstanceExtensionProperties(const char *layer,
         uint32_t *count, VkExtensionProperties *extensions) {
+    if (mb_capability_mode()) return cap_InstanceExtensions(layer, count, extensions);
     (void)extensions;
     if (layer) return VK_ERROR_LAYER_NOT_PRESENT;
     *count = 0; return VK_SUCCESS;
 }
 
-/* The loader requires these core dispatch slots even for enumeration. They describe
- * the proxy's empty capabilities, not Android rendering capabilities. Nothing here
- * creates a device, submits work, allocates GPU memory, or reaches the vendor driver. */
+#include "capability_icd.h"
+
+/* Core dispatch slots are required even for enumeration. Version 2 retains its
+ * empty capabilities; the opt-in version-3 session forwards real query data.
+ * These calls never create a device, submit work or allocate GPU resources. */
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceFeatures(VkPhysicalDevice d, VkPhysicalDeviceFeatures *p) {
+    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { *p = ((struct proxy_device *)d)->capabilities.core; return; }
     (void)d; memset(p, 0, sizeof(*p));
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceFormatProperties(VkPhysicalDevice d, VkFormat f, VkFormatProperties *p) {
+    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { cap_Format(d, f, p, NULL); return; }
     (void)d; (void)f; memset(p, 0, sizeof(*p));
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice d, VkFormat f,
         VkImageType t, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties *p) {
+    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) return cap_Image(d, f, t, tiling, usage, flags, 0, 0, 0, p, NULL);
     (void)d; (void)f; (void)t; (void)tiling; (void)usage; (void)flags; memset(p, 0, sizeof(*p));
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice d, uint32_t *count,
-        VkQueueFamilyProperties *p) { (void)d; (void)p; *count = 0; }
+        VkQueueFamilyProperties *p) {
+    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { cap_Queues(d, count, p); return; }
+    (void)d; (void)p; *count = 0;
+}
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice d, VkPhysicalDeviceMemoryProperties *p) {
+    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { *p = ((struct proxy_device *)d)->capabilities.memory; return; }
     (void)d; memset(p, 0, sizeof(*p));
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_EnumerateDeviceExtensionProperties(VkPhysicalDevice d, const char *layer,
         uint32_t *count, VkExtensionProperties *p) {
+    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) return cap_DeviceExtensions(d, layer, count, p);
     (void)d; return proxy_EnumerateInstanceExtensionProperties(layer, count, p);
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice d, VkFormat f,
         VkImageType t, VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageTiling tiling,
         uint32_t *count, VkSparseImageFormatProperties *p) {
+    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { cap_Sparse(d, f, t, samples, usage, tiling, count, p); return; }
     (void)d; (void)f; (void)t; (void)samples; (void)usage; (void)tiling; (void)p; *count = 0;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice d, const VkDeviceCreateInfo *info,
@@ -243,6 +287,7 @@ static PFN_vkVoidFunction physical_proc(const char *name) {
     ENTRY(GetPhysicalDeviceSparseImageFormatProperties)
     ENTRY(EnumerateDeviceExtensionProperties)
     ENTRY(CreateDevice)
+    if (mb_capability_mode()) return cap_proc(name);
     return NULL;
 }
 EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char *name) {

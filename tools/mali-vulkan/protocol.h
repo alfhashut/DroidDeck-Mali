@@ -44,6 +44,35 @@
 #define MB_LIST 4u
 #define MB_PROPERTIES 5u
 
+/* Version 3 is opt-in capability inspection. Versions 1/2 retain their wire contract.
+ * GLOBAL (empty, one-shot): Android loader version + complete instance extension list.
+ * CREATE/LIST/PROPERTIES/DESTROY retain version-2 layouts on a version-3 connection.
+ * CAPS (device ID): fixed capability snapshot defined by capabilities_fields.def.
+ * FORMAT (ID, format): base format flags + bounded DRM modifier records.
+ * IMAGE (ID, format, type, tiling, usage, flags, handle type, modifier-present,
+ *        uint64 modifier): image limits + external-memory flags.
+ * BUFFER (ID, flags, usage, handle type), SEMAPHORE/FENCE (ID, handle type).
+ * SPARSE (ID, format, type, samples, usage, tiling): bounded sparse-format records.
+ * All fields use LE u32/u64 or fixed byte arrays. No pNext, native structs or handles.
+ * MB_UNSUPPORTED means NOT QUERIED; it is distinct from a successful zero capability.
+ */
+#define MB_CAP_VERSION 3u
+#define MB_GLOBAL 6u
+#define MB_CAPS 7u
+#define MB_FORMAT 8u
+#define MB_IMAGE 9u
+#define MB_BUFFER 10u
+#define MB_SEMAPHORE 11u
+#define MB_FENCE 12u
+#define MB_SPARSE 13u
+#define MB_UNSUPPORTED 6u
+#define MB_CAP_MAX_PAYLOAD 131072u
+#define MB_MAX_EXTENSIONS 256u
+#define MB_MAX_QUEUES 64u
+#define MB_MAX_MODIFIERS 128u
+#define MB_MAX_SPARSE 64u
+#define MB_EXTENSION_BYTES 260u
+
 static inline uint32_t mb_get_u32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;

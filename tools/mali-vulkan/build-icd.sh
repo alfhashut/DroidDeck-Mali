@@ -19,5 +19,6 @@ flags=(-std=c11 -O2 -Wall -Wextra -Werror -idirafter "$headers")
 "$compiler" "${flags[@]}" -shared -fPIC -fvisibility=hidden -Wl,-z,defs \
     "$repo_root/tools/mali-vulkan/icd_proxy.c" -pthread -o "$output/libdroiddeck_mali_proxy.so"
 "$compiler" "${flags[@]}" "$repo_root/tools/mali-vulkan/loader_test.c" -ldl -o "$output/vulkan_loader_test"
+"$compiler" "${flags[@]}" "$repo_root/tools/mali-vulkan/capability_inventory.c" -o "$output/capability_inventory"
 cp -- "$repo_root/tools/mali-vulkan/mali_proxy_icd.json" "$output/mali_proxy_icd.json"
 printf 'Built query-only AArch64 glibc ICD and normal-loader test: %s\n' "$output"

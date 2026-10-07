@@ -5,6 +5,7 @@
 #include <jni.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -13,7 +14,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "protocol.h"
-#include "properties.h"
+#include "capabilities.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__)
 #define ERROR(...) __android_log_print(ANDROID_LOG_ERROR, "MaliVulkanBroker", __VA_ARGS__)
@@ -35,10 +36,18 @@ struct vk_session {
     PFN_vkDestroyInstance destroy;
     PFN_vkEnumeratePhysicalDevices enumerate;
     PFN_vkGetPhysicalDeviceProperties properties;
+    PFN_vkGetInstanceProcAddr gipa;
+    uint32_t native_api, enabled_queries;
     VkPhysicalDevice devices[MB_MAX_DEVICES];
     uint32_t count;
     int listed;
 };
+
+static const char *const query_extensions[] = {
+    "VK_KHR_get_physical_device_properties2", "VK_KHR_external_memory_capabilities",
+    "VK_KHR_external_semaphore_capabilities", "VK_KHR_external_fence_capabilities",
+};
+static VkResult native_global(void *, uint32_t *, uint32_t *, VkExtensionProperties *);
 
 static void close_session(struct vk_session *s) {
     if (s->instance) { s->destroy(s->instance, NULL); LOG("destroyed Vulkan instance"); }
@@ -46,8 +55,8 @@ static void close_session(struct vk_session *s) {
     memset(s, 0, sizeof(*s));
 }
 
-static uint32_t open_session(struct vk_session *s, uint32_t api, VkResult *result) {
-    /* The proxy supports core instance queries at 1.0, with no extensions. */
+static uint32_t open_session(struct vk_session *s, uint32_t api, VkResult *result, int capabilities) {
+    /* The glibc instance API remains 1.0; v3 enables only native query extensions. */
     if (VK_API_VERSION_VARIANT(api) || VK_API_VERSION_MAJOR(api) != 1 ||
         VK_API_VERSION_MINOR(api) != 0) {
         *result = VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -57,12 +66,33 @@ static uint32_t open_session(struct vk_session *s, uint32_t api, VkResult *resul
     if (!s->library) { ERROR("Android libvulkan load failed: %s", dlerror()); return MB_LOADER_ERROR; }
     LOG("loaded Android /system/lib64/libvulkan.so");
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(s->library, "vkGetInstanceProcAddr");
+    s->gipa = gipa;
     PFN_vkCreateInstance create = gipa ? (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance") : NULL;
     s->destroy = (PFN_vkDestroyInstance)dlsym(s->library, "vkDestroyInstance");
     if (!create || !s->destroy) { ERROR("system loader missing instance entry points"); return MB_LOADER_ERROR; }
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "DroidDeck query broker", .apiVersion = api };
     VkInstanceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+    const char *enabled[4];
+    if (capabilities) {
+        uint32_t version, n;
+        VkExtensionProperties extensions[MB_MAX_EXTENSIONS];
+        *result = native_global(s->library, &version, &n, extensions);
+        if (*result != VK_SUCCESS) return MB_VULKAN_ERROR;
+        /* Only the broker uses native 1.1 queries; the glibc ICD still supports API 1.0.
+         * On a 1.0 loader, enable the actually-reported KHR query extensions instead. */
+        app.apiVersion = version >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+        for (unsigned i = 0; i < 4; ++i) {
+            if (mb_has_extension(extensions, n, query_extensions[i])) {
+                enabled[info.enabledExtensionCount++] = query_extensions[i];
+                s->enabled_queries |= 1u << i;
+            }
+        }
+        info.ppEnabledExtensionNames = enabled;
+        LOG("capability instance: native API=%u.%u.%u query extensions=%u", VK_VERSION_MAJOR(app.apiVersion),
+            VK_VERSION_MINOR(app.apiVersion), VK_VERSION_PATCH(app.apiVersion), info.enabledExtensionCount);
+    }
+    s->native_api = app.apiVersion;
     VkInstance instance = VK_NULL_HANDLE;
     *result = create(&info, NULL, &instance);
     LOG("vkCreateInstance result=%d", (int)*result);
@@ -105,11 +135,13 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
         index, p->deviceName, p->vendorID, p->deviceID, p->apiVersion, p->driverVersion, (unsigned)p->deviceType);
 }
 
+#include "capability_queries.h"
+
 /* Preserve the original version-1 one-shot probe and its six-field reply. */
 static uint32_t query_devices(uint8_t *payload) {
     struct vk_session s = {0};
     VkResult result = VK_SUCCESS;
-    uint32_t status = open_session(&s, VK_API_VERSION_1_0, &result), count = 0;
+    uint32_t status = open_session(&s, VK_API_VERSION_1_0, &result, 0), count = 0;
     if (status == MB_OK) status = list_devices(&s, &result);
     if (status == MB_OK && !s.count) status = MB_NO_DEVICES;
     if (status == MB_OK) {
@@ -134,7 +166,7 @@ static uint32_t query_devices(uint8_t *payload) {
 static void serve(int fd) {
     struct vk_session s = {0};
     for (;;) {
-        uint8_t header[MB_HEADER_BYTES], request[4], payload[MB_MAX_PAYLOAD] = {0};
+        uint8_t header[MB_HEADER_BYTES], request[40], payload[MB_CAP_MAX_PAYLOAD] = {0};
         if (mb_read(fd, header, sizeof(header))) break;
         uint32_t version = mb_get_u32(header + 4), op = mb_get_u32(header + 8);
         uint32_t request_bytes = mb_get_u32(header + 12), bytes = MB_PREFIX_BYTES;
@@ -149,11 +181,29 @@ static void serve(int fd) {
             if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes))
                 ERROR("write probe response: %s", strerror(errno));
             break;
-        } else if (version != MB_SESSION_VERSION ||
+        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION) ||
                    (request_bytes && mb_read(fd, request, request_bytes))) {
             finish = 1;
+        } else if (version == MB_CAP_VERSION && op == MB_GLOBAL && !request_bytes && !s.library) {
+            void *library = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+            uint32_t api = 0;
+            VkExtensionProperties extensions[MB_MAX_EXTENSIONS];
+            status = MB_LOADER_ERROR;
+            if (library) {
+                result = native_global(library, &api, &count, extensions);
+                status = result == VK_SUCCESS ? MB_OK : MB_VULKAN_ERROR;
+                if (status == MB_OK) {
+                    mb_put_u32(payload + MB_PREFIX_BYTES, api);
+                    mb_encode_extensions(payload + MB_PREFIX_BYTES + 4, extensions, count);
+                    bytes += 4 + count * MB_EXTENSION_BYTES;
+                    LOG("Android loader API=%u.%u.%u instance extensions=%u", VK_VERSION_MAJOR(api),
+                        VK_VERSION_MINOR(api), VK_VERSION_PATCH(api), count);
+                } else count = 0;
+                dlclose(library);
+            } else ERROR("Android global inventory load failed: %s", dlerror());
+            finish = 1;
         } else if (op == MB_CREATE && request_bytes == 4 && !s.library) {
-            status = open_session(&s, mb_get_u32(request), &result);
+            status = open_session(&s, mb_get_u32(request), &result, version == MB_CAP_VERSION);
             finish = status != MB_OK;
             /* Live instances may idle. Stop shuts down every connection to wake reads. */
             struct timeval no_timeout = {0};
@@ -174,6 +224,17 @@ static void serve(int fd) {
                 mb_encode_properties(payload + MB_PREFIX_BYTES, &p);
                 status = MB_OK; count = 1; bytes += MB_PROPERTIES_BYTES;
             } else finish = 1;
+        } else if (version == MB_CAP_VERSION && op == MB_CAPS && request_bytes == 4 && s.instance && s.listed) {
+            uint32_t id = mb_get_u32(request);
+            if (id && id <= s.count) {
+                status = native_snapshot(&s, id, payload + MB_PREFIX_BYTES, &result);
+                if (status == MB_OK) { count = 1; bytes += MB_PROPERTIES_BYTES + MB_CAPS_BYTES; }
+            } else finish = 1;
+        } else if (version == MB_CAP_VERSION && op >= MB_FORMAT && op <= MB_SPARSE && s.instance && s.listed) {
+            uint32_t extra = 0;
+            status = native_extra(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (status == MB_OK) bytes += extra;
+            else { count = 0; if (status == MB_UNSUPPORTED) result = VK_ERROR_FEATURE_NOT_PRESENT; }
         } else if (op == MB_DESTROY && !request_bytes && s.instance) {
             close_session(&s); status = MB_OK; finish = 1;
         } else {
@@ -182,6 +243,7 @@ static void serve(int fd) {
         mb_put_u32(payload, status); mb_put_u32(payload + 4, (uint32_t)result); mb_put_u32(payload + 8, count);
         if (version == MB_VERSION) mb_header(header, bytes);
         else mb_session_header(header, op, bytes);
+        if (version == MB_CAP_VERSION) mb_put_u32(header + 4, MB_CAP_VERSION);
         LOG("query RPC opcode=%u status=%u VkResult=%d count=%u", op, status, (int)result, count);
         if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes)) {
             ERROR("write response: %s", strerror(errno)); break;

@@ -65,6 +65,7 @@ strip --strip-unneeded out/usr/local/bin/gamescope || true
 # An explicitly missing ICD must fail at instance creation in the diagnostic path.
 out/usr/local/bin/gamescope --help > out/gamescope-help.log 2>&1
 grep -F -- '--vk-enumerate-only' out/gamescope-help.log
+grep -F -- '--vk-capabilities' out/gamescope-help.log
 set +e
 env VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
   VK_LOADER_LAYERS_DISABLE='*' out/usr/local/bin/gamescope --vk-enumerate-only > out/gamescope-enumeration.log 2>&1
@@ -74,6 +75,14 @@ cat out/gamescope-enumeration.log
 test "$ENUM_STATUS" -eq 1
 grep -F 'gamescope: Vulkan enumeration-only (instance API 1.0, no extensions)' out/gamescope-enumeration.log
 grep -F 'gamescope: enumeration-only vkCreateInstance failed:' out/gamescope-enumeration.log
+set +e
+env VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
+  VK_LOADER_LAYERS_DISABLE='*' out/usr/local/bin/gamescope --vk-capabilities > out/gamescope-capabilities.log 2>&1
+CAP_STATUS=$?
+set -e
+cat out/gamescope-capabilities.log
+test "$CAP_STATUS" -eq 1
+grep -F 'gamescope: capabilities vkCreateInstance failed:' out/gamescope-capabilities.log
 # Every NEEDED library must be one the runtime ships, or the binary would not load there.
 NEEDED=$(readelf -d out/usr/local/bin/gamescope | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
 echo "NEEDED: $NEEDED"

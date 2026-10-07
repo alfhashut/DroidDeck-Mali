@@ -1,0 +1,397 @@
+From: DroidDeck
+Subject: [PATCH] main: opt-in Vulkan capability inspection without a logical device
+
+diff --git a/src/main.cpp b/src/main.cpp
+index ba42b00..aa0c29c 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -26,6 +26,7 @@
+ #include "steamcompmgr.hpp"
+ #include "rendervulkan.hpp"
+ #include "vulkan_enumerate_only.hpp"
++#include "vulkan_capabilities.hpp"
+ #include "wlserver.hpp"
+ #include "convar.h"
+ #include "gpuvis_trace_utils.h"
+@@ -62,6 +63,7 @@ const struct option *gamescope_options = (struct option[]){
+ 	{ "help", no_argument, nullptr, 0 },
+ 	{ "version", no_argument, nullptr, 0 },
+ 	{ "vk-enumerate-only", no_argument, nullptr, 0 },
++	{ "vk-capabilities", no_argument, nullptr, 0 },
+ 	{ "nested-width", required_argument, nullptr, 'w' },
+ 	{ "nested-height", required_argument, nullptr, 'h' },
+ 	{ "nested-refresh", required_argument, nullptr, 'r' },
+@@ -172,6 +174,7 @@ const char usage[] =
+ 	"Options:\n"
+ 	"  --help                         show help message\n"
+ 	"  --vk-enumerate-only            print Vulkan devices and exit without initializing a renderer/backend\n"
++	"  --vk-capabilities              print Vulkan capabilities without initializing a renderer/backend\n"
+ 	"  -W, --output-width             output width\n"
+ 	"  -H, --output-height            output height\n"
+ 	"  -w, --nested-width             game width\n"
+@@ -720,6 +723,8 @@ int main(int argc, char **argv)
+ 	// The standalone diagnostic exits before any normal startup, including scripts/X11.
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-enumerate-only" ) == 0 )
+ 		return vulkan_enumerate_only();
++	if ( argc == 2 && strcmp( argv[1], "--vk-capabilities" ) == 0 )
++		return vulkan_capabilities();
+ 
+ 	g_argc = argc;
+ 	g_argv = argv;
+@@ -798,6 +803,8 @@ int main(int argc, char **argv)
+ 					return 0;
+ 				} else if (strcmp(opt_name, "vk-enumerate-only") == 0) {
+ 					return vulkan_enumerate_only();
++				} else if (strcmp(opt_name, "vk-capabilities") == 0) {
++					return vulkan_capabilities();
+ 				} else if (strcmp(opt_name, "version") == 0) {
+ 					gamescope::PrintVersion();
+ 					return 0;
+diff --git a/src/meson.build b/src/meson.build
+index 707570b..115c5de 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -111,6 +111,7 @@ src = [
+   'color_helpers.cpp',
+   'main.cpp',
+   'vulkan_enumerate_only.cpp',
++  'vulkan_capabilities.cpp',
+   'edid.cpp',
+   'wlserver.cpp',
+   'vblankmanager.cpp',
+diff --git a/src/vulkan_capabilities.hpp b/src/vulkan_capabilities.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/vulkan_capabilities.hpp
+@@ -0,0 +1,4 @@
++#pragma once
++
++// Standalone query diagnostic: no device, renderer or backend.
++int vulkan_capabilities();
+diff --git a/src/vulkan_capabilities.cpp b/src/vulkan_capabilities.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/vulkan_capabilities.cpp
+@@ -0,0 +1,322 @@
++// Opt-in capability queries through the normal loader. Never creates a logical device.
++#include "vulkan_capabilities.hpp"
++#include <stdio.h>
++#include <initializer_list>
++#include <string.h>
++#include <vulkan/vulkan.h>
++
++static bool has(const VkExtensionProperties *p, uint32_t n, const char *name)
++{
++    for (uint32_t i = 0; i < n; ++i)
++        if (!strcmp(p[i].extensionName, name)) return true;
++    return false;
++}
++static void version(const char *label, uint32_t v)
++{
++    printf("%s: %u.%u.%u\n", label, VK_VERSION_MAJOR(v), VK_VERSION_MINOR(v), VK_VERSION_PATCH(v));
++}
++static void external_memory(const char *label, const VkExternalMemoryProperties &p)
++{
++    printf("%s: features=0x%x importable=%u exportable=%u dedicated-only=%u export-from-imported=0x%x compatible=0x%x\n",
++        label, p.externalMemoryFeatures, !!(p.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT),
++        !!(p.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT),
++        !!(p.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT),
++        p.exportFromImportedHandleTypes, p.compatibleHandleTypes);
++}
++int vulkan_capabilities()
++{
++    printf("gamescope: Vulkan capability queries (instance API 1.0, no logical device/backend)\n");
++    uint32_t loader_version = VK_API_VERSION_1_0;
++    auto enumerate_version = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"));
++    if (enumerate_version && enumerate_version(&loader_version) != VK_SUCCESS) return 1;
++    version("glibc loader instance API (not the proxy implementation ceiling)", loader_version);
++    VkExtensionProperties instance_extensions[256] = {};
++    uint32_t instance_count = 256;
++    VkResult result = vkEnumerateInstanceExtensionProperties(nullptr, &instance_count, instance_extensions);
++    if (result != VK_SUCCESS) { fprintf(stderr, "instance extension query failed: %d\n", int(result)); return 1; }
++    printf("instance extensions (glibc loader + selected ICD): %u\n", instance_count);
++    const char *enabled[4]; uint32_t enabled_count = 0;
++    const char *query_extensions[] = {"VK_KHR_get_physical_device_properties2", "VK_KHR_external_memory_capabilities",
++        "VK_KHR_external_semaphore_capabilities", "VK_KHR_external_fence_capabilities"};
++    for (uint32_t i = 0; i < instance_count; ++i)
++        printf("  %s specVersion=%u\n", instance_extensions[i].extensionName, instance_extensions[i].specVersion);
++    for (const char *name : query_extensions)
++        if (has(instance_extensions, instance_count, name)) enabled[enabled_count++] = name;
++    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++        .pApplicationName = "Gamescope capability diagnostic", .apiVersion = VK_API_VERSION_1_0};
++    VkInstanceCreateInfo info = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
++        .enabledExtensionCount = enabled_count, .ppEnabledExtensionNames = enabled};
++    VkInstance instance = VK_NULL_HANDLE;
++    result = vkCreateInstance(&info, nullptr, &instance);
++    if (result != VK_SUCCESS) { fprintf(stderr, "gamescope: capabilities vkCreateInstance failed: %d\n", int(result)); return 1; }
++    VkPhysicalDevice devices[16]; uint32_t count = 16;
++    result = vkEnumeratePhysicalDevices(instance, &count, devices);
++    if (result != VK_SUCCESS) { fprintf(stderr, "device enumeration failed: %d\n", int(result)); vkDestroyInstance(instance, nullptr); return 1; }
++#define QUERY(n) auto n = reinterpret_cast<PFN_vk##n>(vkGetInstanceProcAddr(instance, "vk" #n "KHR"))
++    QUERY(GetPhysicalDeviceFeatures2);
++    QUERY(GetPhysicalDeviceProperties2);
++    QUERY(GetPhysicalDeviceImageFormatProperties2);
++    QUERY(GetPhysicalDeviceFormatProperties2);
++    QUERY(GetPhysicalDeviceExternalBufferProperties);
++    QUERY(GetPhysicalDeviceExternalSemaphoreProperties);
++    QUERY(GetPhysicalDeviceExternalFenceProperties);
++#undef QUERY
++    printf("physical-device count = %u\n", count);
++    int code = 0;
++    for (uint32_t i = 0; i < count; ++i)
++    {
++        VkPhysicalDevice d = devices[i]; VkPhysicalDeviceProperties p = {};
++        vkGetPhysicalDeviceProperties(d, &p);
++        printf("Device %u\ndeviceName: %s\nvendorID: 0x%08x\ndeviceID: 0x%08x\ndriverVersion: %u\ndeviceType: %u\n",
++            i, p.deviceName, p.vendorID, p.deviceID, p.driverVersion, unsigned(p.deviceType));
++        version("physical-device API", p.apiVersion);
++        VkExtensionProperties extensions[256] = {}; uint32_t n = 256;
++        result = vkEnumerateDeviceExtensionProperties(d, nullptr, &n, extensions);
++        if (result != VK_SUCCESS) { fprintf(stderr, "device extension query failed: %d\n", int(result)); code = 1; break; }
++        printf("device extensions (real Android inventory; device creation remains unsupported): %u\n", n);
++        for (uint32_t j = 0; j < n; ++j) printf("  %s specVersion=%u\n", extensions[j].extensionName, extensions[j].specVersion);
++        VkPhysicalDeviceFeatures features = {};
++        vkGetPhysicalDeviceFeatures(d, &features);
++        printf("core features:\n");
++#define FEATURE(f) printf("  " #f "=%u\n", features.f);
++        FEATURE(robustBufferAccess)
++        FEATURE(fullDrawIndexUint32)
++        FEATURE(imageCubeArray)
++        FEATURE(independentBlend)
++        FEATURE(geometryShader)
++        FEATURE(tessellationShader)
++        FEATURE(sampleRateShading)
++        FEATURE(dualSrcBlend)
++        FEATURE(logicOp)
++        FEATURE(multiDrawIndirect)
++        FEATURE(drawIndirectFirstInstance)
++        FEATURE(depthClamp)
++        FEATURE(depthBiasClamp)
++        FEATURE(fillModeNonSolid)
++        FEATURE(depthBounds)
++        FEATURE(wideLines)
++        FEATURE(largePoints)
++        FEATURE(alphaToOne)
++        FEATURE(multiViewport)
++        FEATURE(samplerAnisotropy)
++        FEATURE(textureCompressionETC2)
++        FEATURE(textureCompressionASTC_LDR)
++        FEATURE(textureCompressionBC)
++        FEATURE(occlusionQueryPrecise)
++        FEATURE(pipelineStatisticsQuery)
++        FEATURE(vertexPipelineStoresAndAtomics)
++        FEATURE(fragmentStoresAndAtomics)
++        FEATURE(shaderTessellationAndGeometryPointSize)
++        FEATURE(shaderImageGatherExtended)
++        FEATURE(shaderStorageImageExtendedFormats)
++        FEATURE(shaderStorageImageMultisample)
++        FEATURE(shaderStorageImageReadWithoutFormat)
++        FEATURE(shaderStorageImageWriteWithoutFormat)
++        FEATURE(shaderUniformBufferArrayDynamicIndexing)
++        FEATURE(shaderSampledImageArrayDynamicIndexing)
++        FEATURE(shaderStorageBufferArrayDynamicIndexing)
++        FEATURE(shaderStorageImageArrayDynamicIndexing)
++        FEATURE(shaderClipDistance)
++        FEATURE(shaderCullDistance)
++        FEATURE(shaderFloat64)
++        FEATURE(shaderInt64)
++        FEATURE(shaderInt16)
++        FEATURE(shaderResourceResidency)
++        FEATURE(shaderResourceMinLod)
++        FEATURE(sparseBinding)
++        FEATURE(sparseResidencyBuffer)
++        FEATURE(sparseResidencyImage2D)
++        FEATURE(sparseResidencyImage3D)
++        FEATURE(sparseResidency2Samples)
++        FEATURE(sparseResidency4Samples)
++        FEATURE(sparseResidency8Samples)
++        FEATURE(sparseResidency16Samples)
++        FEATURE(sparseResidencyAliased)
++        FEATURE(variableMultisampleRate)
++        FEATURE(inheritedQueries)
++#undef FEATURE
++        VkQueueFamilyProperties queues[64] = {}; uint32_t qn = 64;
++        vkGetPhysicalDeviceQueueFamilyProperties(d, &qn, queues);
++        printf("queue families: %u\n", qn);
++        for (uint32_t j = 0; j < qn; ++j)
++            printf("  queue[%u]: flags=0x%x count=%u timestampValidBits=%u transferGranularity=%u,%u,%u\n", j,
++                queues[j].queueFlags, queues[j].queueCount, queues[j].timestampValidBits,
++                queues[j].minImageTransferGranularity.width, queues[j].minImageTransferGranularity.height,
++                queues[j].minImageTransferGranularity.depth);
++        VkPhysicalDeviceMemoryProperties memory = {};
++        vkGetPhysicalDeviceMemoryProperties(d, &memory);
++        printf("memory heaps: %u types: %u\n", memory.memoryHeapCount, memory.memoryTypeCount);
++        for (uint32_t j = 0; j < memory.memoryHeapCount; ++j)
++            printf("  heap[%u]: size=%llu flags=0x%x\n", j, (unsigned long long)memory.memoryHeaps[j].size, memory.memoryHeaps[j].flags);
++        for (uint32_t j = 0; j < memory.memoryTypeCount; ++j)
++            printf("  type[%u]: heap=%u flags=0x%x\n", j, memory.memoryTypes[j].heapIndex, memory.memoryTypes[j].propertyFlags);
++        if (GetPhysicalDeviceProperties2)
++        {
++            VkPhysicalDeviceIDProperties id = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
++            VkPhysicalDeviceProperties2 properties2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++                .pNext = p.apiVersion >= VK_API_VERSION_1_1 ? &id : nullptr};
++            GetPhysicalDeviceProperties2(d, &properties2);
++            printf("properties2 deviceName: %s\n", properties2.properties.deviceName);
++            if (properties2.pNext) { printf("deviceUUID: "); for (uint8_t byte : id.deviceUUID) printf("%02x", byte); printf("\n"); }
++        }
++        else printf("properties2: NOT QUERYABLE\n");
++        if (GetPhysicalDeviceProperties2 && has(extensions, n, "VK_EXT_physical_device_drm"))
++        {
++            VkPhysicalDeviceDrmPropertiesEXT drm = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
++            VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drm};
++            GetPhysicalDeviceProperties2(d, &props);
++            printf("DRM properties: primary=%u (%lld,%lld) render=%u (%lld,%lld)\n", drm.hasPrimary,
++                (long long)drm.primaryMajor, (long long)drm.primaryMinor, drm.hasRender,
++                (long long)drm.renderMajor, (long long)drm.renderMinor);
++        }
++        else printf("DRM properties: NOT QUERIED (query/extension absent)\n");
++        if (GetPhysicalDeviceFeatures2)
++        {
++#define FEATURE2(type, tag, core_version, extension, field) do { \
++            if (p.apiVersion >= core_version || has(extensions, n, extension)) { \
++                type extra = {.sType = tag}; extra.field = UINT32_MAX; \
++                VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &extra}; \
++                GetPhysicalDeviceFeatures2(d, &f2); if (extra.field <= 1) printf("features2 " #field "=%u\n", extra.field); \
++                else printf("features2 " #field ": NOT QUERIED (proxy/query error)\n"); \
++            } else printf("features2 " #field ": NOT QUERYABLE (API/extension absent)\n"); \
++        } while (0)
++            FEATURE2(VkPhysicalDeviceTimelineSemaphoreFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
++                VK_API_VERSION_1_2, "VK_KHR_timeline_semaphore", timelineSemaphore);
++            FEATURE2(VkPhysicalDeviceScalarBlockLayoutFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
++                VK_API_VERSION_1_2, "VK_EXT_scalar_block_layout", scalarBlockLayout);
++            FEATURE2(VkPhysicalDeviceSamplerYcbcrConversionFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
++                VK_API_VERSION_1_1, "VK_KHR_sampler_ycbcr_conversion", samplerYcbcrConversion);
++            FEATURE2(VkPhysicalDeviceShaderFloat16Int8Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
++                VK_API_VERSION_1_2, "VK_KHR_shader_float16_int8", shaderFloat16);
++            FEATURE2(VkPhysicalDeviceRobustness2FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++                UINT32_MAX, "VK_EXT_robustness2", nullDescriptor);
++            FEATURE2(VkPhysicalDeviceRobustness2FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++                UINT32_MAX, "VK_EXT_robustness2", robustBufferAccess2);
++            FEATURE2(VkPhysicalDeviceRobustness2FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++                UINT32_MAX, "VK_EXT_robustness2", robustImageAccess2);
++            FEATURE2(VkPhysicalDeviceShaderFloat16Int8Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
++                VK_API_VERSION_1_2, "VK_KHR_shader_float16_int8", shaderInt8);
++            FEATURE2(VkPhysicalDeviceDynamicRenderingFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
++                VK_API_VERSION_1_3, "VK_KHR_dynamic_rendering", dynamicRendering);
++            FEATURE2(VkPhysicalDevicePresentIdFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
++                UINT32_MAX, "VK_KHR_present_id", presentId);
++            FEATURE2(VkPhysicalDevicePresentWaitFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
++                UINT32_MAX, "VK_KHR_present_wait", presentWait);
++#undef FEATURE2
++        }
++        else printf("features2: NOT QUERYABLE\n");
++        const struct { VkFormat format; const char *name; } formats[] = {
++            {VK_FORMAT_B8G8R8A8_UNORM, "BGRA8"}, {VK_FORMAT_R8G8B8A8_UNORM, "RGBA8"},
++            {VK_FORMAT_A2B10G10R10_UNORM_PACK32, "ABGR2101010"}, {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, "NV12"},
++        };
++        const struct { VkExternalMemoryHandleTypeFlagBits handle; const char *name; const char *extension; } handles[] = {
++            {VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, "OPAQUE_FD", "VK_KHR_external_memory_fd"},
++            {VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, "DMA_BUF", "VK_EXT_external_memory_dma_buf"},
++            {VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID, "ANDROID_HARDWARE_BUFFER", "VK_ANDROID_external_memory_android_hardware_buffer"},
++        };
++        for (const auto &format : formats)
++        {
++            VkFormatProperties fp = {}; vkGetPhysicalDeviceFormatProperties(d, format.format, &fp);
++            printf("format %s: linear=0x%x optimal=0x%x buffer=0x%x\n", format.name, fp.linearTilingFeatures, fp.optimalTilingFeatures, fp.bufferFeatures);
++            for (VkImageTiling tiling : {VK_IMAGE_TILING_LINEAR, VK_IMAGE_TILING_OPTIMAL})
++            for (VkImageUsageFlags usage : {VkImageUsageFlags(VK_IMAGE_USAGE_SAMPLED_BIT), VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT),
++                    VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT), VkImageUsageFlags(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)})
++            {
++                VkImageFormatProperties limits = {};
++                result = vkGetPhysicalDeviceImageFormatProperties(d, format.format, VK_IMAGE_TYPE_2D, tiling, usage, 0, &limits);
++                printf("image %s tiling=%u usage=0x%x result=%d extent=%u,%u,%u maxResourceSize=%llu\n", format.name,
++                    unsigned(tiling), usage, int(result), limits.maxExtent.width, limits.maxExtent.height, limits.maxExtent.depth,
++                    (unsigned long long)limits.maxResourceSize);
++            }
++            for (const auto &handle : handles)
++            {
++                if (!GetPhysicalDeviceImageFormatProperties2 || !has(extensions, n, handle.extension))
++                { printf("external image %s %s: NOT QUERIED (query/extension absent)\n", format.name, handle.name); continue; }
++                VkPhysicalDeviceExternalImageFormatInfo external = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++                    .handleType = handle.handle};
++                VkPhysicalDeviceImageFormatInfo2 image = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++                    .pNext = &external, .format = format.format, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL,
++                    .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
++                VkExternalImageFormatProperties ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
++                VkImageFormatProperties2 properties = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &ext};
++                result = GetPhysicalDeviceImageFormatProperties2(d, &image, &properties);
++                printf("external image %s %s result=%d\n", format.name, handle.name, int(result));
++                if (result == VK_SUCCESS) external_memory(handle.name, ext.externalMemoryProperties);
++            }
++            if (GetPhysicalDeviceFormatProperties2 && has(extensions, n, "VK_EXT_image_drm_format_modifier"))
++            {
++                VkDrmFormatModifierPropertiesEXT modifiers[128] = {};
++                VkDrmFormatModifierPropertiesListEXT list = {.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
++                    .drmFormatModifierCount = 128, .pDrmFormatModifierProperties = modifiers};
++                VkFormatProperties2 properties = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &list};
++                GetPhysicalDeviceFormatProperties2(d, format.format, &properties);
++                printf("DRM modifiers %s: %u\n", format.name, list.drmFormatModifierCount);
++                for (uint32_t j = 0; j < list.drmFormatModifierCount; ++j)
++                {
++                    printf("  modifier=0x%llx planes=%u tilingFeatures=0x%x\n", (unsigned long long)modifiers[j].drmFormatModifier,
++                        modifiers[j].drmFormatModifierPlaneCount, modifiers[j].drmFormatModifierTilingFeatures);
++                    if (GetPhysicalDeviceImageFormatProperties2 && has(extensions, n, "VK_EXT_external_memory_dma_buf"))
++                    {
++                        VkPhysicalDeviceImageDrmFormatModifierInfoEXT drm = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++                            .drmFormatModifier = modifiers[j].drmFormatModifier, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
++                        VkPhysicalDeviceExternalImageFormatInfo external = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++                            .pNext = &drm, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
++                        VkPhysicalDeviceImageFormatInfo2 image = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++                            .pNext = &external, .format = format.format, .type = VK_IMAGE_TYPE_2D,
++                            .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
++                        VkExternalImageFormatProperties ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
++                        VkImageFormatProperties2 properties = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &ext};
++                        result = GetPhysicalDeviceImageFormatProperties2(d, &image, &properties);
++                        printf("  modifier DMA_BUF image result=%d\n", int(result));
++                        if (result == VK_SUCCESS) external_memory("modifier DMA_BUF", ext.externalMemoryProperties);
++                    }
++                }
++            }
++            else printf("DRM modifiers %s: NOT QUERIED (query/extension absent)\n", format.name);
++        }
++        for (const auto &handle : handles)
++        {
++            if (handle.handle == VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) continue; // Image-only handle.
++            if (!GetPhysicalDeviceExternalBufferProperties || !has(extensions, n, handle.extension))
++            { printf("external buffer %s: NOT QUERIED (query/extension absent)\n", handle.name); continue; }
++            VkPhysicalDeviceExternalBufferInfo buffer = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
++                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .handleType = handle.handle};
++            VkExternalBufferProperties properties = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
++            properties.externalMemoryProperties.externalMemoryFeatures = UINT32_MAX;
++            GetPhysicalDeviceExternalBufferProperties(d, &buffer, &properties);
++            if (properties.externalMemoryProperties.externalMemoryFeatures != UINT32_MAX)
++                external_memory(handle.name, properties.externalMemoryProperties);
++            else printf("external buffer %s: NOT QUERIED (proxy/query error)\n", handle.name);
++        }
++        if (GetPhysicalDeviceExternalSemaphoreProperties && has(extensions, n, "VK_KHR_external_semaphore_fd"))
++            for (auto handle : {VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT})
++            {
++                VkPhysicalDeviceExternalSemaphoreInfo semaphore = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO, .handleType = handle};
++                VkExternalSemaphoreProperties properties = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
++                properties.externalSemaphoreFeatures = UINT32_MAX;
++                GetPhysicalDeviceExternalSemaphoreProperties(d, &semaphore, &properties);
++                if (properties.externalSemaphoreFeatures == UINT32_MAX) { printf("external semaphore: NOT QUERIED (proxy/query error)\n"); continue; }
++                printf("external semaphore handle=0x%x features=0x%x compatible=0x%x export-from-imported=0x%x\n",
++                    unsigned(handle), properties.externalSemaphoreFeatures, properties.compatibleHandleTypes, properties.exportFromImportedHandleTypes);
++            }
++        else printf("external semaphore FD: NOT QUERIED (query/extension absent)\n");
++        if (GetPhysicalDeviceExternalFenceProperties && has(extensions, n, "VK_KHR_external_fence_fd"))
++            for (auto handle : {VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT, VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT})
++            {
++                VkPhysicalDeviceExternalFenceInfo fence = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO, .handleType = handle};
++                VkExternalFenceProperties properties = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES};
++                properties.externalFenceFeatures = UINT32_MAX;
++                GetPhysicalDeviceExternalFenceProperties(d, &fence, &properties);
++                if (properties.externalFenceFeatures == UINT32_MAX) { printf("external fence: NOT QUERIED (proxy/query error)\n"); continue; }
++                printf("external fence handle=0x%x features=0x%x compatible=0x%x export-from-imported=0x%x\n",
++                    unsigned(handle), properties.externalFenceFeatures, properties.compatibleHandleTypes, properties.exportFromImportedHandleTypes);
++            }
++        else printf("external fence FD: NOT QUERIED (query/extension absent)\n");
++        printf("Gamescope normal-path Vulkan >=1.2 requirement: %s\n", p.apiVersion >= VK_API_VERSION_1_2 ? "A: device meets version floor" : "D: device below version floor");
++        const char *required[] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf", "VK_KHR_external_semaphore_fd", "VK_EXT_robustness2"};
++        for (const char *name : required) printf("Gamescope unconditional extension %s: %s\n", name, has(extensions, n, name) ? "REPORTED" : "ABSENT");
++    }
++    vkDestroyInstance(instance, nullptr);
++    printf("gamescope: destroyed capability-query Vulkan instance; no device/backend initialized\n");
++    return code;
++}

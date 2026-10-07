@@ -30,7 +30,12 @@ int __android_log_print(int priority, const char *tag, const char *format, ...) 
     fputc('\n', stderr); return 0;
 }
 static VkResult mock_create(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *allocator, VkInstance *out) {
-    assert(info->enabledExtensionCount == 0 && allocator == NULL);
+    assert(allocator == NULL);
+    for (uint32_t i = 0; i < info->enabledExtensionCount; ++i) {
+        int found = 0;
+        for (unsigned j = 0; j < 4; ++j) found |= !strcmp(info->ppEnabledExtensionNames[i], query_extensions[j]);
+        assert(found);
+    }
     ++creates;
     if (mode == 2) return VK_ERROR_INITIALIZATION_FAILED;
     *out = (VkInstance)malloc(1);
@@ -51,6 +56,7 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
     assert(device == (VkPhysicalDevice)(uintptr_t)0x42);
     memset(p, 0, sizeof(*p)); strcpy(p->deviceName, "HOST TEST ONLY");
     p->vendorID = 0x13b5; p->deviceID = 0x74021000; p->apiVersion = VK_MAKE_API_VERSION(0, 1, 1, 131);
+    if (mode == 6) p->apiVersion = VK_API_VERSION_1_0;
     p->driverVersion = 109051904; p->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     p->limits.maxImageDimension2D = 8192;
     p->limits.bufferImageGranularity = UINT64_C(0x123456789);
@@ -60,11 +66,29 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
     p->sparseProperties.residencyStandard2DBlockShape = VK_TRUE;
     for (unsigned i = 0; i < VK_UUID_SIZE; ++i) p->pipelineCacheUUID[i] = (uint8_t)i;
 }
+#include "mock_capabilities.h"
+
 static PFN_vkVoidFunction mock_gipa(VkInstance instance, const char *name) {
     (void)instance;
     if (!strcmp(name, "vkCreateInstance")) return (PFN_vkVoidFunction)mock_create;
     if (!strcmp(name, "vkEnumeratePhysicalDevices")) return (PFN_vkVoidFunction)mock_enumerate;
     if (!strcmp(name, "vkGetPhysicalDeviceProperties") && mode != 5) return (PFN_vkVoidFunction)mock_properties;
+    if (!strcmp(name, "vkEnumerateInstanceVersion")) return (PFN_vkVoidFunction)mock_version;
+    if (!strcmp(name, "vkEnumerateInstanceExtensionProperties")) return (PFN_vkVoidFunction)mock_instance_extensions;
+    if (!strcmp(name, "vkEnumerateDeviceExtensionProperties")) return (PFN_vkVoidFunction)mock_device_extensions;
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures")) return (PFN_vkVoidFunction)mock_features;
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures2")) return (PFN_vkVoidFunction)mock_features2;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties2")) return (PFN_vkVoidFunction)mock_properties2;
+    if (!strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties")) return (PFN_vkVoidFunction)mock_queues;
+    if (!strcmp(name, "vkGetPhysicalDeviceMemoryProperties")) return (PFN_vkVoidFunction)mock_memory;
+    if (!strcmp(name, "vkGetPhysicalDeviceFormatProperties")) return (PFN_vkVoidFunction)mock_format;
+    if (!strcmp(name, "vkGetPhysicalDeviceFormatProperties2")) return (PFN_vkVoidFunction)mock_format2;
+    if (!strcmp(name, "vkGetPhysicalDeviceImageFormatProperties")) return (PFN_vkVoidFunction)mock_image;
+    if (!strcmp(name, "vkGetPhysicalDeviceImageFormatProperties2")) return (PFN_vkVoidFunction)mock_image2;
+    if (!strcmp(name, "vkGetPhysicalDeviceExternalBufferProperties")) return (PFN_vkVoidFunction)mock_buffer;
+    if (!strcmp(name, "vkGetPhysicalDeviceExternalSemaphoreProperties")) return (PFN_vkVoidFunction)mock_semaphore;
+    if (!strcmp(name, "vkGetPhysicalDeviceExternalFenceProperties")) return (PFN_vkVoidFunction)mock_fence;
+    if (!strcmp(name, "vkGetPhysicalDeviceSparseImageFormatProperties")) return (PFN_vkVoidFunction)mock_sparse;
     return NULL;
 }
 static void *mock_dlopen(const char *path, int flags) {

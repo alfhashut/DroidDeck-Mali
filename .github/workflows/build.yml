@@ -323,6 +323,7 @@ jobs:
           mkdir -p app/src/main/assets/linuxfs
           tar --use-compress-program=unzstd -xf gamescope-component/gamescope.tzst -C app/src/main/assets/linuxfs
           grep -a -q -F -- 'vk-enumerate-only' app/src/main/assets/linuxfs/usr/local/bin/gamescope
+          grep -a -q -F -- 'vk-capabilities' app/src/main/assets/linuxfs/usr/local/bin/gamescope
 
       - name: Build the x86 preloads FEX guests load (glibc 2.31)
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -487,7 +488,8 @@ jobs:
           with zipfile.ZipFile("app/build/outputs/apk/release/app-release.apk") as apk:
               name = "assets/linuxfs/usr/local/bin/gamescope"
               result = "MISSING" if name not in apk.namelist() else (
-                  "NEW" if b"vk-enumerate-only" in apk.read(name) else "OLD")
+                  "NEW" if all(marker in apk.read(name) for marker in
+                               (b"vk-enumerate-only", b"vk-capabilities")) else "OLD")
           print(result)
           sys.exit(0 if result == "NEW" else 1)
           PY

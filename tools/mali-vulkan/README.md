@@ -343,3 +343,10 @@ also run that translation unit through the normal host Vulkan loader, proxy ICD,
 broker. This focused harness is not the complete Gamescope executable: the component build's actual
 binary checks and the real-phone test above remain necessary. Set `VULKAN_HEADERS`/`JAVA_HOME` as in
 checkpoint 2 if needed. No proprietary phone libraries are used in host tests or committed.
+
+## Checkpoint 4A
+
+The separate **Run Gamescope Vulkan capability test** action queries real driver capabilities
+without creating a device. See [CAPABILITIES.md](CAPABILITIES.md) for the version-3 protocol,
+Gamescope requirement matrix, public wrapper/Sarek source review, build flow and phone test.
+The preceding three actions retain their existing behavior.

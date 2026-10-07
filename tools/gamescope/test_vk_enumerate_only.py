@@ -30,7 +30,7 @@ class EnumerationTests(unittest.TestCase):
         shutil.copytree(source, cls.source, ignore=shutil.ignore_patterns(".git", "build", "builddir"))
         cls.patch_output = ""
         for patch in sorted((ROOT / "patches").glob("*.patch")):
-            if patch.name == "0113-vulkan-enumerate-only.patch":
+            if patch.name in ("0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch"):
                 # Validate added source whitespace, excluding the patch's context prefixes.
                 subprocess.run(["git", "apply", "--check", "--whitespace=error", str(patch)],
                                cwd=cls.source, check=True, capture_output=True)
@@ -52,6 +52,14 @@ class EnumerationTests(unittest.TestCase):
         cls.normal = cls.directory / "normal-loader-diagnostic"
         subprocess.run(cls.compiler + cls.flags + [str(cls.object), str(cls.main), "-l:libvulkan.so.1",
                        "-o", str(cls.normal)], check=True)
+        cls.cap_object = cls.directory / "capabilities.o"
+        cap_main = cls.directory / "capabilities_main.cpp"
+        cap_main.write_text('#include "vulkan_capabilities.hpp"\nint main() { return vulkan_capabilities(); }\n')
+        subprocess.run(cls.compiler + cls.flags + ["-c", str(cls.source / "src/vulkan_capabilities.cpp"),
+                       "-o", str(cls.cap_object)], check=True)
+        cls.cap_normal = cls.directory / "capabilities-loader-diagnostic"
+        subprocess.run(cls.compiler + cls.flags + [str(cls.cap_object), str(cap_main), "-l:libvulkan.so.1",
+                       "-o", str(cls.cap_normal)], check=True)
         # Reuse checkpoint 2's actual proxy/broker host fixture without changing its tests.
         spec = importlib.util.spec_from_file_location("checkpoint2_fixture", MALI / "test_icd.py")
         module = importlib.util.module_from_spec(spec)
@@ -59,6 +67,53 @@ class EnumerationTests(unittest.TestCase):
         module.IcdTests.setUpClass()
         cls.addClassCleanup(module.IcdTests.doClassCleanups)
         cls.checkpoint2 = module.IcdTests("test_normal_loader")
+
+    def test_capability_path_has_no_device_or_backend_calls(self):
+        main = (self.source / "src/main.cpp").read_text()
+        body = main[main.index("int main(int argc, char **argv)"):]
+        early = body.index("return vulkan_capabilities();")
+        self.assertLess(early, body.index("g_argc = argc;"))
+        parser = body.index("return vulkan_capabilities();", early + 1)
+        self.assertLess(parser, body.index("HasCapSysNice()"))
+        self.assertIn('{ "vk-capabilities", no_argument, nullptr, 0 }', main)
+        symbols = subprocess.check_output(["nm", "-u", str(self.cap_object)], text=True)
+        for forbidden in ("vkCreateDevice", "vkAllocateMemory", "vkCreateImage", "vkCreateBuffer", "wl_display", "vkQueueSubmit", "vkCreateWaylandSurface"):
+            self.assertNotIn(forbidden, symbols)
+
+    def test_capabilities_real_loader_and_mock_android(self):
+        fixture = self.checkpoint2
+        with fixture.broker() as path:
+            env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(fixture.manifest),
+                       VK_ICD_FILENAMES=str(fixture.manifest), VK_LOADER_LAYERS_DISABLE="*", MALI_VULKAN_QUERY_CAPABILITIES="1")
+            result = subprocess.run([str(self.cap_normal)], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for value in ("HOST TEST ONLY", "physical-device API: 1.1.131", "textureCompressionBC=0", "samplerAnisotropy=1",
+                          "features2 scalarBlockLayout=0", "features2 timelineSemaphore=1", "features2 dynamicRendering: NOT QUERYABLE",
+                          "queue families: 2", "memory heaps: 1 types: 2", "modifier=0x123456789abcdef0",
+                          "modifier DMA_BUF image result=0", "D: device below version floor", "no device/backend initialized"):
+                self.assertIn(value, result.stdout)
+        self.assertIn("creates=1 destroys=1", fixture.cleanup_output)
+
+    def test_capabilities_missing_icd_smoke(self):
+        missing = str(self.directory / "missing.json")
+        result = subprocess.run([str(self.cap_normal)], env=dict(os.environ, VK_DRIVER_FILES=missing,
+            VK_ICD_FILENAMES=missing, VK_LOADER_LAYERS_DISABLE="*"), capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("gamescope: capabilities vkCreateInstance failed:", result.stderr)
+        self.assertNotIn("deviceName:", result.stdout)
+        smoke = (ROOT / "build-in-arch.sh").read_text()
+        self.assertIn("grep -F 'gamescope: capabilities vkCreateInstance failed:'", smoke)
+
+    def test_capabilities_one_zero_fallback(self):
+        fixture = self.checkpoint2
+        with fixture.broker(6) as path:
+            env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(fixture.manifest),
+                       VK_ICD_FILENAMES=str(fixture.manifest), VK_LOADER_LAYERS_DISABLE="*", MALI_VULKAN_QUERY_CAPABILITIES="1")
+            result = subprocess.run([str(self.cap_normal)], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("device extensions (real Android inventory; device creation remains unsupported): 0", result.stdout)
+            self.assertIn("external semaphore FD: NOT QUERIED", result.stdout)
+            self.assertIn("features2: NOT QUERYABLE", result.stdout)
 
     def run_mock(self, mode):
         return subprocess.run([str(self.mock)], env=dict(os.environ, ENUM_TEST_MODE=mode),
@@ -77,9 +132,11 @@ class EnumerationTests(unittest.TestCase):
             self.assertLess(parser_return, body.index(initialization))
         self.assertIn('{ "vk-enumerate-only", no_argument, nullptr, 0 }', main)
         self.assertIn("'vulkan_enumerate_only.cpp'", (self.source / "src/meson.build").read_text())
-        subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--reverse", "--dry-run", "-i",
-                        str(ROOT / "patches/0113-vulkan-enumerate-only.patch")],
-                       cwd=self.source, check=True, capture_output=True)
+        reverse = self.directory / "reverse-check"
+        shutil.copytree(self.source, reverse)
+        for name in ("0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
+            subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--reverse", "-i", str(ROOT / "patches" / name)],
+                           cwd=reverse, check=True, capture_output=True)
 
     def test_only_four_instance_query_calls(self):
         symbols = subprocess.check_output(["nm", "-u", str(self.object)], text=True)

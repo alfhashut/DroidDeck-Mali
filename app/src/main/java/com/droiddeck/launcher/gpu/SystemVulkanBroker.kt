@@ -128,6 +128,44 @@ object SystemVulkanBroker {
     }
 
     @Synchronized
+    fun runCapabilities(context: Context): String {
+        val path = socket ?: throw IOException("Broker is not running")
+        if (!LinuxRuntime.isInstalled(context)) {
+            return "Linux runtime is not installed or is being removed.\n" +
+                "Install the Linux runtime in DroidDeck, then retry. The Android broker is still running."
+        }
+        val directory = path.parentFile
+        for (name in listOf("capability_inventory", "libdroiddeck_mali_proxy.so", "mali_proxy_icd.json")) {
+            val file = File(directory, name)
+            context.assets.open("mali-vulkan/$name").use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            }
+            Os.chmod(file.path, if (name == "capability_inventory") 0x1c0 else 0x180)
+        }
+        val manifest = File(directory, "mali_proxy_icd.json")
+        val environment = listOf("/usr/bin/env", "VK_DRIVER_FILES=${manifest.path}",
+            "VK_ICD_FILENAMES=${manifest.path}", "MALI_VULKAN_BROKER_SOCKET=${path.path}",
+            "MALI_VULKAN_QUERY_CAPABILITIES=1", "VK_LOADER_LAYERS_DISABLE=*",
+            "VK_LOADER_DEBUG=error,warn,driver")
+        val output = StringBuilder()
+        // Print the complete Android inventory separately: unsupported WSI extensions
+        // must not be advertised by the query-only ICD just to make this diagnostic work.
+        for (command in listOf(listOf(File(directory, "capability_inventory").path),
+            listOf("/usr/local/bin/gamescope", "--vk-capabilities"))) {
+            val code = GuestCommand.run(context, environment + command) { line ->
+                output.append(line).append('\n')
+                Log.i(TAG, "capabilities/proot: $line")
+            }
+            output.append("${command.first()} exit code=$code\n")
+            if (code != 0) {
+                output.append("Capability test failed. Bundle Gamescope with patches 0113 and 0114, then retry.\n")
+                return output.toString()
+            }
+        }
+        return output.toString()
+    }
+
+    @Synchronized
     fun stop() {
         if (socket == null) return
         nativeStop()

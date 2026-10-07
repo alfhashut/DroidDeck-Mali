@@ -30,7 +30,7 @@ def rpc(connection, opcode, payload=b"", version=2):
     connection.sendall(struct.pack("<4I", MAGIC, version, opcode, len(payload)) + payload)
     magic, response_version, response_opcode, length = struct.unpack("<4I", read_exact(connection, 16))
     assert (magic, response_version, response_opcode) == (MAGIC, version, opcode)
-    assert 12 <= length <= 4428
+    assert 12 <= length <= (131072 if version == 3 else 4428)
     reply = read_exact(connection, length)
     return struct.unpack("<3I", reply[:12]), reply[12:]
 
@@ -52,6 +52,8 @@ class IcdTests(unittest.TestCase):
         build("icd_proxy.c", "libdroiddeck_mali_proxy.so", ["-shared", "-fPIC", "-fvisibility=hidden", "-Wl,-z,defs", "-pthread"])
         build("loader_test.c", "vulkan_loader_test", ["-ldl"])
         build("broker_probe.c", "broker_probe")
+        build("capability_inventory.c", "capability_inventory")
+        build("tests/capability_contract.c", "capability_contract", ["-l:libvulkan.so.1"])
         build("tests/icd_contract.c", "icd_contract", ["-ldl"])
         build("tests/broker_mock.c", "broker_mock", ["-pthread", "-I" + str(ROOT / "tests"),
               "-I" + str(java / "include"), "-I" + str(java / "include/linux")])
@@ -79,9 +81,13 @@ class IcdTests(unittest.TestCase):
                 self.cleanup_output = output
                 self.assertFalse(path.exists(), "broker must remove its socket")
 
-    def run_program(self, name, path, *arguments):
+    def run_program(self, name, path, *arguments, capabilities=False):
         env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(self.manifest),
                    VK_ICD_FILENAMES=str(self.manifest), VK_LOADER_LAYERS_DISABLE="*")
+        if capabilities:
+            env["MALI_VULKAN_QUERY_CAPABILITIES"] = "1"
+        else:
+            env.pop("MALI_VULKAN_QUERY_CAPABILITIES", None)
         return subprocess.run([str(self.directory / name), *map(str, arguments)], env=env,
                               capture_output=True, text=True, timeout=20)
 
@@ -91,6 +97,70 @@ class IcdTests(unittest.TestCase):
         connection.settimeout(5)
         connection.connect(path)
         return connection
+
+    def test_capability_loader_contract(self):
+        with self.broker() as path:
+            result = self.run_program("capability_contract", path, capabilities=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("capability contracts:", result.stdout)
+            result = self.run_program("capability_inventory", path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("VK_KHR_android_surface", result.stdout)
+        self.assertIn("creates=1 destroys=1", self.cleanup_output)
+
+    def test_corrupt_capability_snapshot_does_not_publish_devices(self):
+        for mode in (7, 8): # Invalid VkBool32 / invalid memory heap index.
+            with self.subTest(mode=mode), self.broker(mode) as path:
+                result = self.run_program("vulkan_loader_test", path, capabilities=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("deviceName:", result.stdout)
+                self.assertIn("invalid capability snapshot", result.stderr)
+            self.assertIn("creates=1 destroys=1", self.cleanup_output)
+
+    def test_inventory_fragmentation_and_bad_wire_names(self):
+        for malformed in (False, True):
+            path = str(self.directory / "inventory.sock")
+            errors = []
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(path); server.listen(1); server.settimeout(10)
+                def respond():
+                    try:
+                        with server.accept()[0] as connection:
+                            self.assertEqual(struct.unpack("<4I", read_exact(connection, 16)), (MAGIC, 3, 6, 0))
+                            name = b"x" * 256 if malformed else b"HOST_WIRE_ONLY".ljust(256, b"\0")
+                            body = struct.pack("<4I", 0, 0, 1, 1 << 22) + name + struct.pack("<I", 9)
+                            wire = struct.pack("<4I", MAGIC, 3, 6, len(body)) + body
+                            for byte in wire:
+                                connection.sendall(bytes([byte]))
+                    except Exception as error:
+                        errors.append(error)
+                worker = threading.Thread(target=respond); worker.start()
+                result = self.run_program("capability_inventory", path)
+                worker.join(15)
+                self.assertFalse(worker.is_alive()); self.assertFalse(errors, errors)
+                self.assertEqual(result.returncode == 0, not malformed, result.stdout + result.stderr)
+                if not malformed: self.assertIn("HOST_WIRE_ONLY specVersion=9", result.stdout)
+            os.unlink(path)
+
+    def test_version_three_queries_and_unsupported_are_distinct(self):
+        with self.broker(6) as path:
+            connection = self.connect(path)
+            prefix, data = rpc(connection, 6, version=3)
+            self.assertEqual(prefix, (0, 0, 0))
+            self.assertEqual(struct.unpack("<I", data)[0], 1 << 22)
+            connection.close()
+            connection = self.connect(path)
+            self.assertEqual(rpc(connection, 2, struct.pack("<I", 1 << 22), version=3)[0], (0, 0, 0))
+            self.assertEqual(rpc(connection, 4, version=3)[0], (0, 0, 1))
+            prefix, data = rpc(connection, 7, struct.pack("<I", 1), version=3)
+            self.assertEqual(prefix, (0, 0, 1))
+            schema = (ROOT / "properties_fields.def").read_text().splitlines()
+            property_bytes = 272 + sum(8 if line.startswith(("MB_U64(", "MB_SIZE(")) else 4
+                                       for line in schema if line.startswith("MB_"))
+            self.assertEqual(struct.unpack("<I", data[property_bytes:property_bytes + 4])[0], 0) # get2 unavailable, not false feature claims
+            self.assertEqual(rpc(connection, 11, struct.pack("<2I", 1, 1), version=3)[0][0], 6)
+            self.assertEqual(rpc(connection, 7, struct.pack("<I", 0x42), version=3)[0][0], 3)
+            self.assertEqual(connection.recv(1), b"") # invalid ID closes and destroys the session
 
     def test_normal_loader(self):
         with self.broker() as path:
