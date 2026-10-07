@@ -3,6 +3,8 @@ package com.droiddeck.launcher.gpu
 import android.content.Context
 import android.system.Os
 import android.util.Log
+import com.droiddeck.launcher.runtime.GuestCommand
+import com.droiddeck.launcher.runtime.LinuxRuntime
 import java.io.File
 import java.io.IOException
 
@@ -27,24 +29,27 @@ object SystemVulkanBroker {
         return path.path
     }
 
-    /** Runs a separate, statically linked glibc process; no Linux session or Vulkan client library. */
+    /** Runs the glibc probe through the existing one-off Linux/proot command path. */
     @Synchronized
     fun runProbe(context: Context): String {
         val path = socket ?: throw IOException("Broker is not running")
+        if (!LinuxRuntime.isInstalled(context)) {
+            return "Linux runtime is not installed or is being removed.\n" +
+                "Install the Linux runtime in DroidDeck, then retry. The Android broker is still running."
+        }
         val binary = File(path.parentFile, "broker_probe")
         context.assets.open("mali-vulkan/broker_probe").use { input ->
             binary.outputStream().use { output -> input.copyTo(output) }
         }
         Os.chmod(binary.path, 0x1c0)
-        val process = ProcessBuilder(binary.path, path.path).redirectErrorStream(true).start()
-        try {
-            val output = process.inputStream.bufferedReader().use { it.readText() }
-            val code = process.waitFor()
-            Log.i(TAG, "glibc probe exit=$code\n$output")
-            return "$output\nprobe exit code=$code"
-        } finally {
-            process.destroy()
+        Log.i(TAG, "starting glibc probe via Linux/proot: ${binary.path} ${path.path}")
+        val output = StringBuilder()
+        val code = GuestCommand.run(context, listOf(binary.path, path.path)) { line ->
+            output.append(line).append('\n')
+            Log.i(TAG, "probe/proot: $line")
         }
+        Log.i(TAG, "glibc probe via Linux/proot exit=$code")
+        return "$output\nprobe via Linux/proot exit code=$code"
     }
 
     @Synchronized

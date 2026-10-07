@@ -17,7 +17,7 @@ class SystemVulkanBrokerActivity : Activity() {
             text = "Mali Vulkan checkpoint 1\nStarting Android broker…"
             setTextIsSelectable(true)
         }
-        val probe = Button(this).apply { text = "Run glibc probe"; isEnabled = false }
+        val probe = Button(this).apply { text = "Run probe via Linux/proot"; isEnabled = false }
         val stop = Button(this).apply { text = "Stop broker and close"; setOnClickListener { finish() } }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -30,7 +30,7 @@ class SystemVulkanBrokerActivity : Activity() {
                 val socket = SystemVulkanBroker.start(applicationContext)
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = "Android broker listening\nSocket: $socket\n\nPress Run glibc probe. No session is started."
+                        status.text = "Android broker listening\nSocket: $socket\n\nPress Run probe via Linux/proot. The Linux runtime must be installed. No normal session is started."
                         probe.isEnabled = true
                     }
                 }
@@ -41,13 +41,13 @@ class SystemVulkanBrokerActivity : Activity() {
         }
         probe.setOnClickListener {
             probe.isEnabled = false
-            status.text = "Querying Android Vulkan from the glibc probe…"
+            status.text = "Querying Android Vulkan from the glibc probe via Linux/proot…"
             worker.execute {
                 val output = try {
                     SystemVulkanBroker.runProbe(applicationContext)
                 } catch (t: Throwable) {
                     Log.e("MaliVulkanBroker", "probe failed", t)
-                    "Probe failed: $t\nBuild/package tools/mali-vulkan/build-probe.sh before building the APK."
+                    "Probe via Linux/proot failed: $t"
                 }
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) { status.text = output; probe.isEnabled = true }

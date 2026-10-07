@@ -33,11 +33,20 @@ For a package variant, replace the package before `/`; the Activity's class name
 The Activity requires `android.permission.DUMP`, like the existing shell debug trampoline. It has
 no launcher entry and does not start Steam, Gamescope, the compositor, or a Linux session.
 
-Press **Run glibc probe**. The Activity extracts the bundled executable into its private directory
-and starts it as a separate glibc process under the app's UID. Static linking allows this to run
-without entering proot; the client does not link or load Vulkan. The screen and logcat show the
-device count, all six returned properties, and the probe's exit code. `driverVersion` is printed
-as raw vendor-specific data, not interpreted as a universal major/minor/patch version.
+Install the Linux runtime through DroidDeck if it is not already installed. Keep the debug screen
+open and press **Run probe via Linux/proot**. A missing or removing runtime produces a clear message
+without launching the probe; the Android broker remains available.
+
+The Activity extracts the same bundled glibc executable into its private directory and runs it
+through `GuestCommand.run()`, the existing one-off Linux/proot launcher used by package/import tools.
+That launcher prepares the runtime, supplies `PROOT_LOADER` and the usual proot environment, and
+binds the app's private files at the same paths inside the guest. Both the executable and
+`broker.sock` therefore keep their existing paths. The Bionic broker stays in the Android process.
+There is no root/su/adb invocation in application code and no automatic fallback to direct execution.
+
+The client still does not link or load Vulkan. The screen and logcat show merged stdout/stderr,
+the device count, all six returned properties, and `probe via Linux/proot exit code`. `driverVersion`
+is printed as raw vendor-specific data, not interpreted as a universal major/minor/patch version.
 
 The broker remains available for repeated queries. Press **Stop broker and close**, or Back, to
 destroy the Activity and stop it. Teardown interrupts blocked socket reads, joins the broker thread,
@@ -52,8 +61,29 @@ running as this app's UID. Use the exact app-private socket path displayed on sc
   /data/user/0/com.droiddeck.launcher/files/mali-vulkan/broker.sock
 ```
 
-An ordinary adb shell cannot access the app-private socket as the app's UID. The debug screen's
-Run button avoids needing root or a debuggable APK. No session environment overrides are needed.
+An ordinary adb shell cannot access the app-private socket as the app's UID. Use the debug screen's
+Run button for this test; no root, su, or session environment overrides are needed. Repeat the Run
+action to check that the broker remains available, then close the screen and check the cleanup logs.
+
+## Real-device result and launch-path follow-up
+
+Checkpoint 1 was validated on Android 13 / MT6769V/CZ (mt6768): the exact glibc probe, launched
+externally under the app UID, reached the Bionic broker and reported:
+
+```text
+deviceName: Mali-G52
+vendorID: 0x000013b5
+deviceID: 0x74021000
+apiVersion: 1.1.131
+driverVersion: 109051904
+deviceType: 1
+```
+
+Direct execution as an Android-app child exited 159 / SIGSYS, consistent with the inherited Android
+app seccomp policy. The debug button now uses the existing proot execution path instead. This does
+not remove Android's seccomp filter; success of this launch path must be checked on the device.
+Expected success is the same real properties above with `probe via Linux/proot exit code=0` and
+broker instance-destruction logs. If it fails, retain the proot output, exit code, and logcat.
 
 ## Protocol and validation
 
