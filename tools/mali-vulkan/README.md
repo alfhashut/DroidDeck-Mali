@@ -350,3 +350,11 @@ The separate **Run Gamescope Vulkan capability test** action queries real driver
 without creating a device. See [CAPABILITIES.md](CAPABILITIES.md) for the version-3 protocol,
 Gamescope requirement matrix, public wrapper/Sarek source review, build flow and phone test.
 The preceding three actions retain their existing behavior.
+
+## Checkpoint 4B
+
+The separate **Run Gamescope Vulkan device test** action uses version 4 to create a
+real Android logical device, obtain a queue, and destroy both device and instance
+without rendering. Earlier query actions retain their behavior. See
+[DEVICE_TEST.md](DEVICE_TEST.md) for the pre-edit Gamescope source analysis, explicit
+protocol schema, test results, build requirements and phone acceptance instructions.

@@ -21,4 +21,4 @@ flags=(-std=c11 -O2 -Wall -Wextra -Werror -idirafter "$headers")
 "$compiler" "${flags[@]}" "$repo_root/tools/mali-vulkan/loader_test.c" -ldl -o "$output/vulkan_loader_test"
 "$compiler" "${flags[@]}" "$repo_root/tools/mali-vulkan/capability_inventory.c" -o "$output/capability_inventory"
 cp -- "$repo_root/tools/mali-vulkan/mali_proxy_icd.json" "$output/mali_proxy_icd.json"
-printf 'Built query-only AArch64 glibc ICD and normal-loader test: %s\n' "$output"
+printf 'Built AArch64 glibc diagnostic ICD and normal-loader test: %s\n' "$output"

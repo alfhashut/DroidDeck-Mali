@@ -15,6 +15,7 @@
 #include <vulkan/vulkan.h>
 #include "protocol.h"
 #include "capabilities.h"
+#include "device_protocol.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__)
 #define ERROR(...) __android_log_print(ANDROID_LOG_ERROR, "MaliVulkanBroker", __VA_ARGS__)
@@ -41,6 +42,15 @@ struct vk_session {
     VkPhysicalDevice devices[MB_MAX_DEVICES];
     uint32_t count;
     int listed;
+    uint32_t wire_version, next_device_id, next_queue_id;
+    struct native_device {
+        VkDevice handle;
+        PFN_vkDestroyDevice destroy;
+        PFN_vkGetDeviceQueue get_queue;
+        uint32_t id, family, count;
+        VkQueue queues[MB_DEVICE_MAX_QUEUES];
+        uint32_t queue_ids[MB_DEVICE_MAX_QUEUES];
+    } logical[MB_MAX_LOGICAL_DEVICES];
 };
 
 static const char *const query_extensions[] = {
@@ -50,6 +60,11 @@ static const char *const query_extensions[] = {
 static VkResult native_global(void *, uint32_t *, uint32_t *, VkExtensionProperties *);
 
 static void close_session(struct vk_session *s) {
+    for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
+        if (s->logical[i].handle) {
+            s->logical[i].destroy(s->logical[i].handle, NULL);
+            LOG("vkDestroyDevice id=%u (session cleanup)", s->logical[i].id);
+        }
     if (s->instance) { s->destroy(s->instance, NULL); LOG("destroyed Vulkan instance"); }
     if (s->library) { dlclose(s->library); LOG("closed Android libvulkan"); }
     memset(s, 0, sizeof(*s));
@@ -136,6 +151,7 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 }
 
 #include "capability_queries.h"
+#include "device_commands.h"
 
 /* Preserve the original version-1 one-shot probe and its six-field reply. */
 static uint32_t query_devices(uint8_t *payload) {
@@ -166,7 +182,7 @@ static uint32_t query_devices(uint8_t *payload) {
 static void serve(int fd) {
     struct vk_session s = {0};
     for (;;) {
-        uint8_t header[MB_HEADER_BYTES], request[40], payload[MB_CAP_MAX_PAYLOAD] = {0};
+        uint8_t header[MB_HEADER_BYTES], request[MB_DEVICE_MAX_REQUEST], payload[MB_CAP_MAX_PAYLOAD] = {0};
         if (mb_read(fd, header, sizeof(header))) break;
         uint32_t version = mb_get_u32(header + 4), op = mb_get_u32(header + 8);
         uint32_t request_bytes = mb_get_u32(header + 12), bytes = MB_PREFIX_BYTES;
@@ -181,10 +197,11 @@ static void serve(int fd) {
             if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes))
                 ERROR("write probe response: %s", strerror(errno));
             break;
-        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION) ||
+        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION) ||
+                   (s.wire_version && version != s.wire_version) ||
                    (request_bytes && mb_read(fd, request, request_bytes))) {
             finish = 1;
-        } else if (version == MB_CAP_VERSION && op == MB_GLOBAL && !request_bytes && !s.library) {
+        } else if (version >= MB_CAP_VERSION && op == MB_GLOBAL && !request_bytes && !s.library) {
             void *library = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
             uint32_t api = 0;
             VkExtensionProperties extensions[MB_MAX_EXTENSIONS];
@@ -203,7 +220,8 @@ static void serve(int fd) {
             } else ERROR("Android global inventory load failed: %s", dlerror());
             finish = 1;
         } else if (op == MB_CREATE && request_bytes == 4 && !s.library) {
-            status = open_session(&s, mb_get_u32(request), &result, version == MB_CAP_VERSION);
+            status = open_session(&s, mb_get_u32(request), &result, version >= MB_CAP_VERSION);
+            s.wire_version = version;
             finish = status != MB_OK;
             /* Live instances may idle. Stop shuts down every connection to wake reads. */
             struct timeval no_timeout = {0};
@@ -224,17 +242,21 @@ static void serve(int fd) {
                 mb_encode_properties(payload + MB_PREFIX_BYTES, &p);
                 status = MB_OK; count = 1; bytes += MB_PROPERTIES_BYTES;
             } else finish = 1;
-        } else if (version == MB_CAP_VERSION && op == MB_CAPS && request_bytes == 4 && s.instance && s.listed) {
+        } else if (version >= MB_CAP_VERSION && op == MB_CAPS && request_bytes == 4 && s.instance && s.listed) {
             uint32_t id = mb_get_u32(request);
             if (id && id <= s.count) {
                 status = native_snapshot(&s, id, payload + MB_PREFIX_BYTES, &result);
                 if (status == MB_OK) { count = 1; bytes += MB_PROPERTIES_BYTES + MB_CAPS_BYTES; }
             } else finish = 1;
-        } else if (version == MB_CAP_VERSION && op >= MB_FORMAT && op <= MB_SPARSE && s.instance && s.listed) {
+        } else if (version >= MB_CAP_VERSION && op >= MB_FORMAT && op <= MB_SPARSE && s.instance && s.listed) {
             uint32_t extra = 0;
             status = native_extra(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
             else { count = 0; if (status == MB_UNSUPPORTED) result = VK_ERROR_FEATURE_NOT_PRESENT; }
+        } else if (version == MB_DEVICE_VERSION && op >= MB_DEVICE_CREATE && op <= MB_DEVICE_DESTROY && s.instance && s.listed) {
+            uint32_t extra = 0;
+            status = native_device_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (status == MB_OK) bytes += extra;
         } else if (op == MB_DESTROY && !request_bytes && s.instance) {
             close_session(&s); status = MB_OK; finish = 1;
         } else {
@@ -243,7 +265,7 @@ static void serve(int fd) {
         mb_put_u32(payload, status); mb_put_u32(payload + 4, (uint32_t)result); mb_put_u32(payload + 8, count);
         if (version == MB_VERSION) mb_header(header, bytes);
         else mb_session_header(header, op, bytes);
-        if (version == MB_CAP_VERSION) mb_put_u32(header + 4, MB_CAP_VERSION);
+        mb_put_u32(header + 4, version);
         LOG("query RPC opcode=%u status=%u VkResult=%d count=%u", op, status, (int)result, count);
         if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes)) {
             ERROR("write response: %s", strerror(errno)); break;

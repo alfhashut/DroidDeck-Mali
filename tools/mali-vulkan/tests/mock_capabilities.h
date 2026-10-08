@@ -62,6 +62,8 @@ static void mock_queues(VkPhysicalDevice d, uint32_t *count, VkQueueFamilyProper
     uint32_t written = *count < 2 ? *count : 2;
     for (uint32_t i = 0; i < written; ++i) p[i] = (VkQueueFamilyProperties){i ? VK_QUEUE_COMPUTE_BIT : VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT,
         i + 1, 32, {1, 2, 3}};
+    if (mode == 12) for (uint32_t i = 0; i < written; ++i) p[i].queueFlags = VK_QUEUE_TRANSFER_BIT;
+    if (mode == 14 && written == 2) { p[0].queueFlags = VK_QUEUE_TRANSFER_BIT; p[1].queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT; }
     *count = written;
 }
 static void mock_memory(VkPhysicalDevice d, VkPhysicalDeviceMemoryProperties *p) {

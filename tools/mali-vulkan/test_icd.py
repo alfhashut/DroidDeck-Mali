@@ -30,7 +30,7 @@ def rpc(connection, opcode, payload=b"", version=2):
     connection.sendall(struct.pack("<4I", MAGIC, version, opcode, len(payload)) + payload)
     magic, response_version, response_opcode, length = struct.unpack("<4I", read_exact(connection, 16))
     assert (magic, response_version, response_opcode) == (MAGIC, version, opcode)
-    assert 12 <= length <= (131072 if version == 3 else 4428)
+    assert 12 <= length <= (131072 if version >= 3 else 4428)
     reply = read_exact(connection, length)
     return struct.unpack("<3I", reply[:12]), reply[12:]
 
@@ -54,6 +54,7 @@ class IcdTests(unittest.TestCase):
         build("broker_probe.c", "broker_probe")
         build("capability_inventory.c", "capability_inventory")
         build("tests/capability_contract.c", "capability_contract", ["-l:libvulkan.so.1"])
+        build("tests/device_contract.c", "device_contract", ["-l:libvulkan.so.1"])
         build("tests/icd_contract.c", "icd_contract", ["-ldl"])
         build("tests/broker_mock.c", "broker_mock", ["-pthread", "-I" + str(ROOT / "tests"),
               "-I" + str(java / "include"), "-I" + str(java / "include/linux")])
@@ -81,9 +82,13 @@ class IcdTests(unittest.TestCase):
                 self.cleanup_output = output
                 self.assertFalse(path.exists(), "broker must remove its socket")
 
-    def run_program(self, name, path, *arguments, capabilities=False):
+    def run_program(self, name, path, *arguments, capabilities=False, device=False):
         env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(self.manifest),
                    VK_ICD_FILENAMES=str(self.manifest), VK_LOADER_LAYERS_DISABLE="*")
+        if device:
+            env["MALI_VULKAN_DEVICE_TEST"] = "1"
+        else:
+            env.pop("MALI_VULKAN_DEVICE_TEST", None)
         if capabilities:
             env["MALI_VULKAN_QUERY_CAPABILITIES"] = "1"
         else:
@@ -97,6 +102,94 @@ class IcdTests(unittest.TestCase):
         connection.settimeout(5)
         connection.connect(path)
         return connection
+
+    def test_device_loader_contract(self):
+        with self.broker() as path:
+            result = self.run_program("device_contract", path, device=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("device contracts:", result.stdout)
+        self.assertIn("DEVICES creates=3 destroys=3 queues=3", self.cleanup_output)
+
+    def device_request(self, physical=1, family=0, feature=-1, extension=None):
+        features = [int(i == feature) for i in range(55)]
+        return (struct.pack("<4I", physical, family, 1, int(extension is not None)) +
+                struct.pack("<55I", *features) + struct.pack("<f", 1.0) +
+                (extension.encode().ljust(256, b"\0") if extension is not None else b""))
+
+    def device_session(self, path):
+        connection = self.connect(path)
+        self.assertEqual(rpc(connection, 2, struct.pack("<I", 1 << 22), version=4)[0], (0, 0, 0))
+        self.assertEqual(rpc(connection, 4, version=4)[0], (0, 0, 1))
+        return connection
+
+    def test_device_protocol_rejections_and_stable_ids(self):
+        with self.broker() as path:
+            connection = self.device_session(path)
+            for request, status, result in (
+                (self.device_request(physical=99), 3, 0),
+                (self.device_request(family=99), 3, 0),
+                (self.device_request(extension="HOST_UNSUPPORTED"), 2, -7),
+                (self.device_request(feature=22), 2, -8), # textureCompressionBC
+                (self.device_request()[:-1], 3, 0),
+                (self.device_request() + b"x", 3, 0),
+            ):
+                self.assertEqual(rpc(connection, 14, request, version=4)[0], (status, result & 0xffffffff, 0))
+            for op, payload in ((15, struct.pack("<3I", 99, 0, 0)), (16, struct.pack("<I", 99))):
+                self.assertEqual(rpc(connection, op, payload, version=4)[0], (3, 0, 0))
+            for expected in (1, 2):
+                # Byte-at-a-time request fragmentation, supported extension + supported feature.
+                request = self.device_request(feature=19, extension="VK_KHR_external_memory_fd")
+                header = struct.pack("<4I", MAGIC, 4, 14, len(request))
+                for byte in header + request:
+                    connection.sendall(bytes([byte]))
+                self.assertEqual(struct.unpack("<4I", read_exact(connection, 16)), (MAGIC, 4, 14, 16))
+                self.assertEqual(struct.unpack("<4I", read_exact(connection, 16)), (0, 0, 1, expected))
+                for family, index in ((99, 0), (0, 99)):
+                    self.assertEqual(rpc(connection, 15, struct.pack("<3I", expected, family, index), version=4)[0], (3, 0, 0))
+                for repeat in range(2):
+                    prefix, queue = rpc(connection, 15, struct.pack("<3I", expected, 0, 0), version=4)
+                    self.assertEqual(prefix, (0, 0, 1)); self.assertEqual(queue, struct.pack("<I", expected))
+                self.assertEqual(rpc(connection, 16, struct.pack("<I", expected), version=4)[0], (0, 0, 0))
+                self.assertEqual(rpc(connection, 15, struct.pack("<3I", expected, 0, 0), version=4)[0], (3, 0, 0))
+            self.assertEqual(rpc(connection, 3, version=4)[0], (0, 0, 0))
+        self.assertIn("DEVICES creates=2 destroys=2 queues=2", self.cleanup_output)
+
+    def test_device_disconnect_stop_and_instance_cleanup(self):
+        with self.broker() as path:
+            connections = [self.device_session(path) for _ in range(3)]
+            for c in connections:
+                self.assertEqual(rpc(c, 14, self.device_request(), version=4)[0], (0, 0, 1))
+            connections[0].close()
+            self.assertEqual(rpc(connections[1], 3, version=4)[0], (0, 0, 0))
+            # Third live device/instance is reclaimed by broker shutdown.
+        self.assertIn("DEVICES creates=3 destroys=3 queues=0", self.cleanup_output)
+        self.assertIn("creates=3 destroys=3 closes=3", self.cleanup_output)
+
+    def test_device_backend_errors_and_cleanup(self):
+        for mode in (9, 10, 11):
+            with self.subTest(mode=mode), self.broker(mode) as path:
+                c = self.device_session(path)
+                prefix, _ = rpc(c, 14, self.device_request(), version=4)
+                if mode == 10:
+                    self.assertEqual(prefix, (0, 0, 1))
+                    self.assertEqual(rpc(c, 15, struct.pack("<3I", 1, 0, 0), version=4)[0], (2, (-3) & 0xffffffff, 0))
+                else:
+                    self.assertNotEqual(prefix[0], 0)
+                self.assertEqual(rpc(c, 3, version=4)[0], (0, 0, 0))
+            self.assertIn("DEVICES creates=0 destroys=0" if mode == 9 else "DEVICES creates=1 destroys=1", self.cleanup_output)
+
+    def test_session_version_cannot_upgrade(self):
+        for version in (2, 3):
+            with self.broker() as path:
+                c = self.connect(path)
+                self.assertEqual(rpc(c, 2, struct.pack("<I", 1 << 22), version=version)[0], (0, 0, 0))
+                self.assertEqual(rpc(c, 4, version=version)[0], (0, 0, 1))
+                self.assertEqual(rpc(c, 14, self.device_request(), version=4)[0], (3, 0, 0))
+                try:
+                    self.assertEqual(c.recv(1), b"")
+                except ConnectionResetError:
+                    pass # Closing with an unread rejected payload may reset the socket.
+            self.assertIn("DEVICES creates=0 destroys=0", self.cleanup_output)
 
     def test_capability_loader_contract(self):
         with self.broker() as path:

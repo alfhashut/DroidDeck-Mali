@@ -127,6 +127,48 @@ object SystemVulkanBroker {
         return "$output\nGamescope Vulkan enumeration via Linux/proot exit code=$code$hint"
     }
 
+    /** Runs the actual staged DroidDeck Gamescope binary, without starting a session. */
+    @Synchronized
+    fun runGamescopeDeviceTest(context: Context): String {
+        val path = socket ?: throw IOException("Broker is not running")
+        if (!LinuxRuntime.isInstalled(context)) {
+            return "Linux runtime is not installed or is being removed.\n" +
+                "Install the Linux runtime in DroidDeck, then retry. The Android broker is still running."
+        }
+        val gamescope = "/usr/local/bin/gamescope"
+        val bundled = context.assets.list("linuxfs/usr/local/bin")?.contains("gamescope") == true
+        if (!bundled && !File(LinuxRuntime.rootDir(context), gamescope.removePrefix("/")).isFile) {
+            return "DroidDeck Gamescope is not installed or bundled.\n" +
+                "Build Gamescope 3.16.29 with patches 0113–0115 and bundle it in the APK before retrying."
+        }
+        val directory = path.parentFile
+        for (name in listOf("libdroiddeck_mali_proxy.so", "mali_proxy_icd.json")) {
+            val file = File(directory, name)
+            context.assets.open("mali-vulkan/$name").use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            }
+            Os.chmod(file.path, 0x180) // 0600
+        }
+        val manifest = File(directory, "mali_proxy_icd.json")
+        // GuestCommand stages the APK's Gamescope through the existing SessionFiles path.
+        // The ICD overrides apply only to this diagnostic child, never to a normal session.
+        val command = listOf("/usr/bin/env", "VK_DRIVER_FILES=${manifest.path}",
+            "VK_ICD_FILENAMES=${manifest.path}", "MALI_VULKAN_BROKER_SOCKET=${path.path}",
+            "MALI_VULKAN_DEVICE_TEST=1", "VK_LOADER_LAYERS_DISABLE=*", "VK_LOADER_DEBUG=error,warn,driver",
+            gamescope, "--vk-create-device-test")
+        Log.i(TAG, "starting Gamescope device test via Linux/proot: $gamescope --vk-create-device-test")
+        val output = StringBuilder()
+        val code = GuestCommand.run(context, command) { line ->
+            output.append(line).append('\n')
+            Log.i(TAG, "Gamescope device test/proot: $line")
+        }
+        Log.i(TAG, "Gamescope Vulkan device test via Linux/proot exit=$code")
+        val hint = if (code != 0 && output.contains("unrecognized option")) {
+            "\nThis Gamescope binary lacks checkpoint 4B. Bundle Gamescope 3.16.29 rebuilt with patches 0113–0115 in the APK."
+        } else ""
+        return "$output\nGamescope Vulkan device test via Linux/proot exit code=$code$hint"
+    }
+
     @Synchronized
     fun runCapabilities(context: Context): String {
         val path = socket ?: throw IOException("Broker is not running")

@@ -1,4 +1,4 @@
-/* Debug-only, query-only glibc ICD. No rendering or logical-device implementation. */
+/* Debug-only glibc ICD: query and opt-in logical-device lifecycle subset. */
 #define _GNU_SOURCE
 #define VK_NO_PROTOTYPES
 #include <pthread.h>
@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <vulkan/vk_icd.h>
 #include "capability_transport.h"
+#include "device_protocol.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
 #endif
@@ -31,6 +32,7 @@ struct proxy_instance {
     pthread_mutex_t lock;
     uint32_t count;
     uint32_t wire_version;
+    struct proxy_logical *logical;
     struct proxy_device devices[MB_MAX_DEVICES];
 };
 _Static_assert(offsetof(struct proxy_instance, loader) == 0, "instance dispatch word");
@@ -57,6 +59,8 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
     if (result == (uint32_t)VK_ERROR_OUT_OF_DEVICE_MEMORY) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (result == (uint32_t)VK_ERROR_INCOMPATIBLE_DRIVER) return VK_ERROR_INCOMPATIBLE_DRIVER;
     if (result == (uint32_t)VK_ERROR_FORMAT_NOT_SUPPORTED) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (result == (uint32_t)VK_ERROR_EXTENSION_NOT_PRESENT) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (result == (uint32_t)VK_ERROR_TOO_MANY_OBJECTS) return VK_ERROR_TOO_MANY_OBJECTS;
     if (result == (uint32_t)VK_ERROR_FEATURE_NOT_PRESENT) return VK_ERROR_FEATURE_NOT_PRESENT;
     return VK_ERROR_INITIALIZATION_FAILED;
 broken:
@@ -65,6 +69,8 @@ broken:
     shutdown(s->fd, SHUT_RDWR);
     return VK_ERROR_INITIALIZATION_FAILED;
 }
+
+static void proxy_free_logical(struct proxy_instance *);
 
 static VkResult cap_InstanceExtensions(const char *, uint32_t *, VkExtensionProperties *);
 
@@ -107,7 +113,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
     }
     struct proxy_instance *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    s->wire_version = mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION;
+    s->wire_version = mb_device_mode() ? MB_DEVICE_VERSION : (mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION);
     s->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     strcpy(address.sun_path, path);
     struct timeval timeout = { .tv_sec = 10 };
@@ -140,6 +146,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_DestroyInstance(VkInstance instance, con
     VkResult result = rpc(s, MB_DESTROY, NULL, 0, reply, &bytes, sizeof(reply));
     if (result == VK_SUCCESS && (bytes != MB_PREFIX_BYTES || mb_get_u32(reply + 8)))
         LOG("invalid destroy acknowledgement");
+    proxy_free_logical(s);
     close(s->fd);
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_destroy(&s->lock);
@@ -166,7 +173,7 @@ static VkResult cache_devices(struct proxy_instance *s) {
             return VK_ERROR_INITIALIZATION_FAILED;
         set_loader_magic_value(&s->devices[i]);
         s->devices[i].owner = s; s->devices[i].id = ids[i];
-        if (s->wire_version == MB_CAP_VERSION) {
+        if (s->wire_version >= MB_CAP_VERSION) {
             uint8_t *wide = malloc(MB_CAP_MAX_PAYLOAD);
             if (!wide) return VK_ERROR_OUT_OF_HOST_MEMORY;
             result = rpc(s, MB_CAPS, request, sizeof(request), wide, &bytes, MB_CAP_MAX_PAYLOAD);
@@ -227,48 +234,40 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_EnumerateInstanceExtensionProperties
  * empty capabilities; the opt-in version-3 session forwards real query data.
  * These calls never create a device, submit work or allocate GPU resources. */
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceFeatures(VkPhysicalDevice d, VkPhysicalDeviceFeatures *p) {
-    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { *p = ((struct proxy_device *)d)->capabilities.core; return; }
+    if (((struct proxy_device *)d)->owner->wire_version >= MB_CAP_VERSION) { *p = ((struct proxy_device *)d)->capabilities.core; return; }
     (void)d; memset(p, 0, sizeof(*p));
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceFormatProperties(VkPhysicalDevice d, VkFormat f, VkFormatProperties *p) {
-    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { cap_Format(d, f, p, NULL); return; }
+    if (((struct proxy_device *)d)->owner->wire_version >= MB_CAP_VERSION) { cap_Format(d, f, p, NULL); return; }
     (void)d; (void)f; memset(p, 0, sizeof(*p));
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice d, VkFormat f,
         VkImageType t, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties *p) {
-    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) return cap_Image(d, f, t, tiling, usage, flags, 0, 0, 0, p, NULL);
+    if (((struct proxy_device *)d)->owner->wire_version >= MB_CAP_VERSION) return cap_Image(d, f, t, tiling, usage, flags, 0, 0, 0, p, NULL);
     (void)d; (void)f; (void)t; (void)tiling; (void)usage; (void)flags; memset(p, 0, sizeof(*p));
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice d, uint32_t *count,
         VkQueueFamilyProperties *p) {
-    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { cap_Queues(d, count, p); return; }
+    if (((struct proxy_device *)d)->owner->wire_version >= MB_CAP_VERSION) { cap_Queues(d, count, p); return; }
     (void)d; (void)p; *count = 0;
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice d, VkPhysicalDeviceMemoryProperties *p) {
-    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { *p = ((struct proxy_device *)d)->capabilities.memory; return; }
+    if (((struct proxy_device *)d)->owner->wire_version >= MB_CAP_VERSION) { *p = ((struct proxy_device *)d)->capabilities.memory; return; }
     (void)d; memset(p, 0, sizeof(*p));
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_EnumerateDeviceExtensionProperties(VkPhysicalDevice d, const char *layer,
         uint32_t *count, VkExtensionProperties *p) {
-    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) return cap_DeviceExtensions(d, layer, count, p);
+    if (((struct proxy_device *)d)->owner->wire_version >= MB_CAP_VERSION) return cap_DeviceExtensions(d, layer, count, p);
     (void)d; return proxy_EnumerateInstanceExtensionProperties(layer, count, p);
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_GetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice d, VkFormat f,
         VkImageType t, VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageTiling tiling,
         uint32_t *count, VkSparseImageFormatProperties *p) {
-    if (((struct proxy_device *)d)->owner->wire_version == MB_CAP_VERSION) { cap_Sparse(d, f, t, samples, usage, tiling, count, p); return; }
+    if (((struct proxy_device *)d)->owner->wire_version >= MB_CAP_VERSION) { cap_Sparse(d, f, t, samples, usage, tiling, count, p); return; }
     (void)d; (void)f; (void)t; (void)samples; (void)usage; (void)tiling; (void)p; *count = 0;
 }
-static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice d, const VkDeviceCreateInfo *info,
-        const VkAllocationCallbacks *allocator, VkDevice *out) {
-    (void)d; (void)info; (void)allocator;
-    if (out) *out = VK_NULL_HANDLE;
-    return VK_ERROR_INITIALIZATION_FAILED;
-}
-static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr(VkDevice device, const char *name) {
-    (void)device; (void)name; return NULL;
-}
+#include "device_icd.h"
 
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
     if (!version || *version < 2) return VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -304,6 +303,8 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
     ENTRY(DestroyInstance)
     ENTRY(EnumeratePhysicalDevices)
     ENTRY(GetDeviceProcAddr)
+    ENTRY(DestroyDevice)
+    ENTRY(GetDeviceQueue)
 #undef ENTRY
     return physical_proc(name);
 }

@@ -22,6 +22,7 @@ static const char *mock_dlerror(void);
 #undef dlclose
 #undef dlerror
 static atomic_int mode, creates, destroys, closes;
+static atomic_int device_creates, device_destroys, queue_gets;
 static int thrown;
 int __android_log_print(int priority, const char *tag, const char *format, ...) {
     (void)priority;
@@ -57,6 +58,7 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
     memset(p, 0, sizeof(*p)); strcpy(p->deviceName, "HOST TEST ONLY");
     p->vendorID = 0x13b5; p->deviceID = 0x74021000; p->apiVersion = VK_MAKE_API_VERSION(0, 1, 1, 131);
     if (mode == 6) p->apiVersion = VK_API_VERSION_1_0;
+    if (mode == 13) { p->vendorID = 0xffff; p->deviceID = 0xffff; }
     p->driverVersion = 109051904; p->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     p->limits.maxImageDimension2D = 8192;
     p->limits.bufferImageGranularity = UINT64_C(0x123456789);
@@ -68,8 +70,39 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
 }
 #include "mock_capabilities.h"
 
+struct mock_logical { uint32_t family, count; };
+static VkResult mock_create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo *info,
+        const VkAllocationCallbacks *allocator, VkDevice *out) {
+    assert(physical == (VkPhysicalDevice)(uintptr_t)0x42 && !allocator);
+    assert(!info->pNext && !info->flags && !info->enabledLayerCount && info->queueCreateInfoCount == 1);
+    const VkDeviceQueueCreateInfo *q = info->pQueueCreateInfos;
+    assert(!q->pNext && !q->flags && q->queueCount && q->queueCount <= 2 && q->queueFamilyIndex < 2);
+    assert(info->pEnabledFeatures && !info->pEnabledFeatures->textureCompressionBC);
+    if (mode == 9) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    struct mock_logical *d = malloc(sizeof(*d)); assert(d);
+    d->family = q->queueFamilyIndex; d->count = q->queueCount;
+    *out = (VkDevice)d; ++device_creates; return VK_SUCCESS;
+}
+static void mock_destroy_device(VkDevice device, const VkAllocationCallbacks *allocator) {
+    assert(device && !allocator); free(device); ++device_destroys;
+}
+static void mock_get_queue(VkDevice device, uint32_t family, uint32_t index, VkQueue *out) {
+    struct mock_logical *d = (struct mock_logical *)device;
+    assert(d && family == d->family && index < d->count); ++queue_gets;
+    *out = mode == 10 ? VK_NULL_HANDLE : (VkQueue)(uintptr_t)(0x9000 + index);
+}
+static PFN_vkVoidFunction mock_gdpa(VkDevice device, const char *name) {
+    assert(device);
+    if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)mock_destroy_device;
+    if (!strcmp(name, "vkGetDeviceQueue")) return mode == 11 ? NULL : (PFN_vkVoidFunction)mock_get_queue;
+    return NULL;
+}
+
 static PFN_vkVoidFunction mock_gipa(VkInstance instance, const char *name) {
     (void)instance;
+    if (!strcmp(name, "vkCreateDevice")) return (PFN_vkVoidFunction)mock_create_device;
+    if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)mock_gdpa;
+    if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)mock_destroy_device;
     if (!strcmp(name, "vkCreateInstance")) return (PFN_vkVoidFunction)mock_create;
     if (!strcmp(name, "vkEnumeratePhysicalDevices")) return (PFN_vkVoidFunction)mock_enumerate;
     if (!strcmp(name, "vkGetPhysicalDeviceProperties") && mode != 5) return (PFN_vkVoidFunction)mock_properties;
@@ -148,6 +181,7 @@ int main(int argc, char **argv) {
         (void)getchar();
         stop();
         printf("CLEANUP creates=%d destroys=%d closes=%d\n", creates, destroys, closes);
+        printf("DEVICES creates=%d destroys=%d queues=%d\n", device_creates, device_destroys, queue_gets);
         return 0;
     }
     assert(argc == 4);

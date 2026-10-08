@@ -182,3 +182,10 @@ The tests cover v1/v2 regressions, v3 wire fragmentation/bounds/invalid fields, 
 masks, instance cleanup, 1.0 fallback, actual glibc loader dispatch/export symbols, and the complete
 Gamescope patch stack plus isolated diagnostic builds. A full APK/packaged Gamescope build and
 real Mali capability results still require CI and the phone; host mocks are not those validations.
+
+## Follow-up after real checkpoint 4A results
+
+Checkpoint 4A passed on the real phone. The 4B handoff and exact Gamescope source
+review are recorded in [DEVICE_TEST.md](DEVICE_TEST.md); that document supersedes
+the pending-phone entries above. Capability-only mode stays query-only. The new
+separate device-test mode creates/destroys a device and obtains a queue, with no rendering.

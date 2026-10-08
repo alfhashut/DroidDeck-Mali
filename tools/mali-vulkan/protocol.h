@@ -1,4 +1,4 @@
-/* Versioned Vulkan query protocol: no native Vulkan objects on the wire. */
+/* Versioned Vulkan diagnostic protocol: no native Vulkan objects on the wire. */
 #ifndef DROIDDECK_MALI_PROTOCOL_H
 #define DROIDDECK_MALI_PROTOCOL_H
 
@@ -72,6 +72,10 @@
 #define MB_MAX_MODIFIERS 128u
 #define MB_MAX_SPARSE 64u
 #define MB_EXTENSION_BYTES 260u
+
+/* Version 4 opts into logical-device/queue lifecycle; see device_protocol.h for
+ * the bounded scalar schema. Versions 1–3 remain query-only and retain layouts.
+ */
 
 static inline uint32_t mb_get_u32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 |

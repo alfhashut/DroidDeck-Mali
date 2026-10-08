@@ -30,7 +30,7 @@ class EnumerationTests(unittest.TestCase):
         shutil.copytree(source, cls.source, ignore=shutil.ignore_patterns(".git", "build", "builddir"))
         cls.patch_output = ""
         for patch in sorted((ROOT / "patches").glob("*.patch")):
-            if patch.name in ("0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch"):
+            if patch.name in ("0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch", "0115-vulkan-create-device-test.patch"):
                 # Validate added source whitespace, excluding the patch's context prefixes.
                 subprocess.run(["git", "apply", "--check", "--whitespace=error", str(patch)],
                                cwd=cls.source, check=True, capture_output=True)
@@ -60,6 +60,14 @@ class EnumerationTests(unittest.TestCase):
         cls.cap_normal = cls.directory / "capabilities-loader-diagnostic"
         subprocess.run(cls.compiler + cls.flags + [str(cls.cap_object), str(cap_main), "-l:libvulkan.so.1",
                        "-o", str(cls.cap_normal)], check=True)
+        cls.device_object = cls.directory / "device.o"
+        device_main = cls.directory / "device_main.cpp"
+        device_main.write_text('#include "vulkan_device_test.hpp"\nint main() { return vulkan_create_device_test(); }\n')
+        subprocess.run(cls.compiler + cls.flags + ["-c", str(cls.source / "src/vulkan_device_test.cpp"),
+                       "-o", str(cls.device_object)], check=True)
+        cls.device_normal = cls.directory / "device-loader-diagnostic"
+        subprocess.run(cls.compiler + cls.flags + [str(cls.device_object), str(device_main), "-l:libvulkan.so.1",
+                       "-o", str(cls.device_normal)], check=True)
         # Reuse checkpoint 2's actual proxy/broker host fixture without changing its tests.
         spec = importlib.util.spec_from_file_location("checkpoint2_fixture", MALI / "test_icd.py")
         module = importlib.util.module_from_spec(spec)
@@ -67,6 +75,75 @@ class EnumerationTests(unittest.TestCase):
         module.IcdTests.setUpClass()
         cls.addClassCleanup(module.IcdTests.doClassCleanups)
         cls.checkpoint2 = module.IcdTests("test_normal_loader")
+
+    def test_device_path_exits_before_normal_startup(self):
+        main = (self.source / "src/main.cpp").read_text()
+        body = main[main.index("int main(int argc, char **argv)"):]
+        early = body.index("return vulkan_create_device_test();")
+        self.assertLess(early, body.index("g_argc = argc;"))
+        parser = body.index("return vulkan_create_device_test();", early + 1)
+        for initialization in ("HasCapSysNice()", "RaiseFdLimit()", "gpuvis_trace_init()", "RunDefaultScripts()",
+                               "XInitThreads()", "auto_select_backend()", "vulkan_init_formats()", "vulkan_make_output()"):
+            self.assertLess(parser, body.index(initialization))
+        self.assertIn('{ "vk-create-device-test", no_argument, nullptr, 0 }', main)
+        symbols = subprocess.check_output(["nm", "-u", str(self.device_object)], text=True)
+        actual = {line.split()[-1] for line in symbols.splitlines() if line.split()[-1].startswith("vk")}
+        self.assertEqual(actual, {"vkCreateInstance", "vkDestroyInstance", "vkEnumeratePhysicalDevices",
+            "vkGetPhysicalDeviceProperties", "vkGetPhysicalDeviceFeatures", "vkEnumerateDeviceExtensionProperties",
+            "vkGetPhysicalDeviceQueueFamilyProperties", "vkCreateDevice", "vkGetDeviceQueue", "vkDestroyDevice"})
+        # This patch never touches the normal renderer or shaders.
+        patch = (ROOT / "patches/0115-vulkan-create-device-test.patch").read_text()
+        self.assertNotIn("b/src/rendervulkan", patch)
+        self.assertNotIn("b/src/shaders", patch)
+
+    def run_device(self, path):
+        fixture = self.checkpoint2
+        env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(fixture.manifest),
+                   VK_ICD_FILENAMES=str(fixture.manifest), VK_LOADER_LAYERS_DISABLE="*", MALI_VULKAN_DEVICE_TEST="1",
+                   DISPLAY="invalid-for-device-test", WAYLAND_DISPLAY="invalid-for-device-test")
+        return subprocess.run([str(self.device_normal)], env=env, capture_output=True, text=True, timeout=20)
+
+    def test_device_normal_loader_and_mock_android(self):
+        fixture = self.checkpoint2
+        with fixture.broker() as path:
+            for _ in range(2):
+                result = self.run_device(path)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for value in ("gamescope: Vulkan logical-device test", "physical device: HOST TEST ONLY",
+                              "physical API: 1.1.131", "queue family: 0 (verified graphics+compute)",
+                              "requested extensions: none", "requested features: none", "queue obtained = yes",
+                              "logical device destroyed", "instance destroyed", "normal Gamescope rendering remains disabled", "exit 0"):
+                    self.assertIn(value, result.stdout)
+                self.assertIn("broker vkCreateDevice = VK_SUCCESS", result.stderr)
+        self.assertIn("DEVICES creates=2 destroys=2 queues=2", fixture.cleanup_output)
+
+    def test_device_failures_cleanup_without_success(self):
+        fixture = self.checkpoint2
+        for mode in (3, 4, 9, 10, 11, 12, 13):
+            with self.subTest(mode=mode), fixture.broker(mode) as path:
+                result = self.run_device(path)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("exit 0", result.stdout)
+                self.assertIn("instance destroyed", result.stdout)
+            self.assertIn("creates=1 destroys=1", fixture.cleanup_output)
+            self.assertIn("DEVICES creates=1 destroys=1" if mode in (10, 11) else "DEVICES creates=0 destroys=0", fixture.cleanup_output)
+
+    def test_device_queue_family_zero_must_have_required_flags(self):
+        fixture = self.checkpoint2
+        with fixture.broker(14) as path:
+            result = self.run_device(path)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("queue family: 1 (verified graphics+compute)", result.stdout)
+        self.assertIn("DEVICES creates=1 destroys=1 queues=1", fixture.cleanup_output)
+
+    def test_device_missing_icd(self):
+        missing = str(self.directory / "missing.json")
+        result = subprocess.run([str(self.device_normal)], env=dict(os.environ, VK_DRIVER_FILES=missing,
+            VK_ICD_FILENAMES=missing, VK_LOADER_LAYERS_DISABLE="*"), capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("gamescope: device test vkCreateInstance failed:", result.stderr)
+        self.assertNotIn("physical device:", result.stdout)
+        self.assertNotIn("exit 0", result.stdout)
 
     def test_capability_path_has_no_device_or_backend_calls(self):
         main = (self.source / "src/main.cpp").read_text()
@@ -134,7 +211,7 @@ class EnumerationTests(unittest.TestCase):
         self.assertIn("'vulkan_enumerate_only.cpp'", (self.source / "src/meson.build").read_text())
         reverse = self.directory / "reverse-check"
         shutil.copytree(self.source, reverse)
-        for name in ("0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
+        for name in ("0115-vulkan-create-device-test.patch", "0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
             subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--reverse", "-i", str(ROOT / "patches" / name)],
                            cwd=reverse, check=True, capture_output=True)
 

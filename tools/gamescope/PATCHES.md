@@ -51,3 +51,11 @@ library list, before anything is published.
 
 Sixteen more of Armada's patches are DRM/lease/HDR-on-KMS work for a native display, which this
 app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the runtime has.
+
+- `0114-vulkan-capabilities.patch` - separate real-driver query diagnostic; no device creation.
+- `0115-vulkan-create-device-test.patch` - separate `--vk-create-device-test` checkpoint 4B:
+  selects the real ARM device, verifies a graphics+compute queue family, requests zero
+  extensions/features, creates a device, obtains a queue and destroys device/instance.
+  Both the standalone entry and option parser return before renderer/backend initialization.
+  Normal Vulkan version selection and robustness2 requirements are unchanged. See
+  [the source analysis and phone instructions](../mali-vulkan/DEVICE_TEST.md).

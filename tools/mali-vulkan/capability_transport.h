@@ -7,9 +7,13 @@
 #include <unistd.h>
 #include "capabilities.h"
 
+static inline int mb_device_mode(void) {
+    const char *value = getenv("MALI_VULKAN_DEVICE_TEST");
+    return value && !strcmp(value, "1");
+}
 static inline int mb_capability_mode(void) {
     const char *value = getenv("MALI_VULKAN_QUERY_CAPABILITIES");
-    return value && !strcmp(value, "1");
+    return mb_device_mode() || (value && !strcmp(value, "1"));
 }
 static inline int mb_cap_connect(void) {
     const char *path = getenv("MALI_VULKAN_BROKER_SOCKET");
