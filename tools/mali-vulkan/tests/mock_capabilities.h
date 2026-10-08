@@ -6,7 +6,8 @@ static const char *const instance_names[] = {
 static const char *const device_names[] = {
     "VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf", "VK_KHR_external_semaphore_fd",
     "VK_KHR_external_fence_fd", "VK_KHR_timeline_semaphore", "VK_EXT_scalar_block_layout",
-    "VK_KHR_shader_float16_int8", "VK_EXT_robustness2", "VK_EXT_image_drm_format_modifier"
+    "VK_KHR_shader_float16_int8", "VK_EXT_robustness2", "VK_EXT_image_drm_format_modifier",
+    "VK_ANDROID_external_memory_android_hardware_buffer", "VK_EXT_queue_family_foreign"
 };
 static VkResult mock_extension_list(const char *const *names, uint32_t total, uint32_t *count, VkExtensionProperties *p) {
     if (!p) { *count = total; return VK_SUCCESS; }
@@ -20,7 +21,7 @@ static VkResult mock_instance_extensions(const char *layer, uint32_t *count, VkE
 }
 static VkResult mock_device_extensions(VkPhysicalDevice d, const char *layer, uint32_t *count, VkExtensionProperties *p) {
     assert(d == (VkPhysicalDevice)(uintptr_t)0x42 && !layer);
-    return mock_extension_list(device_names, mode == 6 ? 0 : 9, count, p);
+    return mock_extension_list(device_names, mode == 6 ? 0 : mode >= 29 && mode != 33 ? 11 : 9, count, p);
 }
 static void mock_features(VkPhysicalDevice d, VkPhysicalDeviceFeatures *p) {
     assert(d == (VkPhysicalDevice)(uintptr_t)0x42); memset(p, 0, sizeof(*p));
@@ -70,7 +71,7 @@ static void mock_memory(VkPhysicalDevice d, VkPhysicalDeviceMemoryProperties *p)
     assert(d == (VkPhysicalDevice)(uintptr_t)0x42); memset(p, 0, sizeof(*p));
     p->memoryTypeCount = 2; p->memoryHeapCount = 1;
     p->memoryTypes[0] = (VkMemoryType){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, mode == 8 ? 1u : 0u};
-    p->memoryTypes[1] = (VkMemoryType){VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0};
+    p->memoryTypes[1] = (VkMemoryType){VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | (mode == 29 ? 0 : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT), 0};
     p->memoryHeaps[0] = (VkMemoryHeap){UINT64_C(0x123456789abcdef), VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
 }
 static void mock_format(VkPhysicalDevice d, VkFormat f, VkFormatProperties *p) {

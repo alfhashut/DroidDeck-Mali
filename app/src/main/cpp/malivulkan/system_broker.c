@@ -1,4 +1,4 @@
-/* Opt-in Android system Vulkan query broker. No rendering or driver override. */
+/* Opt-in Android system Vulkan query/lifecycle/memory diagnostic broker. No normal renderer or driver override. */
 #define _GNU_SOURCE
 #include <android/log.h>
 #include <dlfcn.h>
@@ -11,12 +11,18 @@
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <android/hardware_buffer.h>
+#include <poll.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include <vulkan/vulkan_android.h>
 #include "protocol.h"
 #include "capabilities.h"
 #include "submit_protocol.h"
 #include "submit_objects.h"
+#include "interop_protocol.h"
+#include "interop_objects.h"
+#include "interop_consumer.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__)
 #define ERROR(...) __android_log_print(ANDROID_LOG_ERROR, "MaliVulkanBroker", __VA_ARGS__)
@@ -50,6 +56,10 @@ struct vk_session {
         PFN_vkGetDeviceQueue get_queue;
         PFN_vkGetDeviceProcAddr gdpa;
         struct native_submit submit;
+        struct native_interop interop;
+        VkPhysicalDevice physical;
+        PFN_vkGetPhysicalDeviceImageFormatProperties2 image_properties;
+        PFN_vkGetPhysicalDeviceExternalFenceProperties fence_properties;
         uint32_t id, family, count, queue_flags;
         VkQueue queues[MB_DEVICE_MAX_QUEUES];
         uint32_t queue_ids[MB_DEVICE_MAX_QUEUES];
@@ -155,6 +165,7 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 }
 
 #include "capability_queries.h"
+#include "interop_commands.h"
 #include "submit_commands.h"
 #include "device_commands.h"
 
@@ -187,7 +198,7 @@ static uint32_t query_devices(uint8_t *payload) {
 static void serve(int fd) {
     struct vk_session s = {0};
     for (;;) {
-        uint8_t header[MB_HEADER_BYTES], request[MB_DEVICE_MAX_REQUEST], payload[MB_CAP_MAX_PAYLOAD] = {0};
+        uint8_t header[MB_HEADER_BYTES], request[MB_DEVICE_MAX_REQUEST + 4], payload[MB_CAP_MAX_PAYLOAD] = {0};
         if (mb_read(fd, header, sizeof(header))) break;
         uint32_t version = mb_get_u32(header + 4), op = mb_get_u32(header + 8);
         uint32_t request_bytes = mb_get_u32(header + 12), bytes = MB_PREFIX_BYTES;
@@ -202,7 +213,7 @@ static void serve(int fd) {
             if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes))
                 ERROR("write probe response: %s", strerror(errno));
             break;
-        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION && version != MB_SUBMIT_VERSION) ||
+        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION && version != MB_SUBMIT_VERSION && version != MB_INTEROP_VERSION) ||
                    (s.wire_version && version != s.wire_version) ||
                    (request_bytes && mb_read(fd, request, request_bytes))) {
             finish = 1;
@@ -262,9 +273,13 @@ static void serve(int fd) {
             uint32_t extra = 0;
             status = native_device_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
-        } else if (version == MB_SUBMIT_VERSION && op >= MB_POOL_CREATE && op <= MB_QUEUE_SUBMIT && s.instance && s.listed) {
+        } else if (version >= MB_SUBMIT_VERSION && op >= MB_POOL_CREATE && op <= MB_QUEUE_SUBMIT && s.instance && s.listed) {
             uint32_t extra = 0;
             status = native_submit_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (status == MB_OK) bytes += extra;
+        } else if (version == MB_INTEROP_VERSION && op >= MB_BUFFER_CREATE && op <= MB_AHB_PRESENT && s.instance && s.listed) {
+            uint32_t extra = 0;
+            status = native_interop_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
         } else if (op == MB_DESTROY && !request_bytes && s.instance) {
             close_session(&s); status = MB_OK; finish = 1;

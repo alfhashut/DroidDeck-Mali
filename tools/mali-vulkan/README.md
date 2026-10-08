@@ -367,3 +367,7 @@ uses `MALI_VULKAN_SUBMIT_TEST=1` only for its child. It records one core-1.0
 and requires a native `VK_EVENT_SET`. Rendering and normal Gamescope remain disabled.
 See [SUBMIT_TEST.md](SUBMIT_TEST.md) for the v5 subset, timeout lifetimes, build
 instructions, test results and real-phone acceptance. The 4B action stays on v4.
+
+Checkpoint 4D adds four independent memory/image/AHardwareBuffer diagnostics in one APK.
+See [INTEROP_TEST.md](INTEROP_TEST.md) for v6 ownership/synchronization, bounded scope,
+validation and the exact phone sequence. Normal Gamescope renderer requirements are unchanged.

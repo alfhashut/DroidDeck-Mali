@@ -1,5 +1,5 @@
 /* Local opaque resources and a loader-dispatchable primary command buffer. */
-enum proxy_resource_kind { PROXY_POOL, PROXY_COMMAND, PROXY_EVENT, PROXY_FENCE };
+enum proxy_resource_kind { PROXY_POOL, PROXY_COMMAND, PROXY_EVENT, PROXY_FENCE, PROXY_BUFFER, PROXY_MEMORY, PROXY_IMAGE, PROXY_AHB, PROXY_SYNC };
 struct proxy_resource {
     VK_LOADER_DATA loader;
     struct proxy_logical *owner;
@@ -7,10 +7,12 @@ struct proxy_resource {
     uint32_t id, pool;
     enum proxy_resource_kind kind;
     atomic_int live;
+    uint8_t *mirror;
+    uint64_t allocation, map_offset, map_size;
 };
 _Static_assert(offsetof(struct proxy_resource, loader) == 0, "command buffer dispatch word");
 static void proxy_free_resources(struct proxy_logical *d) {
-    while (d->resources) { struct proxy_resource *next = d->resources->next; free(d->resources); d->resources = next; }
+    while (d->resources) { struct proxy_resource *next = d->resources->next; free(d->resources->mirror); free(d->resources); d->resources = next; }
 }
 static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t handle, enum proxy_resource_kind kind) {
     struct proxy_resource *found = NULL;
@@ -22,7 +24,7 @@ static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t han
 }
 static VkResult submit_rpc(struct proxy_logical *d, uint32_t op, const uint32_t *args, unsigned n,
         uint64_t timeout, uint32_t *id) {
-    if (!d || d->owner->wire_version != MB_SUBMIT_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!d || d->owner->wire_version < MB_SUBMIT_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     uint8_t request[24], reply[MB_PREFIX_BYTES + 4]; uint32_t bytes = 0;
     mb_put_u32(request, d->id);
     for (unsigned i = 0; i < n; ++i) mb_put_u32(request + 4 + i * 4, args[i]);

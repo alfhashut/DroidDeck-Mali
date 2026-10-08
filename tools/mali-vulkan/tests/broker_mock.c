@@ -62,7 +62,7 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
     p->driverVersion = 109051904; p->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     p->limits.maxImageDimension2D = 8192;
     p->limits.bufferImageGranularity = UINT64_C(0x123456789);
-    p->limits.minMemoryMapAlignment = 4096;
+    p->limits.minMemoryMapAlignment = 4096; p->limits.nonCoherentAtomSize = 256;
     p->limits.minTexelOffset = -8;
     p->limits.timestampPeriod = 2.5f;
     p->sparseProperties.residencyStandard2DBlockShape = VK_TRUE;
@@ -72,7 +72,9 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
 
 struct mock_object;
 struct mock_logical { uint32_t family, count; int lost, idle_retries; struct mock_object *commands[MB_SUBMIT_MAX_OBJECTS]; };
+#include "mock_interop_types.h"
 #include "mock_submit.h"
+#include "mock_interop.h"
 static VkResult mock_create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo *info,
         const VkAllocationCallbacks *allocator, VkDevice *out) {
     assert(physical == (VkPhysicalDevice)(uintptr_t)0x42 && !allocator);
@@ -103,6 +105,11 @@ static PFN_vkVoidFunction mock_gdpa(VkDevice device, const char *name) {
 #define MB_SUBMIT_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)mock_##n;
 #include "submit_entries.def"
 #undef MB_SUBMIT_ENTRY
+#define MB_INTEROP_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)mock_##n;
+#include "interop_entries.def"
+#undef MB_INTEROP_ENTRY
+    if (!strcmp(name, "vkGetAndroidHardwareBufferPropertiesANDROID")) return (PFN_vkVoidFunction)mock_GetAndroidHardwareBufferPropertiesANDROID;
+    if (!strcmp(name, "vkGetFenceFdKHR")) return (PFN_vkVoidFunction)mock_GetFenceFdKHR;
     if (!strcmp(name, "vkDeviceWaitIdle")) return (PFN_vkVoidFunction)mock_DeviceWaitIdle;
     return NULL;
 }
@@ -192,6 +199,8 @@ int main(int argc, char **argv) {
         printf("CLEANUP creates=%d destroys=%d closes=%d\n", creates, destroys, closes);
         printf("DEVICES creates=%d destroys=%d queues=%d\n", device_creates, device_destroys, queue_gets);
         printf("SUBMIT pools=%d/%d commands=%d/%d events=%d/%d fences=%d/%d submits=%d executions=%d idle=%d\n", pools_created, pools_destroyed, commands_allocated, commands_freed, events_created, events_destroyed, fences_created, fences_destroyed, submits, executions, idle_calls);
+        printf("INTEROP buffers=%d/%d images=%d/%d memories=%d/%d AHB=%d/%d consumers=%d CPU=%d flush=%d invalidate=%d\n", buffers_created, buffers_destroyed, images_created, images_destroyed, memories_created, memories_freed, ahb_created, ahb_freed, consumers, cpu_locks, flushes, invalidates);
+        assert(buffers_created == buffers_destroyed && images_created == images_destroyed && memories_created == memories_freed && ahb_created == ahb_freed);
         assert(pools_created == pools_destroyed && commands_allocated == commands_freed && events_created == events_destroyed && fences_created == fences_destroyed);
         return 0;
     }

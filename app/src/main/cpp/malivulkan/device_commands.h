@@ -3,6 +3,12 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         uint32_t bytes, uint8_t *reply, uint32_t *extra, uint32_t *count, VkResult *result) {
     if (op == MB_DEVICE_CREATE) {
         struct mb_device_request r;
+        uint32_t service = 0;
+        if (s->wire_version == MB_INTEROP_VERSION) {
+            if (bytes < 4) return MB_PROTOCOL_ERROR;
+            service = mb_get_u32(wire + bytes - 4); bytes -= 4;
+            if (service > 1) return MB_PROTOCOL_ERROR;
+        }
         if (mb_decode_device_request(wire, bytes, &r) || r.physical_id > s->count) return MB_PROTOCOL_ERROR;
         uint8_t *snapshot = malloc(MB_PROPERTIES_BYTES + MB_CAPS_BYTES);
         struct mb_capabilities *caps = calloc(1, sizeof(*caps));
@@ -25,6 +31,18 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
 #include "features_fields.def"
 #undef MB_FEATURE
         uint32_t queue_flags = caps->queues[r.family].queueFlags;
+        VkPhysicalDeviceMemoryProperties memory = caps->memory;
+        if (service) {
+            const char *required[] = {"VK_ANDROID_external_memory_android_hardware_buffer", "VK_EXT_queue_family_foreign", "VK_KHR_external_fence_fd"};
+            VkPhysicalDeviceProperties service_properties; get_properties(s, r.physical_id - 1, &service_properties);
+            if (r.extension_count || s->native_api < VK_API_VERSION_1_1 || service_properties.apiVersion < VK_API_VERSION_1_1) { free(caps); *result = VK_ERROR_FEATURE_NOT_PRESENT; return MB_VULKAN_ERROR; }
+            for (unsigned i = 0; i < 3; ++i) {
+                if (!mb_has_extension(caps->extensions, caps->extension_count, required[i])) {
+                    ERROR("AHB native service requires %s", required[i]); free(caps); *result = VK_ERROR_EXTENSION_NOT_PRESENT; return MB_VULKAN_ERROR;
+                }
+                strcpy(r.extensions[r.extension_count++], required[i]);
+            }
+        }
         free(caps);
         struct native_device *d = NULL;
         for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
@@ -67,7 +85,14 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         }
         memset(d, 0, sizeof(*d)); d->handle = handle; d->destroy = destroy; d->get_queue = get;
         d->id = ++s->next_device_id; d->family = r.family; d->count = r.count; d->gdpa = gdpa; d->queue_flags = queue_flags;
-        if (s->wire_version == MB_SUBMIT_VERSION && native_submit_init(d)) {
+        d->physical = s->devices[r.physical_id - 1];
+        d->image_properties = (PFN_vkGetPhysicalDeviceImageFormatProperties2)s->gipa(s->instance, "vkGetPhysicalDeviceImageFormatProperties2");
+        d->fence_properties = (PFN_vkGetPhysicalDeviceExternalFenceProperties)s->gipa(s->instance, "vkGetPhysicalDeviceExternalFenceProperties");
+        d->interop.properties = memory; d->interop.atom = properties.limits.nonCoherentAtomSize;
+        if (s->wire_version >= MB_SUBMIT_VERSION && native_submit_init(d)) {
+            native_close_device(d); *result = VK_ERROR_INITIALIZATION_FAILED; return MB_LOADER_ERROR;
+        }
+        if (s->wire_version == MB_INTEROP_VERSION && native_interop_init(d, service)) {
             native_close_device(d); *result = VK_ERROR_INITIALIZATION_FAILED; return MB_LOADER_ERROR;
         }
         mb_put_u32(reply, d->id); *extra = 4; *count = 1; return MB_OK;

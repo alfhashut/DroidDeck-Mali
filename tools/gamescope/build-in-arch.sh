@@ -101,6 +101,18 @@ set -e
 cat out/gamescope-submit.log
 test "$SUBMIT_STATUS" -eq 1
 grep -F 'gamescope: submit test vkCreateInstance failed:' out/gamescope-submit.log
+# All four paths must be in this same packaged executable and must exit before startup.
+for diagnostic in vk-buffer-memory-test vk-image-memory-test vk-ahb-test vk-ahb-present-test; do
+  grep -F -- "--$diagnostic" out/gamescope-help.log
+  set +e
+  env VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
+    VK_LOADER_LAYERS_DISABLE='*' out/usr/local/bin/gamescope "--$diagnostic" > "out/gamescope-$diagnostic.log" 2>&1
+  INTEROP_STATUS=$?
+  set -e
+  cat "out/gamescope-$diagnostic.log"
+  test "$INTEROP_STATUS" -eq 1
+  grep -F 'vkCreateInstance: VkResult=' "out/gamescope-$diagnostic.log"
+done
 # Every NEEDED library must be one the runtime ships, or the binary would not load there.
 NEEDED=$(readelf -d out/usr/local/bin/gamescope | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
 echo "NEEDED: $NEEDED"

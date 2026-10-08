@@ -50,10 +50,10 @@ add_library(deviceinfo SHARED deviceinfo/vkinfo.c)
 target_link_libraries(deviceinfo dl)
 
 # Explicitly started debug broker; uses only the installed Android system loader.
-add_library(malivulkan SHARED malivulkan/system_broker.c)
+add_library(malivulkan SHARED malivulkan/system_broker.c malivulkan/interop_consumer.c)
 target_compile_features(malivulkan PRIVATE c_std_11)
 target_include_directories(malivulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/mali-vulkan")
-target_link_libraries(malivulkan dl log)
+target_link_libraries(malivulkan dl log android)
 
 # Rebuild Termux terminal-emulator's PTY JNI helper with the app's NDK instead of carrying its
 # prebuilt libtermux.so with a redundant libstdc++.so dependency.

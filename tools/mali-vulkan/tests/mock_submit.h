@@ -5,16 +5,20 @@ struct mock_object {
     struct mock_logical *device;
     unsigned kind, state, pending;
     struct mock_object *pool, *event, *fence;
+    unsigned op_count; struct mock_op ops[64];
+    int exportable, exported, writer;
 };
 static struct mock_object *mock_object_new(VkDevice device, unsigned kind) {
-    struct mock_object *o = calloc(1, sizeof(*o)); assert(o); o->device = (struct mock_logical *)device; o->kind = kind; return o;
+    struct mock_object *o = calloc(1, sizeof(*o)); assert(o); o->device = (struct mock_logical *)device; o->kind = kind; o->writer = -1; return o;
 }
 static void mock_child(VkDevice device, struct mock_object *o, unsigned kind) { assert(o && o->device == (struct mock_logical *)device && o->kind == kind); }
 static void mock_execute(struct mock_object *c) {
-    assert(c->pending && c->state == 2 && c->event);
-    c->event->state = mode == 25 ? VK_EVENT_RESET : VK_EVENT_SET;
-    c->event->pending = 0;
-    if (c->fence) { c->fence->state = 1; c->fence->pending = 0; }
+    assert(c->pending && c->state == 2 && (c->event || c->op_count));
+    mock_interop_execute(c);
+    if (c->event) { c->event->state = mode == 25 ? VK_EVENT_RESET : VK_EVENT_SET; c->event->pending = 0; }
+    if (c->fence) { c->fence->state = 1; c->fence->pending = 0;
+        if (c->fence->writer >= 0) { assert(write(c->fence->writer, "x", 1) == 1); close(c->fence->writer); c->fence->writer = -1; }
+    }
     c->pending = 0; ++executions;
 }
 static VkResult mock_CreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkCommandPool *out) {
@@ -47,7 +51,7 @@ static VkResult mock_BeginCommandBuffer(VkCommandBuffer buffer, const VkCommandB
     c->state = 1; return VK_SUCCESS;
 }
 static VkResult mock_EndCommandBuffer(VkCommandBuffer buffer) {
-    struct mock_object *c = (struct mock_object *)buffer; assert(c->kind == 2 && c->state == 1 && c->event);
+    struct mock_object *c = (struct mock_object *)buffer; assert(c->kind == 2 && c->state == 1 && (c->event || c->op_count));
     if (mode == 19) return VK_ERROR_OUT_OF_HOST_MEMORY;
     c->state = 2; return VK_SUCCESS;
 }
@@ -70,9 +74,11 @@ static void mock_CmdSetEvent(VkCommandBuffer buffer, VkEvent event, VkPipelineSt
     c->event = e; /* Event remains RESET until mock queue execution. */
 }
 static VkResult mock_CreateFence(VkDevice device, const VkFenceCreateInfo *ci, const VkAllocationCallbacks *a, VkFence *out) {
-    assert(!a && !ci->pNext && !ci->flags);
+    assert(!a && !ci->flags);
+    const VkExportFenceCreateInfo *export = ci->pNext;
+    if (export) assert(export->sType == VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO && !export->pNext && export->handleTypes == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT);
     if (mode == 20) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    *out = (VkFence)mock_object_new(device, 4); ++fences_created; return VK_SUCCESS;
+    *out = (VkFence)mock_object_new(device, 4); ((struct mock_object *)*out)->exportable = export != NULL; ++fences_created; return VK_SUCCESS;
 }
 static void mock_DestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks *a) {
     struct mock_object *f = (struct mock_object *)fence; assert(!a); mock_child(device, f, 4);
@@ -97,11 +103,11 @@ static VkResult mock_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitIn
     struct mock_logical *d = (struct mock_logical *)queue;
     assert(count == 1 && !si->pNext && !si->waitSemaphoreCount && !si->signalSemaphoreCount && si->commandBufferCount == 1);
     struct mock_object *c = (struct mock_object *)si->pCommandBuffers[0], *f = (struct mock_object *)fence;
-    assert(c->device == d && c->state == 2 && !c->pending && c->event);
+    assert(c->device == d && c->state == 2 && !c->pending && (c->event || c->op_count));
     if (mode == 21) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (mode == 23) { d->lost = 1; return VK_ERROR_DEVICE_LOST; }
     if (f) { mock_child((VkDevice)d, f, 4); assert(!f->state && !f->pending); f->pending = 1; }
-    c->fence = f; c->pending = 1; c->event->pending = 1; ++submits; return VK_SUCCESS;
+    c->fence = f; c->pending = 1; if (c->event) c->event->pending = 1; ++submits; return VK_SUCCESS;
 }
 static VkResult mock_DeviceWaitIdle(VkDevice device) {
     struct mock_logical *d = (struct mock_logical *)device;

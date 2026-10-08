@@ -3,6 +3,7 @@ package com.droiddeck.launcher.gpu
 import android.content.Context
 import android.system.Os
 import android.util.Log
+import android.view.Surface
 import com.droiddeck.launcher.runtime.GuestCommand
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import java.io.File
@@ -15,6 +16,13 @@ object SystemVulkanBroker {
 
     @JvmStatic private external fun nativeStart(socketPath: String)
     @JvmStatic private external fun nativeStop()
+    @JvmStatic private external fun nativeSetSurface(surface: Surface?)
+
+    // Surface callbacks must never acquire the monitor held by a running diagnostic.
+    fun setDebugSurface(surface: Surface?) {
+        System.loadLibrary("malivulkan")
+        nativeSetSurface(surface)
+    }
 
     @Synchronized
     fun start(context: Context): String {
@@ -208,6 +216,38 @@ object SystemVulkanBroker {
             "\nThis Gamescope binary lacks checkpoint 4C. Bundle Gamescope 3.16.29 rebuilt with patches 0113–0116 in the APK."
         } else ""
         return "$output\nGamescope Vulkan submit test via Linux/proot exit code=$code$hint"
+    }
+
+    /** Four independent v6 diagnostics in the same Gamescope/APK build. */
+    @Synchronized
+    fun runInteropTest(context: Context, option: String): String {
+        val options = setOf("--vk-buffer-memory-test", "--vk-image-memory-test",
+            "--vk-ahb-test", "--vk-ahb-present-test")
+        require(option in options)
+        val path = socket ?: throw IOException("Broker is not running")
+        if (!LinuxRuntime.isInstalled(context)) return "Install the Linux runtime in DroidDeck, then retry."
+        val directory = path.parentFile
+        for (name in listOf("libdroiddeck_mali_proxy.so", "mali_proxy_icd.json")) {
+            val file = File(directory, name)
+            context.assets.open("mali-vulkan/$name").use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            }
+            Os.chmod(file.path, 0x180)
+        }
+        val manifest = File(directory, "mali_proxy_icd.json")
+        val ahb = option == "--vk-ahb-test" || option == "--vk-ahb-present-test"
+        val command = listOf("/usr/bin/env", "VK_DRIVER_FILES=${manifest.path}",
+            "VK_ICD_FILENAMES=${manifest.path}", "MALI_VULKAN_BROKER_SOCKET=${path.path}",
+            "MALI_VULKAN_INTEROP_TEST=1", "MALI_VULKAN_AHB_TEST=${if (ahb) 1 else 0}",
+            "VK_LOADER_LAYERS_DISABLE=*", "VK_LOADER_DEBUG=error,warn,driver",
+            "/usr/local/bin/gamescope", option)
+        val output = StringBuilder()
+        val code = GuestCommand.run(context, command) { line ->
+            output.append(line).append('\n')
+            Log.i(TAG, "Gamescope $option/proot: $line")
+        }
+        Log.i(TAG, "Gamescope $option exit=$code")
+        return "$output\nGamescope $option via Linux/proot exit code=$code"
     }
 
     @Synchronized

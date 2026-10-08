@@ -14,6 +14,9 @@ struct proxy_logical {
     struct proxy_queue queues[MB_DEVICE_MAX_QUEUES];
     struct proxy_resource *resources;
     atomic_int submit_failed;
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    size_t map_alignment;
+    VkDeviceSize atom;
 };
 _Static_assert(offsetof(struct proxy_logical, loader) == 0, "device dispatch word");
 _Static_assert(offsetof(struct proxy_queue, loader) == 0, "queue dispatch word");
@@ -48,9 +51,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice physic
 #include "features_fields.def"
 #undef MB_FEATURE
     for (uint32_t i = 0; i < q->queueCount; ++i) request.priorities[i] = q->pQueuePriorities[i];
-    uint8_t wire[MB_DEVICE_MAX_REQUEST], reply[MB_PREFIX_BYTES + 4]; uint32_t bytes;
+    uint8_t wire[MB_DEVICE_MAX_REQUEST + 4], reply[MB_PREFIX_BYTES + 4]; uint32_t bytes;
     uint32_t size = mb_encode_device_request(wire, &request);
     if (!size) return VK_ERROR_INITIALIZATION_FAILED;
+    if (s->wire_version == MB_INTEROP_VERSION) {
+        const char *ahb = getenv("MALI_VULKAN_AHB_TEST");
+        mb_put_u32(wire + size, ahb && !strcmp(ahb, "1")); size += 4;
+    }
     struct proxy_logical *d = calloc(1, sizeof(*d));
     if (!d) return VK_ERROR_OUT_OF_HOST_MEMORY;
     pthread_mutex_lock(&s->lock);
@@ -59,6 +66,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice physic
         shutdown(s->fd, SHUT_RDWR); result = VK_ERROR_INITIALIZATION_FAILED;
     }
     if (result == VK_SUCCESS) {
+        d->atom = p->properties.limits.nonCoherentAtomSize; d->memory_properties = p->capabilities.memory; d->map_alignment = p->properties.limits.minMemoryMapAlignment;
         d->owner = s; d->id = mb_get_u32(reply + 12); d->family = q->queueFamilyIndex; d->count = q->queueCount;
         set_loader_magic_value(d);
         for (uint32_t i = 0; i < d->count; ++i) {
@@ -112,6 +120,7 @@ static void proxy_free_logical(struct proxy_instance *s) {
     while (s->logical) { struct proxy_logical *next = s->logical->next; proxy_free_resources(s->logical); free(s->logical); s->logical = next; }
 }
 #include "submit_icd.h"
+#include "interop_icd.h"
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr(VkDevice device, const char *name) {
     if (!device || !name) return NULL;
@@ -120,10 +129,16 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr(VkDevice
     DEVICE_ENTRY(DestroyDevice)
     DEVICE_ENTRY(GetDeviceQueue)
 #undef DEVICE_ENTRY
-    if (((struct proxy_logical *)device)->owner->wire_version == MB_SUBMIT_VERSION) {
+    if (((struct proxy_logical *)device)->owner->wire_version >= MB_SUBMIT_VERSION) {
 #define MB_SUBMIT_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;
 #include "submit_entries.def"
 #undef MB_SUBMIT_ENTRY
+    }
+    if (((struct proxy_logical *)device)->owner->wire_version == MB_INTEROP_VERSION) {
+#define MB_INTEROP_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;
+#include "interop_entries.def"
+#undef MB_INTEROP_ENTRY
+        if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
     }
     return NULL;
 }

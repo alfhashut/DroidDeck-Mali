@@ -30,7 +30,7 @@ class EnumerationTests(unittest.TestCase):
         shutil.copytree(source, cls.source, ignore=shutil.ignore_patterns(".git", "build", "builddir"))
         cls.patch_output = ""
         for patch in sorted((ROOT / "patches").glob("*.patch")):
-            if patch.name in ("0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch", "0115-vulkan-create-device-test.patch", "0116-vulkan-submit-test.patch"):
+            if patch.name in ("0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch", "0115-vulkan-create-device-test.patch", "0116-vulkan-submit-test.patch", "0117-vulkan-memory-ahb-tests.patch"):
                 # Validate added source whitespace, excluding the patch's context prefixes.
                 subprocess.run(["git", "apply", "--check", "--whitespace=error", str(patch)],
                                cwd=cls.source, check=True, capture_output=True)
@@ -76,6 +76,11 @@ class EnumerationTests(unittest.TestCase):
         cls.submit_normal = cls.directory / "submit-loader-diagnostic"
         subprocess.run(cls.compiler + cls.flags + [str(cls.submit_object), str(submit_main), "-l:libvulkan.so.1",
                        "-o", str(cls.submit_normal)], check=True)
+        interop_main = cls.directory / "interop_main.cpp"
+        interop_main.write_text('#include "vulkan_interop_test.hpp"\n#include <cstdlib>\nint main(int argc,char **argv) { if(argc!=2)return 2; switch(std::atoi(argv[1])) { case 1:return vulkan_buffer_memory_test(); case 2:return vulkan_image_memory_test(); case 3:return vulkan_ahb_test(); case 4:return vulkan_ahb_present_test(); } return 2; }\n')
+        cls.interop_normal = cls.directory / "interop-loader-diagnostic"
+        subprocess.run(cls.compiler + cls.flags + [str(cls.source / "src/vulkan_interop_test.cpp"),
+                       str(interop_main), "-l:libvulkan.so.1", "-o", str(cls.interop_normal)], check=True)
         # Reuse checkpoint 2's actual proxy/broker host fixture without changing its tests.
         spec = importlib.util.spec_from_file_location("checkpoint2_fixture", MALI / "test_icd.py")
         module = importlib.util.module_from_spec(spec)
@@ -83,6 +88,59 @@ class EnumerationTests(unittest.TestCase):
         module.IcdTests.setUpClass()
         cls.addClassCleanup(module.IcdTests.doClassCleanups)
         cls.checkpoint2 = module.IcdTests("test_normal_loader")
+
+    def run_interop(self, path, stage):
+        env = dict(os.environ, VK_DRIVER_FILES=str(self.checkpoint2.manifest),
+                   VK_ICD_FILENAMES=str(self.checkpoint2.manifest), MALI_VULKAN_BROKER_SOCKET=path,
+                   MALI_VULKAN_INTEROP_TEST="1", MALI_VULKAN_AHB_TEST="1" if stage >= 3 else "0",
+                   VK_LOADER_LAYERS_DISABLE="*", DISPLAY="invalid-for-interop", WAYLAND_DISPLAY="invalid-for-interop")
+        return subprocess.run([str(self.interop_normal), str(stage)], env=env, capture_output=True, text=True, timeout=20)
+
+    def test_all_four_independent_memory_interop_paths(self):
+        for stage in range(1, 5):
+            with self.subTest(stage=stage), self.checkpoint2.broker(42) as path:
+                test = self.run_interop(path, stage)
+                self.assertEqual(test.returncode, 0, test.stdout + test.stderr)
+                self.assertIn(f"4D{stage} PASS", test.stdout)
+                self.assertIn("full device/instance cleanup", test.stdout)
+                if stage >= 3: self.assertIn("actual AHB-backed image GPU readback: mismatched pixels=0", test.stdout)
+                if stage == 4: self.assertIn("Android acquired/presented/released exact Vulkan AHB", test.stdout)
+
+    def test_memory_noncoherent_and_channel_corruption(self):
+        with self.checkpoint2.broker(29) as path:
+            for stage in (1, 2):
+                test = self.run_interop(path, stage)
+                self.assertEqual(test.returncode, 0, test.stdout + test.stderr)
+                self.assertIn("vkInvalidateMappedMemoryRanges", test.stdout)
+                if stage == 1: self.assertIn("vkFlushMappedMemoryRanges", test.stdout)
+        with self.checkpoint2.broker(36) as path:
+            test = self.run_interop(path, 2)
+            self.assertEqual(test.returncode, 1, test.stdout + test.stderr)
+            self.assertIn("mismatched pixels=1", test.stdout)
+            self.assertNotIn("4D2 PASS", test.stdout)
+
+    def test_ahb_unsupported_configuration_and_consumer_failure_are_not_pass(self):
+        for mode, stage, code in ((30, 1, -2), (31, 2, -11), (32, 1, -2), (33, 3, -7), (34, 3, -11), (37, 3, -1000072003), (38, 3, -10), (41, 4, -3)):
+            with self.subTest(mode=mode), self.checkpoint2.broker(mode) as path:
+                test = self.run_interop(path, stage)
+                self.assertEqual(test.returncode, 1, test.stdout + test.stderr)
+                self.assertIn(f"VkResult={code}", test.stdout)
+                self.assertNotIn(f"4D{stage} PASS", test.stdout)
+        with self.checkpoint2.broker(35) as path:
+            test = self.run_interop(path, 3)
+            self.assertEqual(test.returncode, 0, test.stdout + test.stderr)
+            self.assertIn("AHB CPU lock unavailable", test.stdout)
+
+    def test_interop_options_exit_before_startup_and_keep_renderer_gate(self):
+        main = (self.source / "src/main.cpp").read_text()
+        entry = main.index("int main(")
+        for option, function in (("vk-buffer-memory-test", "vulkan_buffer_memory_test"),
+                                 ("vk-image-memory-test", "vulkan_image_memory_test"),
+                                 ("vk-ahb-test", "vulkan_ahb_test"), ("vk-ahb-present-test", "vulkan_ahb_present_test")):
+            self.assertIn('{ "' + option + '", no_argument, nullptr, 0 }', main)
+            self.assertIn("return " + function + "();", main[entry:entry + 2300])
+        self.assertNotIn("src/rendervulkan.cpp", (ROOT / "patches/0117-vulkan-memory-ahb-tests.patch").read_text())
+        self.assertEqual((self.source / "src/interop_test_api.h").read_bytes(), (MALI / "interop_test_api.h").read_bytes())
 
     def run_submit(self, path):
         env = dict(os.environ, VK_DRIVER_FILES=str(self.checkpoint2.manifest),
@@ -291,7 +349,7 @@ class EnumerationTests(unittest.TestCase):
         self.assertIn("'vulkan_enumerate_only.cpp'", (self.source / "src/meson.build").read_text())
         reverse = self.directory / "reverse-check"
         shutil.copytree(self.source, reverse)
-        for name in ("0116-vulkan-submit-test.patch", "0115-vulkan-create-device-test.patch", "0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
+        for name in ("0117-vulkan-memory-ahb-tests.patch", "0116-vulkan-submit-test.patch", "0115-vulkan-create-device-test.patch", "0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
             subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--reverse", "-i", str(ROOT / "patches" / name)],
                            cwd=reverse, check=True, capture_output=True)
 

@@ -30,7 +30,9 @@ static int native_pending(struct native_device *d, uint32_t pool, uint32_t event
 static void native_complete_fence(struct native_device *d, uint32_t fence) {
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
         if (d->submit.commands[i].id && d->submit.commands[i].state == 3 &&
-            d->submit.commands[i].fence == fence) d->submit.commands[i].state = 4;
+            d->submit.commands[i].fence == fence) {
+            native_interop_complete(d, &d->submit.commands[i]); d->submit.commands[i].state = 4;
+        }
 }
 static void native_free_command(struct native_device *d, struct native_command *c) {
     struct native_pool *p = native_find_pool(d, c->pool);
@@ -53,7 +55,10 @@ static void native_drain_device(struct native_device *d) {
         }
     }
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
-        if (d->submit.commands[i].id && d->submit.commands[i].state == 3) d->submit.commands[i].state = 4;
+        if (d->submit.commands[i].id && d->submit.commands[i].state == 3) {
+            if (!d->submit.lost) native_interop_complete(d, &d->submit.commands[i]);
+            d->submit.commands[i].state = 4;
+        }
 }
 static void native_close_device(struct native_device *d) {
     native_drain_device(d);
@@ -71,6 +76,7 @@ static void native_close_device(struct native_device *d) {
         struct native_pool *p = &d->submit.pools[i];
         if (p->id) { d->submit.DestroyCommandPool(d->handle, p->handle, NULL); LOG("command pool destroyed device ID=%u pool ID=%u (cleanup)", d->id, p->id); }
     }
+    native_interop_close(d);
     d->destroy(d->handle, NULL); LOG("vkDestroyDevice id=%u", d->id);
     memset(d, 0, sizeof(*d));
 }
@@ -150,7 +156,7 @@ static uint32_t native_submit_command(struct vk_session *s, uint32_t op, const u
             v->CmdSetEvent(c->handle, e->handle, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); c->event = e->id;
             LOG("vkCmdSetEvent recorded device ID=%u command ID=%u event ID=%u stage=ALL_COMMANDS", device, id, e->id);
         } else {
-            if (c->state != 1 || !c->event || !native_find_event(d, c->event)) return MB_PROTOCOL_ERROR;
+            if (c->state != 1 || (!c->recorded && (!c->event || !native_find_event(d, c->event)))) return MB_PROTOCOL_ERROR;
             *result = v->EndCommandBuffer(c->handle); c->state = *result == VK_SUCCESS ? 2 : 5;
             LOG("vkEndCommandBuffer device ID=%u command ID=%u result=%d", device, id, (int)*result);
         }
@@ -190,7 +196,7 @@ static uint32_t native_submit_command(struct vk_session *s, uint32_t op, const u
     }
     case MB_FENCE_DESTROY: case MB_FENCE_STATUS: case MB_FENCE_WAIT: {
         struct native_fence *f = native_find_fence(d, id);
-        if (!f) return MB_PROTOCOL_ERROR;
+        if (!f || (f->exported && op != MB_FENCE_DESTROY)) return MB_PROTOCOL_ERROR;
         if (op == MB_FENCE_DESTROY) {
             if (!v->lost && native_pending(d, 0, 0, id)) return MB_PROTOCOL_ERROR;
             v->DestroyFence(d->handle, f->handle, NULL); LOG("fence destroyed device ID=%u fence ID=%u", device, id);
@@ -212,7 +218,8 @@ static uint32_t native_submit_command(struct vk_session *s, uint32_t op, const u
         struct native_command *c = native_find_command(d, mb_get_u32(wire + 8));
         uint32_t fence_id = mb_get_u32(wire + 12);
         struct native_fence *f = native_find_fence(d, fence_id);
-        if (!queue || !c || c->family != d->family || c->state != 2 || !native_find_event(d, c->event) ||
+        if (!queue || !c || c->family != d->family || c->state != 2 || (!c->recorded && !native_find_event(d, c->event)) ||
+            !native_interop_can_submit(d, c) ||
             (fence_id && (!f || f->submitted))) return MB_PROTOCOL_ERROR;
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c->handle};
         LOG("queue submission device ID=%u queue ID=%u command ID=%u fence ID=%u", device, id, c->id, fence_id);
