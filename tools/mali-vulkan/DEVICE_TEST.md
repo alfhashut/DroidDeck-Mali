@@ -2,15 +2,19 @@
 
 Adds **Run Gamescope Vulkan device test** and actual Gamescope
 `--vk-create-device-test`. Existing checkpoint 1/2/3/4A buttons and normal sessions
-retain their behavior. Only this new GuestCommand child enables
-`MALI_VULKAN_DEVICE_TEST=1`. No checkpoint 4C work is included.
+retain their behavior. Only this action enables `MALI_VULKAN_DEVICE_TEST=1`.
+This document covers 4B; the separate 4C action is described in [SUBMIT_TEST.md](SUBMIT_TEST.md).
 
 Phone facts supplied after successful 4A: Mali-G52, vendor `0x13b5`, device
 `0x74021000`, API **1.1.131**, family 0 flags `0x7` with two queues. Robustness2
 is absent. Timeline, scalar layout, YCbCr conversion, FP16 and Int8 were reported
-supported. DMA-BUF import but not export, and AHB import/export with dedicated-only
+supported; core `shaderInt16=1` and `VK_KHR_image_format_list=PRESENT`.
+`dynamicRendering`, `presentId` and `presentWait` were **NOT QUERYABLE** because
+the native API/required extensions were absent; these were not successful false
+feature queries. DMA-BUF import but not export, and AHB import/export with dedicated-only
 semantics, remain inventory findings; this checkpoint implements no transport.
-Those phone results do not prove 4B until the new action passes on the phone.
+Checkpoint 4B subsequently passed **twice on the real phone**: device creation,
+family-0 queue acquisition, clean device/instance destruction and exit 0.
 
 ## Source inspection before editing
 
@@ -41,7 +45,18 @@ The locations below refer to that DroidDeck-patched tree; 0115 does not modify
    1403, 1420, 1427, 1572). `vkSignalSemaphore` is not in that table or invoked.
    Shader scalar layouts appear in `cs_sgsr.comp`, `cs_rgb_to_nv12.comp`,
    `cs_nis.comp`, `cs_nis_fp16.comp`, `cs_composite_blit.comp`, and blur shaders.
-   This does not establish a safe normal-renderer Vulkan-1.1 fallback.
+   Gamescope also uses **VkImageFormatListCreateInfo** (promoted to Vulkan 1.2)
+   in modifier/image queries (2064, 2824, 2869), paired linear/sRGB mutable-image
+   creation (2178), and mutable swapchain setup (3269). Its Vulkan 1.1 equivalent
+   is `VK_KHR_image_format_list` / `VkImageFormatListCreateInfoKHR`; the extension
+   was **PRESENT** in the real phone's 4A inventory and has no feature bit.
+   Timeline maps to `VK_KHR_timeline_semaphore`, scalar layout to
+   `VK_EXT_scalar_block_layout`, and FP16 arithmetic to `VK_KHR_shader_float16_int8`.
+   The phone supports their queried bits, including shaderInt16=1 for the FP16
+   selection. These facts make the >=1.2 rejection a version gate for those
+   individual capabilities, but do not establish a safe normal-renderer 1.1 path:
+   extension enabling, individual feature chains, KHR command dispatch and the
+   separate missing renderer requirements still need implementation.
 
 3. **Robustness2 requirement:** `createDevice`, line 599, unconditionally appends
    `VK_EXT_robustness2`. Its required-extension loop (lines 607–625) logs every
@@ -78,7 +93,10 @@ The locations below refer to that DroidDeck-patched tree; 0115 does not modify
    returns empty). Realtime queue priority is conditional in the existing DroidDeck
    patch. Maintenance5 is inside `#if 0`, so is not requested. Dynamic rendering is
    used later in ReShade (`reshade_effect_manager.cpp:1859/1863`); it is not a
-   Vulkan 1.2 feature and is not necessary for this diagnostic.
+   Vulkan 1.2 feature and is not necessary for this diagnostic. The real 4A
+   inventory cannot query dynamicRendering/presentId/presentWait on this driver
+   because the relevant API/extensions are absent. Normal create-info still
+   requests them; no functionality was changed for these audit corrections.
 
 ## What the diagnostic bypasses
 

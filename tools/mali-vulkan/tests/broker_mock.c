@@ -70,7 +70,9 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
 }
 #include "mock_capabilities.h"
 
-struct mock_logical { uint32_t family, count; };
+struct mock_object;
+struct mock_logical { uint32_t family, count; int lost, idle_retries; struct mock_object *commands[MB_SUBMIT_MAX_OBJECTS]; };
+#include "mock_submit.h"
 static VkResult mock_create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo *info,
         const VkAllocationCallbacks *allocator, VkDevice *out) {
     assert(physical == (VkPhysicalDevice)(uintptr_t)0x42 && !allocator);
@@ -79,22 +81,29 @@ static VkResult mock_create_device(VkPhysicalDevice physical, const VkDeviceCrea
     assert(!q->pNext && !q->flags && q->queueCount && q->queueCount <= 2 && q->queueFamilyIndex < 2);
     assert(info->pEnabledFeatures && !info->pEnabledFeatures->textureCompressionBC);
     if (mode == 9) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    struct mock_logical *d = malloc(sizeof(*d)); assert(d);
+    struct mock_logical *d = calloc(1, sizeof(*d)); assert(d);
     d->family = q->queueFamilyIndex; d->count = q->queueCount;
     *out = (VkDevice)d; ++device_creates; return VK_SUCCESS;
 }
 static void mock_destroy_device(VkDevice device, const VkAllocationCallbacks *allocator) {
-    assert(device && !allocator); free(device); ++device_destroys;
+    assert(device && !allocator);
+    for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) assert(!((struct mock_logical *)device)->commands[i]);
+    free(device); ++device_destroys;
 }
 static void mock_get_queue(VkDevice device, uint32_t family, uint32_t index, VkQueue *out) {
     struct mock_logical *d = (struct mock_logical *)device;
     assert(d && family == d->family && index < d->count); ++queue_gets;
-    *out = mode == 10 ? VK_NULL_HANDLE : (VkQueue)(uintptr_t)(0x9000 + index);
+    *out = mode == 10 ? VK_NULL_HANDLE : (VkQueue)device;
 }
 static PFN_vkVoidFunction mock_gdpa(VkDevice device, const char *name) {
     assert(device);
     if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)mock_destroy_device;
     if (!strcmp(name, "vkGetDeviceQueue")) return mode == 11 ? NULL : (PFN_vkVoidFunction)mock_get_queue;
+    if (mode == 28 && !strcmp(name, "vkCmdSetEvent")) return NULL;
+#define MB_SUBMIT_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)mock_##n;
+#include "submit_entries.def"
+#undef MB_SUBMIT_ENTRY
+    if (!strcmp(name, "vkDeviceWaitIdle")) return (PFN_vkVoidFunction)mock_DeviceWaitIdle;
     return NULL;
 }
 
@@ -182,6 +191,8 @@ int main(int argc, char **argv) {
         stop();
         printf("CLEANUP creates=%d destroys=%d closes=%d\n", creates, destroys, closes);
         printf("DEVICES creates=%d destroys=%d queues=%d\n", device_creates, device_destroys, queue_gets);
+        printf("SUBMIT pools=%d/%d commands=%d/%d events=%d/%d fences=%d/%d submits=%d executions=%d idle=%d\n", pools_created, pools_destroyed, commands_allocated, commands_freed, events_created, events_destroyed, fences_created, fences_destroyed, submits, executions, idle_calls);
+        assert(pools_created == pools_destroyed && commands_allocated == commands_freed && events_created == events_destroyed && fences_created == fences_destroyed);
         return 0;
     }
     assert(argc == 4);

@@ -24,6 +24,7 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         *result = VK_ERROR_FEATURE_NOT_PRESENT; return MB_VULKAN_ERROR; }
 #include "features_fields.def"
 #undef MB_FEATURE
+        uint32_t queue_flags = caps->queues[r.family].queueFlags;
         free(caps);
         struct native_device *d = NULL;
         for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
@@ -65,7 +66,10 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
             *result = VK_ERROR_INITIALIZATION_FAILED; return MB_LOADER_ERROR;
         }
         memset(d, 0, sizeof(*d)); d->handle = handle; d->destroy = destroy; d->get_queue = get;
-        d->id = ++s->next_device_id; d->family = r.family; d->count = r.count;
+        d->id = ++s->next_device_id; d->family = r.family; d->count = r.count; d->gdpa = gdpa; d->queue_flags = queue_flags;
+        if (s->wire_version == MB_SUBMIT_VERSION && native_submit_init(d)) {
+            native_close_device(d); *result = VK_ERROR_INITIALIZATION_FAILED; return MB_LOADER_ERROR;
+        }
         mb_put_u32(reply, d->id); *extra = 4; *count = 1; return MB_OK;
     }
     if (bytes != (op == MB_DEVICE_QUEUE ? 12u : 4u)) return MB_PROTOCOL_ERROR;
@@ -75,8 +79,7 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         if (s->logical[i].handle && s->logical[i].id == id) { d = &s->logical[i]; break; }
     if (!d) { ERROR("invalid logical device ID=%u", id); return MB_PROTOCOL_ERROR; }
     if (op == MB_DEVICE_DESTROY) {
-        d->destroy(d->handle, NULL); LOG("vkDestroyDevice id=%u", d->id);
-        memset(d, 0, sizeof(*d)); return MB_OK;
+        native_close_device(d); return MB_OK;
     }
     uint32_t family = mb_get_u32(wire + 4), index = mb_get_u32(wire + 8);
     if (family != d->family || index >= d->count) return MB_PROTOCOL_ERROR;

@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include <vulkan/vk_icd.h>
 #include "capability_transport.h"
-#include "device_protocol.h"
+#include "submit_protocol.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
 #endif
@@ -41,6 +41,12 @@ _Static_assert(offsetof(struct proxy_device, loader) == 0, "physical-device disp
 /* A connection owns the remote instance; IDs only have meaning on that connection. */
 static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *request,
                     uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
+    int teardown = s->wire_version == MB_SUBMIT_VERSION && (op == MB_DEVICE_DESTROY || op == MB_DESTROY);
+    /* A timeout does not make pending GPU resources safe to destroy. Await broker cleanup acknowledgement. */
+    if (teardown) {
+        struct timeval no_timeout = {0};
+        if (setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout))) goto broken;
+    }
     uint8_t header[MB_HEADER_BYTES];
     mb_session_header(header, op, request_bytes);
     mb_put_u32(header + 4, s->wire_version);
@@ -50,10 +56,23 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
     if (mb_get_u32(header) != MB_MAGIC || mb_get_u32(header + 4) != s->wire_version ||
         mb_get_u32(header + 8) != op || bytes < MB_PREFIX_BYTES || bytes > capacity) goto broken;
     if (mb_read(s->fd, reply, bytes)) goto broken;
+    if (teardown) {
+        struct timeval normal_timeout = {.tv_sec = 10};
+        if (setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &normal_timeout, sizeof(normal_timeout))) goto broken;
+    }
     *reply_bytes = bytes;
     if (mb_get_u32(reply) == MB_OK && mb_get_u32(reply + 4) == VK_SUCCESS) return VK_SUCCESS;
     LOG("broker opcode=%u status=%u VkResult bits=0x%x", op, mb_get_u32(reply), mb_get_u32(reply + 4));
-    /* Only propagate the errors this query-only API can report. */
+    /* Preserve the native submission result, including statuses and device loss. */
+    if (s->wire_version == MB_SUBMIT_VERSION &&
+        (mb_get_u32(reply) == MB_OK || mb_get_u32(reply) == MB_VULKAN_ERROR)) {
+        int32_t native_result; uint32_t bits = mb_get_u32(reply + 4);
+        memcpy(&native_result, &bits, 4);
+        if ((mb_get_u32(reply) == MB_OK && native_result >= 0) ||
+            (mb_get_u32(reply) == MB_VULKAN_ERROR && native_result < 0)) return (VkResult)native_result;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    /* Preserve historical v1-v4 query error handling. */
     uint32_t result = mb_get_u32(reply + 4);
     if (result == (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY) return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (result == (uint32_t)VK_ERROR_OUT_OF_DEVICE_MEMORY) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -113,7 +132,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
     }
     struct proxy_instance *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    s->wire_version = mb_device_mode() ? MB_DEVICE_VERSION : (mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION);
+    s->wire_version = mb_submit_mode() ? MB_SUBMIT_VERSION : mb_device_mode() ? MB_DEVICE_VERSION : (mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION);
     s->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     strcpy(address.sun_path, path);
     struct timeval timeout = { .tv_sec = 10 };
@@ -306,5 +325,10 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
     ENTRY(DestroyDevice)
     ENTRY(GetDeviceQueue)
 #undef ENTRY
+    if (((struct proxy_instance *)instance)->wire_version == MB_SUBMIT_VERSION) {
+#define MB_SUBMIT_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;
+#include "submit_entries.def"
+#undef MB_SUBMIT_ENTRY
+    }
     return physical_proc(name);
 }

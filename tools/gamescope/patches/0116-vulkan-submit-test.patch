@@ -1,0 +1,228 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -28,6 +28,7 @@
+ #include "vulkan_enumerate_only.hpp"
+ #include "vulkan_capabilities.hpp"
+ #include "vulkan_device_test.hpp"
++#include "vulkan_submit_test.hpp"
+ #include "wlserver.hpp"
+ #include "convar.h"
+ #include "gpuvis_trace_utils.h"
+@@ -66,6 +67,7 @@
+ 	{ "vk-enumerate-only", no_argument, nullptr, 0 },
+ 	{ "vk-capabilities", no_argument, nullptr, 0 },
+ 	{ "vk-create-device-test", no_argument, nullptr, 0 },
++	{ "vk-submit-test", no_argument, nullptr, 0 },
+ 	{ "nested-width", required_argument, nullptr, 'w' },
+ 	{ "nested-height", required_argument, nullptr, 'h' },
+ 	{ "nested-refresh", required_argument, nullptr, 'r' },
+@@ -176,6 +178,7 @@
+ 	"Options:\n"
+ 	"  --help                         show help message\n"
+ 	"  --vk-enumerate-only            print Vulkan devices and exit without initializing a renderer/backend\n"
++	"  --vk-submit-test               execute one event command and verify fence completion; no rendering\n"
+ 	"  --vk-create-device-test       create/destroy a real Vulkan device and obtain a queue; no rendering\n"
+ 	"  --vk-capabilities              print Vulkan capabilities without initializing a renderer/backend\n"
+ 	"  -W, --output-width             output width\n"
+@@ -726,6 +729,8 @@
+ 	// The standalone diagnostic exits before any normal startup, including scripts/X11.
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-enumerate-only" ) == 0 )
+ 		return vulkan_enumerate_only();
++	if ( argc == 2 && strcmp( argv[1], "--vk-submit-test" ) == 0 )
++		return vulkan_submit_test();
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-create-device-test" ) == 0 )
+ 		return vulkan_create_device_test();
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-capabilities" ) == 0 )
+@@ -808,6 +813,8 @@
+ 					return 0;
+ 				} else if (strcmp(opt_name, "vk-enumerate-only") == 0) {
+ 					return vulkan_enumerate_only();
++				} else if (strcmp(opt_name, "vk-submit-test") == 0) {
++					return vulkan_submit_test();
+ 				} else if (strcmp(opt_name, "vk-create-device-test") == 0) {
+ 					return vulkan_create_device_test();
+ 				} else if (strcmp(opt_name, "vk-capabilities") == 0) {
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -113,6 +113,7 @@
+   'vulkan_enumerate_only.cpp',
+   'vulkan_capabilities.cpp',
+   'vulkan_device_test.cpp',
++  'vulkan_submit_test.cpp',
+   'edid.cpp',
+   'wlserver.cpp',
+   'vblankmanager.cpp',
+--- /dev/null
++++ b/src/vulkan_submit_test.hpp
+@@ -0,0 +1,2 @@
++#pragma once
++int vulkan_submit_test();
+--- /dev/null
++++ b/src/vulkan_submit_test.cpp
+@@ -0,0 +1,166 @@
++// Independent checkpoint 4C. Never enters CVulkanDevice or a backend.
++#include "vulkan_submit_test.hpp"
++#include <vulkan/vulkan.h>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++int vulkan_submit_test()
++{
++    std::puts("gamescope: Vulkan queue-submit test");
++    std::puts("normal Gamescope rendering remains disabled (Vulkan >=1.2 and renderer requirements unchanged)");
++    VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++        .pApplicationName = "gamescope submit test", .apiVersion = VK_API_VERSION_1_0 };
++    VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
++    struct Cleanup {
++        VkInstance instance = VK_NULL_HANDLE;
++        VkDevice device = VK_NULL_HANDLE;
++        VkCommandPool pool = VK_NULL_HANDLE;
++        VkCommandBuffer command = VK_NULL_HANDLE;
++        VkEvent event = VK_NULL_HANDLE;
++        VkFence fence = VK_NULL_HANDLE;
++        bool pending = false;
++        void destroy() {
++            if (device) {
++                if (pending) {
++                    // Broker drains pending work before freeing its real child handles.
++                    std::puts("pending work: delegating safe child cleanup to broker device teardown");
++                    std::fflush(stdout);
++                } else {
++                    if (fence) { vkDestroyFence(device, fence, nullptr); std::puts("fence destroyed"); }
++                    if (event) { vkDestroyEvent(device, event, nullptr); std::puts("event destroyed"); }
++                    if (command) { vkFreeCommandBuffers(device, pool, 1, &command); std::puts("command buffer freed"); }
++                    if (pool) { vkDestroyCommandPool(device, pool, nullptr); std::puts("command pool destroyed"); }
++                }
++                vkDestroyDevice(device, nullptr); device = VK_NULL_HANDLE;
++                fence = VK_NULL_HANDLE; event = VK_NULL_HANDLE; command = VK_NULL_HANDLE; pool = VK_NULL_HANDLE;
++                std::puts("logical device destroyed");
++            }
++            if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; std::puts("instance destroyed"); }
++        }
++        ~Cleanup() { destroy(); }
++    } cleanup;
++    auto report = [](const char *stage, VkResult result) {
++        const char *name = "unexpected VkResult";
++        switch (result) {
++            case VK_SUCCESS: name = "VK_SUCCESS"; break;
++            case VK_TIMEOUT: name = "VK_TIMEOUT"; break;
++            case VK_NOT_READY: name = "VK_NOT_READY"; break;
++            case VK_EVENT_SET: name = "VK_EVENT_SET"; break;
++            case VK_EVENT_RESET: name = "VK_EVENT_RESET"; break;
++            case VK_ERROR_DEVICE_LOST: name = "VK_ERROR_DEVICE_LOST"; break;
++            default: break;
++        }
++        std::printf("%s: %s (%d)\n", stage, name, result);
++        std::fflush(stdout);
++    };
++    VkResult result = vkCreateInstance(&ici, nullptr, &cleanup.instance);
++    if (result != VK_SUCCESS) {
++        std::fprintf(stderr, "gamescope: submit test vkCreateInstance failed: %d\n", result); return 1;
++    }
++    std::vector<VkPhysicalDevice> devices;
++    for (unsigned attempt = 0; attempt < 4; ++attempt) {
++        uint32_t count = 0;
++        result = vkEnumeratePhysicalDevices(cleanup.instance, &count, nullptr);
++        if (result != VK_SUCCESS || count > 16) break;
++        devices.resize(count);
++        if (!count) break;
++        result = vkEnumeratePhysicalDevices(cleanup.instance, &count, devices.data());
++        if (result == VK_SUCCESS) { devices.resize(count); break; }
++        if (result != VK_INCOMPLETE) break;
++    }
++    if (result != VK_SUCCESS) { std::fprintf(stderr, "gamescope: submit test enumeration failed: %d\n", result); return 1; }
++    VkPhysicalDevice selected = VK_NULL_HANDLE;
++    VkPhysicalDeviceProperties properties = {};
++    for (VkPhysicalDevice device : devices) {
++        VkPhysicalDeviceProperties p = {}; vkGetPhysicalDeviceProperties(device, &p);
++        if (p.vendorID == 0x13b5 && p.deviceID == 0x74021000) { selected = device; properties = p; break; }
++    }
++    if (!selected) { std::fprintf(stderr, "gamescope: real Mali-G52 (13b5:74021000) not found\n"); return 1; }
++    std::printf("physical device: %s\nphysical API: %u.%u.%u\n", properties.deviceName,
++        VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion), VK_VERSION_PATCH(properties.apiVersion));
++    if (properties.apiVersion < VK_API_VERSION_1_2)
++        std::puts("normal Gamescope remains blocked: physical API below the unchanged Vulkan 1.2 floor");
++    VkPhysicalDeviceFeatures features = {}; vkGetPhysicalDeviceFeatures(selected, &features);
++    std::printf("real core capabilities: samplerAnisotropy=%u textureCompressionBC=%u\n", features.samplerAnisotropy, features.textureCompressionBC);
++    uint32_t extensionCount = 0;
++    result = vkEnumerateDeviceExtensionProperties(selected, nullptr, &extensionCount, nullptr);
++    if (result != VK_SUCCESS || extensionCount > 256) { std::fprintf(stderr, "gamescope: device extension query failed\n"); return 1; }
++    std::vector<VkExtensionProperties> extensions(extensionCount);
++    if (extensionCount) {
++        result = vkEnumerateDeviceExtensionProperties(selected, nullptr, &extensionCount, extensions.data());
++        if (result != VK_SUCCESS) { std::fprintf(stderr, "gamescope: device extension inventory incomplete: %d\n", result); return 1; }
++    }
++    bool robustness2 = false;
++    for (uint32_t i = 0; i < extensionCount; ++i) robustness2 |= std::strcmp(extensions[i].extensionName, "VK_EXT_robustness2") == 0;
++    std::printf("real device extension inventory: %u; VK_EXT_robustness2=%s (not requested)\n", extensionCount, robustness2 ? "present" : "absent");
++    if (!robustness2) std::puts("normal Gamescope remains blocked: VK_EXT_robustness2 is absent");
++    uint32_t queueCount = 0; vkGetPhysicalDeviceQueueFamilyProperties(selected, &queueCount, nullptr);
++    if (!queueCount || queueCount > 64) { std::fprintf(stderr, "gamescope: no queryable queue families\n"); return 1; }
++    std::vector<VkQueueFamilyProperties> queues(queueCount);
++    vkGetPhysicalDeviceQueueFamilyProperties(selected, &queueCount, queues.data());
++    uint32_t family = ~0u;
++    const VkQueueFlags needed = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
++    for (uint32_t i = 0; i < queueCount; ++i) {
++        std::printf("real queue[%u]: flags=0x%x count=%u\n", i, queues[i].queueFlags, queues[i].queueCount);
++        if (family == ~0u && queues[i].queueCount && (queues[i].queueFlags & needed) == needed) family = i;
++    }
++    if (family != 0) { std::fprintf(stderr, "gamescope: queue family 0 no longer provides graphics+compute\n"); return 1; }
++    std::printf("queue family: %u (verified graphics+compute)\n", family);
++    std::puts("requested extensions: none\nrequested features: none (all core and extension bits disabled)");
++    float priority = 1.0f;
++    VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++        .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority };
++    VkPhysicalDeviceFeatures disabled = {};
++    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = &disabled };
++    result = vkCreateDevice(selected, &dci, nullptr, &cleanup.device);
++    if (result != VK_SUCCESS) { std::fprintf(stderr, "gamescope: submit test vkCreateDevice failed: %d\n", result); return 1; }
++    std::puts("vkCreateDevice = VK_SUCCESS (Android broker result logged by proxy)");
++    VkQueue queue = VK_NULL_HANDLE; vkGetDeviceQueue(cleanup.device, family, 0, &queue);
++    std::printf("queue obtained: %s\n", queue ? "yes" : "no");
++    if (!queue) return 1;
++    VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0 };
++    result = vkCreateCommandPool(cleanup.device, &pci, nullptr, &cleanup.pool);
++    if (result != VK_SUCCESS) { report("vkCreateCommandPool", result); return 1; }
++    std::puts("command pool created: yes");
++    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++        .commandPool = cleanup.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
++    result = vkAllocateCommandBuffers(cleanup.device, &cai, &cleanup.command);
++    if (result != VK_SUCCESS) { report("vkAllocateCommandBuffers", result); return 1; }
++    std::puts("primary command buffer allocated: yes");
++    VkEventCreateInfo eci = { .sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO };
++    result = vkCreateEvent(cleanup.device, &eci, nullptr, &cleanup.event);
++    if (result != VK_SUCCESS) { report("vkCreateEvent", result); return 1; }
++    result = vkGetEventStatus(cleanup.device, cleanup.event); report("event initial status", result);
++    if (result != VK_EVENT_RESET) return 1;
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++    result = vkBeginCommandBuffer(cleanup.command, &bi); report("vkBeginCommandBuffer", result);
++    if (result != VK_SUCCESS) return 1;
++    vkCmdSetEvent(cleanup.command, cleanup.event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++    std::puts("vkCmdSetEvent recorded");
++    result = vkEndCommandBuffer(cleanup.command); report("vkEndCommandBuffer", result);
++    if (result != VK_SUCCESS) return 1;
++    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++    result = vkCreateFence(cleanup.device, &fci, nullptr, &cleanup.fence);
++    if (result != VK_SUCCESS) { report("vkCreateFence", result); return 1; }
++    std::puts("fence created: unsignaled");
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++        .commandBufferCount = 1, .pCommandBuffers = &cleanup.command };
++    result = vkQueueSubmit(queue, 1, &si, cleanup.fence); report("vkQueueSubmit", result);
++    if (result != VK_SUCCESS) return 1;
++    cleanup.pending = true;
++    result = vkWaitForFences(cleanup.device, 1, &cleanup.fence, VK_TRUE, 5000000000ull);
++    report("vkWaitForFences", result);
++    if (result == VK_ERROR_DEVICE_LOST) cleanup.pending = false;
++    if (result != VK_SUCCESS) return 1;
++    cleanup.pending = false;
++    result = vkGetFenceStatus(cleanup.device, cleanup.fence); report("vkGetFenceStatus", result);
++    if (result != VK_SUCCESS) return 1;
++    result = vkGetEventStatus(cleanup.device, cleanup.event); report("event final status", result);
++    if (result != VK_EVENT_SET) return 1;
++    std::puts("observable device command executed: yes");
++    cleanup.destroy();
++    std::puts("normal Gamescope rendering remains disabled\nexit 0");
++    return 0;
++}

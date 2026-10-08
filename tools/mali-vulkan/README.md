@@ -358,3 +358,12 @@ real Android logical device, obtain a queue, and destroy both device and instanc
 without rendering. Earlier query actions retain their behavior. See
 [DEVICE_TEST.md](DEVICE_TEST.md) for the pre-edit Gamescope source analysis, explicit
 protocol schema, test results, build requirements and phone acceptance instructions.
+
+## Checkpoint 4C: observable queue execution
+
+The separate **Run Gamescope Vulkan submit test** action / `--vk-submit-test`
+uses `MALI_VULKAN_SUBMIT_TEST=1` only for its child. It records one core-1.0
+`vkCmdSetEvent`, submits to the real queue, waits five seconds on a real fence,
+and requires a native `VK_EVENT_SET`. Rendering and normal Gamescope remain disabled.
+See [SUBMIT_TEST.md](SUBMIT_TEST.md) for the v5 subset, timeout lifetimes, build
+instructions, test results and real-phone acceptance. The 4B action stays on v4.

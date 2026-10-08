@@ -189,3 +189,12 @@ Checkpoint 4A passed on the real phone. The 4B handoff and exact Gamescope sourc
 review are recorded in [DEVICE_TEST.md](DEVICE_TEST.md); that document supersedes
 the pending-phone entries above. Capability-only mode stays query-only. The new
 separate device-test mode creates/destroys a device and obtains a queue, with no rendering.
+
+## Captured phone facts used by the 4B/4C audit
+
+The supplied real Mali-G52 4A output reports `VK_KHR_image_format_list=PRESENT`
+and core `shaderInt16=1`. `dynamicRendering`, `presentId`, and `presentWait` are
+**NOT QUERYABLE (API/extension absent)**, rather than measured false feature bits.
+The older "Pending" audit rows above describe the initial pre-phone investigation;
+these captured results supersede them. See [DEVICE_TEST.md](DEVICE_TEST.md) for
+Gamescope's image-format-list use and [SUBMIT_TEST.md](SUBMIT_TEST.md) for 4C.

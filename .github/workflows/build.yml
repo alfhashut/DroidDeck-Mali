@@ -325,6 +325,7 @@ jobs:
           grep -a -q -F -- 'vk-enumerate-only' app/src/main/assets/linuxfs/usr/local/bin/gamescope
           grep -a -q -F -- 'vk-capabilities' app/src/main/assets/linuxfs/usr/local/bin/gamescope
           grep -a -q -F -- 'vk-create-device-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
+          grep -a -q -F -- 'vk-submit-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
 
       - name: Build the x86 preloads FEX guests load (glibc 2.31)
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -490,7 +491,7 @@ jobs:
               name = "assets/linuxfs/usr/local/bin/gamescope"
               result = "MISSING" if name not in apk.namelist() else (
                   "NEW" if all(marker in apk.read(name) for marker in
-                               (b"vk-enumerate-only", b"vk-capabilities", b"vk-create-device-test")) else "OLD")
+                               (b"vk-enumerate-only", b"vk-capabilities", b"vk-create-device-test", b"vk-submit-test")) else "OLD")
           print(result)
           sys.exit(0 if result == "NEW" else 1)
           PY

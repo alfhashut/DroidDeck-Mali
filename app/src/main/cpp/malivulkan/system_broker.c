@@ -15,7 +15,8 @@
 #include <vulkan/vulkan.h>
 #include "protocol.h"
 #include "capabilities.h"
-#include "device_protocol.h"
+#include "submit_protocol.h"
+#include "submit_objects.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__)
 #define ERROR(...) __android_log_print(ANDROID_LOG_ERROR, "MaliVulkanBroker", __VA_ARGS__)
@@ -42,12 +43,14 @@ struct vk_session {
     VkPhysicalDevice devices[MB_MAX_DEVICES];
     uint32_t count;
     int listed;
-    uint32_t wire_version, next_device_id, next_queue_id;
+    uint32_t wire_version, next_device_id, next_queue_id, next_resource_id;
     struct native_device {
         VkDevice handle;
         PFN_vkDestroyDevice destroy;
         PFN_vkGetDeviceQueue get_queue;
-        uint32_t id, family, count;
+        PFN_vkGetDeviceProcAddr gdpa;
+        struct native_submit submit;
+        uint32_t id, family, count, queue_flags;
         VkQueue queues[MB_DEVICE_MAX_QUEUES];
         uint32_t queue_ids[MB_DEVICE_MAX_QUEUES];
     } logical[MB_MAX_LOGICAL_DEVICES];
@@ -59,11 +62,12 @@ static const char *const query_extensions[] = {
 };
 static VkResult native_global(void *, uint32_t *, uint32_t *, VkExtensionProperties *);
 
+static void native_close_device(struct native_device *d);
+
 static void close_session(struct vk_session *s) {
     for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
         if (s->logical[i].handle) {
-            s->logical[i].destroy(s->logical[i].handle, NULL);
-            LOG("vkDestroyDevice id=%u (session cleanup)", s->logical[i].id);
+            native_close_device(&s->logical[i]);
         }
     if (s->instance) { s->destroy(s->instance, NULL); LOG("destroyed Vulkan instance"); }
     if (s->library) { dlclose(s->library); LOG("closed Android libvulkan"); }
@@ -151,6 +155,7 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 }
 
 #include "capability_queries.h"
+#include "submit_commands.h"
 #include "device_commands.h"
 
 /* Preserve the original version-1 one-shot probe and its six-field reply. */
@@ -197,7 +202,7 @@ static void serve(int fd) {
             if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes))
                 ERROR("write probe response: %s", strerror(errno));
             break;
-        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION) ||
+        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION && version != MB_SUBMIT_VERSION) ||
                    (s.wire_version && version != s.wire_version) ||
                    (request_bytes && mb_read(fd, request, request_bytes))) {
             finish = 1;
@@ -253,9 +258,13 @@ static void serve(int fd) {
             status = native_extra(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
             else { count = 0; if (status == MB_UNSUPPORTED) result = VK_ERROR_FEATURE_NOT_PRESENT; }
-        } else if (version == MB_DEVICE_VERSION && op >= MB_DEVICE_CREATE && op <= MB_DEVICE_DESTROY && s.instance && s.listed) {
+        } else if (version >= MB_DEVICE_VERSION && op >= MB_DEVICE_CREATE && op <= MB_DEVICE_DESTROY && s.instance && s.listed) {
             uint32_t extra = 0;
             status = native_device_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (status == MB_OK) bytes += extra;
+        } else if (version == MB_SUBMIT_VERSION && op >= MB_POOL_CREATE && op <= MB_QUEUE_SUBMIT && s.instance && s.listed) {
+            uint32_t extra = 0;
+            status = native_submit_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
         } else if (op == MB_DESTROY && !request_bytes && s.instance) {
             close_session(&s); status = MB_OK; finish = 1;

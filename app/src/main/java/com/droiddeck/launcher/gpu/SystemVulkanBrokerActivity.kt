@@ -22,11 +22,12 @@ class SystemVulkanBrokerActivity : Activity() {
         val gamescope = Button(this).apply { text = "Run Gamescope Vulkan enumeration test"; isEnabled = false }
         val capabilities = Button(this).apply { text = "Run Gamescope Vulkan capability test"; isEnabled = false }
         val device = Button(this).apply { text = "Run Gamescope Vulkan device test"; isEnabled = false }
+        val submit = Button(this).apply { text = "Run Gamescope Vulkan submit test"; isEnabled = false }
         val stop = Button(this).apply { text = "Stop broker and close"; setOnClickListener { finish() } }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
-            addView(probe); addView(icd); addView(gamescope); addView(capabilities); addView(device); addView(stop); addView(status)
+            addView(probe); addView(icd); addView(gamescope); addView(capabilities); addView(device); addView(submit); addView(stop); addView(status)
         }
         setContentView(ScrollView(this).apply { addView(content) })
         worker.execute {
@@ -34,12 +35,12 @@ class SystemVulkanBrokerActivity : Activity() {
                 val socket = SystemVulkanBroker.start(applicationContext)
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = "Android broker listening\nSocket: $socket\n\nChoose the boundary probe, Vulkan ICD test, Gamescope enumeration, capability test, or device test. The Linux runtime must be installed. No normal session is started."
+                        status.text = "Android broker listening\nSocket: $socket\n\nChoose the boundary probe, Vulkan ICD test, Gamescope enumeration, capability test, device test, or submit test. The Linux runtime must be installed. No normal session is started."
                         probe.isEnabled = true
                         icd.isEnabled = true
                         gamescope.isEnabled = true
                         capabilities.isEnabled = true
-                        device.isEnabled = true
+                        device.isEnabled = true; submit.isEnabled = true
                     }
                 }
             } catch (t: Throwable) {
@@ -53,6 +54,7 @@ class SystemVulkanBrokerActivity : Activity() {
             gamescope.isEnabled = false
             capabilities.isEnabled = false
             device.isEnabled = false
+            submit.isEnabled = false
             status.text = "Querying Android Vulkan from the glibc probe via Linux/proot…"
             worker.execute {
                 val output = try {
@@ -63,7 +65,7 @@ class SystemVulkanBrokerActivity : Activity() {
                 }
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true; submit.isEnabled = true
                     }
                 }
             }
@@ -74,6 +76,7 @@ class SystemVulkanBrokerActivity : Activity() {
             gamescope.isEnabled = false
             capabilities.isEnabled = false
             device.isEnabled = false
+            submit.isEnabled = false
             status.text = "Querying Android Vulkan through glibc libvulkan.so.1 and the proxy ICD via Linux/proot…"
             worker.execute {
                 val output = try {
@@ -84,7 +87,7 @@ class SystemVulkanBrokerActivity : Activity() {
                 }
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true; submit.isEnabled = true
                     }
                 }
             }
@@ -95,6 +98,7 @@ class SystemVulkanBrokerActivity : Activity() {
             gamescope.isEnabled = false
             capabilities.isEnabled = false
             device.isEnabled = false
+            submit.isEnabled = false
             status.text = "Enumerating Android Vulkan from Gamescope via Linux/proot (no renderer/backend initialization)…"
             worker.execute {
                 val output = try {
@@ -105,7 +109,7 @@ class SystemVulkanBrokerActivity : Activity() {
                 }
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true; submit.isEnabled = true
                     }
                 }
             }
@@ -116,6 +120,7 @@ class SystemVulkanBrokerActivity : Activity() {
             gamescope.isEnabled = false
             capabilities.isEnabled = false
             device.isEnabled = false
+            submit.isEnabled = false
             status.text = "Querying real Android Vulkan capabilities via Gamescope (no logical device/backend)…"
             worker.execute {
                 val output = try {
@@ -126,7 +131,7 @@ class SystemVulkanBrokerActivity : Activity() {
                 }
                 runOnUiThread {
                     if (!isDestroyed && !isFinishing) {
-                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true
+                        status.text = output; probe.isEnabled = true; icd.isEnabled = true; gamescope.isEnabled = true; capabilities.isEnabled = true; device.isEnabled = true; submit.isEnabled = true
                     }
                 }
             }
@@ -137,6 +142,7 @@ class SystemVulkanBrokerActivity : Activity() {
             gamescope.isEnabled = false
             capabilities.isEnabled = false
             device.isEnabled = false
+            submit.isEnabled = false
             status.text = "Creating a real Android Vulkan device and obtaining a queue via Gamescope (no rendering)…"
             worker.execute {
                 val output = try {
@@ -152,7 +158,34 @@ class SystemVulkanBrokerActivity : Activity() {
                         icd.isEnabled = true
                         gamescope.isEnabled = true
                         capabilities.isEnabled = true
-                        device.isEnabled = true
+                        device.isEnabled = true; submit.isEnabled = true
+                    }
+                }
+            }
+        }
+        submit.setOnClickListener {
+            probe.isEnabled = false
+            icd.isEnabled = false
+            gamescope.isEnabled = false
+            capabilities.isEnabled = false
+            device.isEnabled = false
+            submit.isEnabled = false
+            status.text = "Submitting one event command to the real Mali queue and waiting on a fence (no rendering)…"
+            worker.execute {
+                val output = try {
+                    SystemVulkanBroker.runGamescopeSubmitTest(applicationContext)
+                } catch (t: Throwable) {
+                    Log.e("MaliVulkanBroker", "submit test failed", t)
+                    "Gamescope Vulkan submit test via Linux/proot failed: $t"
+                }
+                runOnUiThread {
+                    if (!isDestroyed && !isFinishing) {
+                        status.text = output
+                        probe.isEnabled = true
+                        icd.isEnabled = true
+                        gamescope.isEnabled = true
+                        capabilities.isEnabled = true
+                        device.isEnabled = true; submit.isEnabled = true
                     }
                 }
             }

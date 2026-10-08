@@ -30,7 +30,7 @@ class EnumerationTests(unittest.TestCase):
         shutil.copytree(source, cls.source, ignore=shutil.ignore_patterns(".git", "build", "builddir"))
         cls.patch_output = ""
         for patch in sorted((ROOT / "patches").glob("*.patch")):
-            if patch.name in ("0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch", "0115-vulkan-create-device-test.patch"):
+            if patch.name in ("0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch", "0115-vulkan-create-device-test.patch", "0116-vulkan-submit-test.patch"):
                 # Validate added source whitespace, excluding the patch's context prefixes.
                 subprocess.run(["git", "apply", "--check", "--whitespace=error", str(patch)],
                                cwd=cls.source, check=True, capture_output=True)
@@ -68,6 +68,14 @@ class EnumerationTests(unittest.TestCase):
         cls.device_normal = cls.directory / "device-loader-diagnostic"
         subprocess.run(cls.compiler + cls.flags + [str(cls.device_object), str(device_main), "-l:libvulkan.so.1",
                        "-o", str(cls.device_normal)], check=True)
+        cls.submit_object = cls.directory / "submit.o"
+        submit_main = cls.directory / "submit_main.cpp"
+        submit_main.write_text('#include "vulkan_submit_test.hpp"\nint main() { return vulkan_submit_test(); }\n')
+        subprocess.run(cls.compiler + cls.flags + ["-c", str(cls.source / "src/vulkan_submit_test.cpp"),
+                       "-o", str(cls.submit_object)], check=True)
+        cls.submit_normal = cls.directory / "submit-loader-diagnostic"
+        subprocess.run(cls.compiler + cls.flags + [str(cls.submit_object), str(submit_main), "-l:libvulkan.so.1",
+                       "-o", str(cls.submit_normal)], check=True)
         # Reuse checkpoint 2's actual proxy/broker host fixture without changing its tests.
         spec = importlib.util.spec_from_file_location("checkpoint2_fixture", MALI / "test_icd.py")
         module = importlib.util.module_from_spec(spec)
@@ -75,6 +83,78 @@ class EnumerationTests(unittest.TestCase):
         module.IcdTests.setUpClass()
         cls.addClassCleanup(module.IcdTests.doClassCleanups)
         cls.checkpoint2 = module.IcdTests("test_normal_loader")
+
+    def run_submit(self, path):
+        env = dict(os.environ, VK_DRIVER_FILES=str(self.checkpoint2.manifest),
+                   VK_ICD_FILENAMES=str(self.checkpoint2.manifest), MALI_VULKAN_BROKER_SOCKET=path,
+                   MALI_VULKAN_SUBMIT_TEST="1", VK_LOADER_LAYERS_DISABLE="*",
+                   DISPLAY="invalid-for-submit-test", WAYLAND_DISPLAY="invalid-for-submit-test")
+        return subprocess.run([str(self.submit_normal)], env=env, capture_output=True, text=True, timeout=20)
+
+    def test_submit_success_through_normal_loader(self):
+        for repeat in range(2):
+            with self.checkpoint2.broker() as path:
+                result = self.run_submit(path)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                values = ("gamescope: Vulkan queue-submit test", "physical API: 1.1.131", "queue family: 0",
+                          "queue obtained: yes", "command pool created: yes", "primary command buffer allocated: yes",
+                          "event initial status: VK_EVENT_RESET", "vkBeginCommandBuffer: VK_SUCCESS",
+                          "vkCmdSetEvent recorded", "vkEndCommandBuffer: VK_SUCCESS", "fence created: unsignaled",
+                          "vkQueueSubmit: VK_SUCCESS", "vkWaitForFences: VK_SUCCESS", "vkGetFenceStatus: VK_SUCCESS",
+                          "event final status: VK_EVENT_SET", "observable device command executed: yes",
+                          "fence destroyed", "event destroyed", "command buffer freed", "command pool destroyed",
+                          "logical device destroyed", "instance destroyed", "exit 0")
+                last = -1
+                for value in values:
+                    found = result.stdout.index(value)
+                    self.assertGreater(found, last); last = found
+            self.assertIn("pools=1/1 commands=1/1 events=1/1 fences=1/1 submits=1 executions=1 idle=0",
+                          self.checkpoint2.cleanup_output)
+
+    def test_submit_failure_at_each_stage_cleanup(self):
+        for mode in (9, 10, 11, 12, 13, 14, *range(15, 29)):
+            with self.subTest(mode=mode), self.checkpoint2.broker(mode) as path:
+                result = self.run_submit(path)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("observable device command executed: yes", result.stdout)
+                self.assertNotIn("exit 0", result.stdout)
+                self.assertIn("instance destroyed", result.stdout)
+                if mode in (22, 27):
+                    self.assertIn("vkWaitForFences: VK_TIMEOUT (2)", result.stdout)
+                    self.assertIn("delegating safe child cleanup", result.stdout)
+                    self.assertNotIn("vkGetFenceStatus:", result.stdout)
+                if mode in (23, 24, 26):
+                    self.assertIn("VK_ERROR_DEVICE_LOST (-4)", result.stdout)
+                if mode == 25:
+                    self.assertIn("event final status: VK_EVENT_RESET", result.stdout)
+            # broker fixture asserts balanced native resources on every failure
+
+    def test_submit_dispatch_and_no_renderer_dependencies(self):
+        main = (self.source / "src/main.cpp").read_text()
+        body = main[main.index("int main(int argc, char **argv)"):]
+        early = body.index("return vulkan_submit_test();")
+        parser = body.index("return vulkan_submit_test();", early + 1)
+        self.assertLess(early, body.index("XInitThreads()"))
+        self.assertLess(parser, body.index("auto_select_backend()"))
+        self.assertIn('{ "vk-submit-test", no_argument, nullptr, 0 }', main)
+        symbols = subprocess.check_output(["nm", "-u", str(self.submit_object)], text=True)
+        required = {"vkCreateInstance", "vkDestroyInstance", "vkEnumeratePhysicalDevices", "vkGetPhysicalDeviceProperties",
+                    "vkGetPhysicalDeviceFeatures", "vkEnumerateDeviceExtensionProperties", "vkGetPhysicalDeviceQueueFamilyProperties",
+                    "vkCreateDevice", "vkDestroyDevice", "vkGetDeviceQueue"}
+        required |= {"vk" + line[len("MB_SUBMIT_ENTRY("):-1] for line in (MALI / "submit_entries.def").read_text().splitlines()
+                     if line.startswith("MB_SUBMIT_ENTRY(")}
+        self.assertEqual({line.split()[-1] for line in symbols.splitlines() if line.split()[-1].startswith("vk")}, required)
+        patch = (ROOT / "patches/0116-vulkan-submit-test.patch").read_text()
+        self.assertNotIn("+++ b/src/rendervulkan", patch)
+        self.assertNotIn("+++ b/src/Backends", patch)
+
+    def test_submit_missing_icd(self):
+        missing = str(self.directory / "absent-icd.json")
+        result = subprocess.run([str(self.submit_normal)], env=dict(os.environ, VK_DRIVER_FILES=missing,
+                                VK_ICD_FILENAMES=missing, VK_LOADER_LAYERS_DISABLE="*"), capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("gamescope: submit test vkCreateInstance failed:", result.stderr)
+        self.assertNotIn("physical device:", result.stdout)
 
     def test_device_path_exits_before_normal_startup(self):
         main = (self.source / "src/main.cpp").read_text()
@@ -211,7 +291,7 @@ class EnumerationTests(unittest.TestCase):
         self.assertIn("'vulkan_enumerate_only.cpp'", (self.source / "src/meson.build").read_text())
         reverse = self.directory / "reverse-check"
         shutil.copytree(self.source, reverse)
-        for name in ("0115-vulkan-create-device-test.patch", "0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
+        for name in ("0116-vulkan-submit-test.patch", "0115-vulkan-create-device-test.patch", "0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
             subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--reverse", "-i", str(ROOT / "patches" / name)],
                            cwd=reverse, check=True, capture_output=True)
 

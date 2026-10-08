@@ -75,6 +75,7 @@
 
 /* Version 4 opts into logical-device/queue lifecycle; see device_protocol.h for
  * the bounded scalar schema. Versions 1–3 remain query-only and retain layouts.
+ * Version 5 adds the submit-only subset in submit_protocol.h; v4 stays lifecycle-only.
  */
 
 static inline uint32_t mb_get_u32(const uint8_t *p) {

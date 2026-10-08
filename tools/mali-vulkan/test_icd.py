@@ -55,6 +55,7 @@ class IcdTests(unittest.TestCase):
         build("capability_inventory.c", "capability_inventory")
         build("tests/capability_contract.c", "capability_contract", ["-l:libvulkan.so.1"])
         build("tests/device_contract.c", "device_contract", ["-l:libvulkan.so.1"])
+        build("tests/submit_contract.c", "submit_contract", ["-l:libvulkan.so.1"])
         build("tests/icd_contract.c", "icd_contract", ["-ldl"])
         build("tests/broker_mock.c", "broker_mock", ["-pthread", "-I" + str(ROOT / "tests"),
               "-I" + str(java / "include"), "-I" + str(java / "include/linux")])
@@ -102,6 +103,182 @@ class IcdTests(unittest.TestCase):
         connection.settimeout(5)
         connection.connect(path)
         return connection
+
+    def submit_session(self, path, family=0):
+        c = self.connect(path)
+        self.assertEqual(rpc(c, 2, struct.pack("<I", 1 << 22), version=5)[0], (0, 0, 0))
+        self.assertEqual(rpc(c, 4, version=5)[0], (0, 0, 1))
+        prefix, data = rpc(c, 14, self.device_request(family=family), version=5)
+        self.assertEqual(prefix, (0, 0, 1))
+        return c, struct.unpack("<I", data)[0]
+
+    def submit_rpc(self, c, op, *fields, expected=(0, 0, 0), suffix=b""):
+        prefix, data = rpc(c, op, struct.pack("<" + "I" * len(fields), *fields) + suffix, version=5)
+        self.assertEqual(prefix, expected, (op, fields, prefix))
+        return struct.unpack("<I", data)[0] if data else None
+
+    def submit_objects(self, c, d):
+        q = self.submit_rpc(c, 15, d, 0, 0, expected=(0, 0, 1))
+        p = self.submit_rpc(c, 17, d, 0, 0, expected=(0, 0, 1))
+        b = self.submit_rpc(c, 19, d, p, 0, 1, expected=(0, 0, 1))
+        e = self.submit_rpc(c, 23, d, 0, expected=(0, 0, 1))
+        f = self.submit_rpc(c, 27, d, 0, expected=(0, 0, 1))
+        return q, p, b, e, f
+
+    def submit_record(self, c, d, b, e):
+        self.submit_rpc(c, 21, d, b, 0)
+        self.submit_rpc(c, 26, d, b, e, 0x10000)
+        self.submit_rpc(c, 22, d, b)
+
+    def test_submit_version_is_opt_in_and_cannot_upgrade(self):
+        with self.broker() as path:
+            c = self.device_session(path)
+            self.assertEqual(rpc(c, 14, self.device_request(), version=4)[0], (0, 0, 1))
+            self.assertEqual(rpc(c, 17, struct.pack("<3I", 1, 0, 0), version=5)[0], (3, 0, 0))
+            try:
+                self.assertEqual(c.recv(1), b"")
+            except ConnectionResetError:
+                pass
+        self.assertIn("pools=0/0 commands=0/0", self.cleanup_output)
+        with self.broker() as path:
+            c = self.device_session(path)
+            self.assertEqual(rpc(c, 17, struct.pack("<3I", 1, 0, 0), version=4)[0], (3, 0, 0))
+        self.assertIn("pools=0/0 commands=0/0", self.cleanup_output)
+
+    def test_submit_fragmentation_and_same_device_wrong_pool(self):
+        with self.broker() as path:
+            c, d = self.submit_session(path)
+            q, p, b, e, f = self.submit_objects(c, d)
+            p2 = self.submit_rpc(c, 17, d, 0, 0, expected=(0, 0, 1))
+            self.submit_rpc(c, 20, d, p2, b, expected=(3, 0, 0))
+            for op, fields in ((21, (d, b, 0)), (26, (d, b, e, 0x10000)), (22, (d, b)), (31, (d, q, b, f))):
+                payload = struct.pack("<" + "I" * len(fields), *fields)
+                wire = struct.pack("<4I", MAGIC, 5, op, len(payload)) + payload
+                for byte in wire: c.sendall(bytes([byte]))
+                self.assertEqual(struct.unpack("<4I", read_exact(c, 16)), (MAGIC, 5, op, 12))
+                self.assertEqual(struct.unpack("<3I", read_exact(c, 12)), (0, 0, 0))
+            self.submit_rpc(c, 30, d, f, 1, suffix=struct.pack("<Q", 5000000000))
+            self.submit_rpc(c, 16, d)
+        self.assertIn("pools=2/2 commands=1/1 events=1/1 fences=1/1 submits=1 executions=1 idle=0", self.cleanup_output)
+
+    def test_submit_loader_contract(self):
+        with self.broker() as path:
+            env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(self.manifest),
+                       VK_ICD_FILENAMES=str(self.manifest), MALI_VULKAN_SUBMIT_TEST="1", VK_LOADER_LAYERS_DISABLE="*")
+            result = subprocess.run([str(self.directory / "submit_contract")], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("submit contracts:", result.stdout)
+        self.assertIn("pools=1/1 commands=1/1 events=1/1 fences=1/1 submits=1 executions=1 idle=0", self.cleanup_output)
+
+    def test_submit_complete_sequence_and_double_free(self):
+        with self.broker() as path:
+            c, d = self.submit_session(path)
+            q, p, b, e, f = self.submit_objects(c, d)
+            self.submit_rpc(c, 25, d, e, expected=(0, 4, 0))
+            self.submit_rpc(c, 29, d, f, expected=(0, 1, 0))
+            self.submit_record(c, d, b, e)
+            self.submit_rpc(c, 25, d, e, expected=(0, 4, 0))
+            self.submit_rpc(c, 31, d, q, b, f)
+            self.submit_rpc(c, 30, d, f, 1, suffix=struct.pack("<Q", 5000000000))
+            self.submit_rpc(c, 29, d, f)
+            self.submit_rpc(c, 25, d, e, expected=(0, 3, 0))
+            for op, fields in ((28, (d, f)), (24, (d, e)), (20, (d, p, b)), (18, (d, p))):
+                self.submit_rpc(c, op, *fields)
+                self.submit_rpc(c, op, *fields, expected=(3, 0, 0))
+            self.submit_rpc(c, 16, d)
+            self.assertEqual(rpc(c, 3, version=5)[0], (0, 0, 0))
+        self.assertIn("submits=1 executions=1 idle=0", self.cleanup_output)
+
+    def test_submit_invalid_ids_parents_and_states(self):
+        with self.broker() as path:
+            c, d = self.submit_session(path)
+            q, p, b, e, f = self.submit_objects(c, d)
+            prefix, data = rpc(c, 14, self.device_request(family=1), version=5)
+            self.assertEqual(prefix, (0, 0, 1)); d2 = struct.unpack("<I", data)[0]
+            q2 = self.submit_rpc(c, 15, d2, 1, 0, expected=(0, 0, 1))
+            p2 = self.submit_rpc(c, 17, d2, 1, 0, expected=(0, 0, 1))
+            b2 = self.submit_rpc(c, 19, d2, p2, 0, 1, expected=(0, 0, 1))
+            cases = [(17, (999, 0, 0)), (17, (d, 1, 0)), (19, (d, 999, 0, 1)),
+                     (19, (d2, p, 0, 1)), (19, (d, p, 1, 1)), (19, (d, p, 0, 2)),
+                     (21, (d, 999, 0)), (21, (d2, b, 0)), (22, (d, b)),
+                     (25, (d, 999)), (25, (d2, e)), (29, (d, 999)), (29, (d2, f)),
+                     (31, (d, 999, b, f)), (31, (d, q2, b, f)), (31, (d, q, b2, f)),
+                     (31, (d, q, b, 999)), (31, (d, q, b, f)), (20, (d, p2, b)),
+                     (21, (d, e, 0)), (25, (d, p))]
+            for op, fields in cases:
+                self.submit_rpc(c, op, *fields, expected=(3, 0, 0))
+            self.submit_rpc(c, 21, d, b, 0)
+            self.submit_rpc(c, 21, d, b, 0, expected=(3, 0, 0))
+            self.submit_rpc(c, 26, d, b, 999, 0x10000, expected=(3, 0, 0))
+            self.submit_rpc(c, 26, d2, b, e, 0x10000, expected=(3, 0, 0))
+            self.submit_rpc(c, 26, d, b, e, 0x4000, expected=(3, 0, 0))
+            self.submit_rpc(c, 26, d, b, e, 0x10000)
+            self.submit_rpc(c, 26, d, b, e, 0x10000, expected=(3, 0, 0))
+            self.submit_rpc(c, 22, d, b)
+            self.submit_rpc(c, 31, d, q, b, f)
+            for op, fields in ((20, (d, p, b)), (18, (d, p)), (24, (d, e)), (28, (d, f)), (31, (d, q, b, f))):
+                self.submit_rpc(c, op, *fields, expected=(3, 0, 0))
+            self.submit_rpc(c, 16, d) # drains pending submission before child teardown
+            self.submit_rpc(c, 16, d2)
+        self.assertIn("submits=1 executions=1 idle=1", self.cleanup_output)
+
+    def test_submit_malformed_lengths_flags_and_truncation(self):
+        with self.broker() as path:
+            c, d = self.submit_session(path)
+            q, p, b, e, f = self.submit_objects(c, d)
+            for op, fields in ((17, (d, 0, 1)), (21, (d, b, 1)), (23, (d, 1)), (27, (d, 1))):
+                self.submit_rpc(c, op, *fields, expected=(3, 0, 0))
+            for op, payload in ((17, struct.pack("<2I", d, 0)), (19, struct.pack("<5I", d, p, 0, 1, 99)),
+                                (31, struct.pack("<3I", d, q, b)), (30, struct.pack("<3IQ", d, f, 2, 0)),
+                                (30, struct.pack("<3IQ", d, f, 1, 2**64 - 1))):
+                self.assertEqual(rpc(c, op, payload, version=5)[0], (3, 0, 0))
+            c.sendall(struct.pack("<4I", MAGIC, 5, 31, 16) + b"\x01\x00")
+            c.shutdown(socket.SHUT_WR)
+            self.assertEqual(read_exact(c, 16), struct.pack("<4I", MAGIC, 5, 31, 12))
+            self.assertEqual(struct.unpack("<3I", read_exact(c, 12)), (3, 0, 0))
+            self.assertEqual(c.recv(1), b"")
+        self.assertIn("pools=1/1 commands=1/1 events=1/1 fences=1/1", self.cleanup_output)
+
+    def test_submit_timeout_and_device_loss_cleanup(self):
+        for mode, expected in ((22, 2), (23, -4), (24, -4), (27, 2)):
+            with self.subTest(mode=mode), self.broker(mode) as path:
+                c, d = self.submit_session(path)
+                q, p, b, e, f = self.submit_objects(c, d)
+                self.submit_record(c, d, b, e)
+                self.submit_rpc(c, 31, d, q, b, f, expected=(2, (-4) & 0xffffffff, 0) if mode == 23 else (0, 0, 0))
+                if mode != 23:
+                    self.submit_rpc(c, 30, d, f, 1, suffix=struct.pack("<Q", 5000000000),
+                                    expected=(2 if expected < 0 else 0, expected & 0xffffffff, 0))
+                self.submit_rpc(c, 16, d)
+            self.assertIn("pools=1/1 commands=1/1 events=1/1 fences=1/1", self.cleanup_output)
+            self.assertIn("idle=" + ("2" if mode == 27 else "1" if mode in (22, 24) else "0"), self.cleanup_output)
+
+    def test_submit_disconnect_stop_and_optional_fence(self):
+        with self.broker() as path:
+            connections = []
+            for index in range(3):
+                c, d = self.submit_session(path); connections.append(c)
+                q, p, b, e, f = self.submit_objects(c, d)
+                self.submit_record(c, d, b, e)
+                self.submit_rpc(c, 31, d, q, b, f if index else 0)
+            connections[0].close()
+            self.assertEqual(rpc(connections[1], 3, version=5)[0], (0, 0, 0))
+            # third pending device is reclaimed by broker stop
+        self.assertIn("pools=3/3 commands=3/3 events=3/3 fences=3/3 submits=3 executions=3 idle=3", self.cleanup_output)
+
+    def test_submit_event_destroy_invalidates_command_and_pool_frees_children(self):
+        with self.broker() as path:
+            c, d = self.submit_session(path)
+            q, p, b, e, f = self.submit_objects(c, d)
+            self.submit_record(c, d, b, e)
+            self.submit_rpc(c, 24, d, e)
+            self.submit_rpc(c, 31, d, q, b, f, expected=(3, 0, 0))
+            self.submit_rpc(c, 18, d, p)
+            self.submit_rpc(c, 21, d, b, 0, expected=(3, 0, 0))
+            new_pool = self.submit_rpc(c, 17, d, 0, 0, expected=(0, 0, 1))
+            self.assertGreater(new_pool, f) # IDs never reused after destruction
+            self.submit_rpc(c, 16, d)
+        self.assertIn("pools=2/2 commands=1/1 events=1/1 fences=1/1 submits=0 executions=0", self.cleanup_output)
 
     def test_device_loader_contract(self):
         with self.broker() as path:

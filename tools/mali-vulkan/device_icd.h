@@ -1,17 +1,24 @@
 /* Opt-in lifecycle subset. Local dispatchable objects contain broker IDs only. */
+#include <stdatomic.h>
 struct proxy_queue {
     VK_LOADER_DATA loader;
     uint32_t id;
+    struct proxy_logical *owner;
 };
+struct proxy_resource;
 struct proxy_logical {
     VK_LOADER_DATA loader;
     struct proxy_instance *owner;
     struct proxy_logical *next;
     uint32_t id, family, count;
     struct proxy_queue queues[MB_DEVICE_MAX_QUEUES];
+    struct proxy_resource *resources;
+    atomic_int submit_failed;
 };
 _Static_assert(offsetof(struct proxy_logical, loader) == 0, "device dispatch word");
 _Static_assert(offsetof(struct proxy_queue, loader) == 0, "queue dispatch word");
+
+static void proxy_free_resources(struct proxy_logical *d);
 
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo *info,
         const VkAllocationCallbacks *allocator, VkDevice *out) {
@@ -20,7 +27,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice physic
     if (!physical) return VK_ERROR_INITIALIZATION_FAILED;
     struct proxy_device *p = (struct proxy_device *)physical;
     struct proxy_instance *s = p->owner;
-    if (s->wire_version != MB_DEVICE_VERSION || !info || allocator || info->flags ||
+    if (s->wire_version < MB_DEVICE_VERSION || !info || allocator || info->flags ||
         info->sType != VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO) return VK_ERROR_INITIALIZATION_FAILED;
     /* Ignore only loader-owned bookkeeping; never transport any pointer chain. */
     unsigned nodes = 0;
@@ -54,7 +61,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice physic
     if (result == VK_SUCCESS) {
         d->owner = s; d->id = mb_get_u32(reply + 12); d->family = q->queueFamilyIndex; d->count = q->queueCount;
         set_loader_magic_value(d);
-        for (uint32_t i = 0; i < d->count; ++i) set_loader_magic_value(&d->queues[i]);
+        for (uint32_t i = 0; i < d->count; ++i) {
+            set_loader_magic_value(&d->queues[i]); d->queues[i].owner = d;
+        }
         d->next = s->logical; s->logical = d; *out = (VkDevice)d;
         LOG("broker vkCreateDevice = VK_SUCCESS; proxy device ID=%u", d->id);
     } else free(d);
@@ -96,12 +105,14 @@ static VKAPI_ATTR void VKAPI_CALL proxy_DestroyDevice(VkDevice device, const VkA
     struct proxy_logical **link = &s->logical;
     while (*link && *link != d) link = &(*link)->next;
     if (*link) *link = d->next;
-    free(d);
+    proxy_free_resources(d); free(d);
     pthread_mutex_unlock(&s->lock);
 }
 static void proxy_free_logical(struct proxy_instance *s) {
-    while (s->logical) { struct proxy_logical *next = s->logical->next; free(s->logical); s->logical = next; }
+    while (s->logical) { struct proxy_logical *next = s->logical->next; proxy_free_resources(s->logical); free(s->logical); s->logical = next; }
 }
+#include "submit_icd.h"
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr(VkDevice device, const char *name) {
     if (!device || !name) return NULL;
 #define DEVICE_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;
@@ -109,5 +120,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr(VkDevice
     DEVICE_ENTRY(DestroyDevice)
     DEVICE_ENTRY(GetDeviceQueue)
 #undef DEVICE_ENTRY
+    if (((struct proxy_logical *)device)->owner->wire_version == MB_SUBMIT_VERSION) {
+#define MB_SUBMIT_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;
+#include "submit_entries.def"
+#undef MB_SUBMIT_ENTRY
+    }
     return NULL;
 }

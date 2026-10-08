@@ -59,3 +59,9 @@ app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the
   Both the standalone entry and option parser return before renderer/backend initialization.
   Normal Vulkan version selection and robustness2 requirements are unchanged. See
   [the source analysis and phone instructions](../mali-vulkan/DEVICE_TEST.md).
+
+- `0116-vulkan-submit-test.patch` - separate `--vk-submit-test` checkpoint 4C:
+  verifies family 0 graphics+compute, creates a command pool/primary command buffer,
+  records one core vkCmdSetEvent, submits with a normal fence, waits five seconds
+  and checks the real event SET result. Standalone/parser returns precede backend
+  initialization. No renderer changes. See [SUBMIT_TEST.md](../mali-vulkan/SUBMIT_TEST.md).

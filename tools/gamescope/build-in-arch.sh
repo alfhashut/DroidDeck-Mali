@@ -67,6 +67,7 @@ out/usr/local/bin/gamescope --help > out/gamescope-help.log 2>&1
 grep -F -- '--vk-enumerate-only' out/gamescope-help.log
 grep -F -- '--vk-capabilities' out/gamescope-help.log
 grep -F -- '--vk-create-device-test' out/gamescope-help.log
+grep -F -- '--vk-submit-test' out/gamescope-help.log
 set +e
 env VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
   VK_LOADER_LAYERS_DISABLE='*' out/usr/local/bin/gamescope --vk-enumerate-only > out/gamescope-enumeration.log 2>&1
@@ -92,6 +93,14 @@ set -e
 cat out/gamescope-device.log
 test "$DEVICE_STATUS" -eq 1
 grep -F 'gamescope: device test vkCreateInstance failed:' out/gamescope-device.log
+set +e
+env VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
+  VK_LOADER_LAYERS_DISABLE='*' out/usr/local/bin/gamescope --vk-submit-test > out/gamescope-submit.log 2>&1
+SUBMIT_STATUS=$?
+set -e
+cat out/gamescope-submit.log
+test "$SUBMIT_STATUS" -eq 1
+grep -F 'gamescope: submit test vkCreateInstance failed:' out/gamescope-submit.log
 # Every NEEDED library must be one the runtime ships, or the binary would not load there.
 NEEDED=$(readelf -d out/usr/local/bin/gamescope | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
 echo "NEEDED: $NEEDED"
