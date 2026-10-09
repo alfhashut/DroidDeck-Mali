@@ -78,9 +78,7 @@ object MaliNormalBroker {
                 } finally { staged.delete() }
             }
             val manifest = File(directory, "mali_proxy_icd.json")
-            val icd = JSONObject(manifest.readText()).getJSONObject("ICD")
-            check(icd.getString("library_path") == "libdroiddeck_mali_proxy.so" && icd.getString("api_version") == "1.0.0") { "Unexpected Mali proxy manifest" }
-            val library = File(directory, "libdroiddeck_mali_proxy.so")
+            val library = validateProxyManifest(manifest)
             val elf = library.inputStream().use { input -> ByteArray(20).also { check(input.read(it) == it.size) } }
             check(elf[0] == 0x7f.toByte() && elf[1] == 'E'.code.toByte() && elf[2] == 'L'.code.toByte() && elf[3] == 'F'.code.toByte() &&
                 elf[4] == 2.toByte() && elf[5] == 1.toByte() && elf[18] == 0xb7.toByte() && elf[19] == 0.toByte()) { "Mali proxy asset is not an AArch64 ELF library" }
@@ -90,5 +88,24 @@ object MaliNormalBroker {
             throw error
         }
     }
+
+    internal fun validateProxyManifest(manifest: File): File {
+        val metadata = JSONObject(manifest.readText())
+        check(metadata.getString("file_format_version") == "1.0.0") { "Unexpected Mali proxy manifest format version" }
+        val icd = metadata.getJSONObject("ICD")
+        check(icd.getString("api_version") == "1.0.0") { "Unexpected Mali proxy manifest API version" }
+        val directory = checkNotNull(manifest.parentFile).canonicalFile
+        val library = File(directory, "libdroiddeck_mali_proxy.so")
+        val path = icd.getString("library_path")
+        val reference = File(path)
+        val resolved = (if (reference.isAbsolute) reference else File(directory, path)).canonicalFile
+        // The diagnostic manifest uses ./libdroiddeck_mali_proxy.so. Resolve it
+        // beside the manifest; a bare soname would instead use loader search paths.
+        check(path.contains('/') && resolved == library.canonicalFile && resolved.parentFile == directory && library.isFile) {
+            "Mali proxy manifest must reference the staged libdroiddeck_mali_proxy.so"
+        }
+        return library
+    }
+
     @Synchronized fun stop(): Boolean = SystemVulkanBroker.stopNormal()
 }

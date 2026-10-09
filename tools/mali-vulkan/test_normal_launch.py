@@ -120,6 +120,23 @@ class NormalLaunchTests(unittest.TestCase):
         self.assertLess(connected, timeout, "LocalSocket must connect/create its FD before SO_TIMEOUT")
         self.assertLess(timeout, inventory)
 
+    def test_normal_manifest_uses_diagnostic_asset_and_resolved_library_validation(self):
+        # Parse the actual build input, without compiling Android/Gamescope fixtures.
+        manifest = json.loads((ROOT / "tools/mali-vulkan/mali_proxy_icd.json").read_text())
+        self.assertEqual(manifest["file_format_version"], "1.0.0")
+        self.assertEqual(manifest["ICD"]["api_version"], "1.0.0")
+        self.assertEqual(manifest["ICD"]["library_path"], "./libdroiddeck_mali_proxy.so")
+        with tempfile.TemporaryDirectory(prefix="mali-manifest-") as directory:
+            library = Path(directory) / "libdroiddeck_mali_proxy.so"
+            self.assertEqual((Path(directory) / manifest["ICD"]["library_path"]).resolve(), library.resolve())
+        build = (ROOT / "tools/mali-vulkan/build-icd.sh").read_text()
+        self.assertIn('cp -- "$repo_root/tools/mali-vulkan/mali_proxy_icd.json" "$output/mali_proxy_icd.json"', build)
+        broker = (ROOT / "app/src/main/java/com/droiddeck/launcher/gpu/MaliNormalBroker.kt").read_text()
+        self.assertIn("val library = validateProxyManifest(manifest)", broker)
+        self.assertIn("resolved == library.canonicalFile", broker)
+        self.assertIn("resolved.parentFile == directory", broker)
+        self.assertNotIn('icd.getString("library_path") == "libdroiddeck_mali_proxy.so"', broker)
+
     def test_service_readiness_order_and_stop_start_race_guards(self):
         # Source contracts supplement the executable native/shell tests. They
         # do not claim to execute an Android Activity/Service lifecycle on host.
