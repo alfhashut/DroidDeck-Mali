@@ -13,6 +13,8 @@ import java.io.IOException
 object SystemVulkanBroker {
     private const val TAG = "MaliVulkanBroker"
     private var socket: File? = null
+    private var normalOwned = false
+    @JvmStatic private external fun nativeQuarantinedSessions(): Int
 
     @JvmStatic private external fun nativeStart(socketPath: String)
     @JvmStatic private external fun nativeStop()
@@ -26,6 +28,7 @@ object SystemVulkanBroker {
 
     @Synchronized
     fun start(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         socket?.let { return it.path }
         val directory = File(context.filesDir, "mali-vulkan")
         if (!directory.isDirectory && !directory.mkdirs()) throw IOException("Cannot create $directory")
@@ -35,6 +38,23 @@ object SystemVulkanBroker {
         nativeStart(path.path)
         socket = path
         return path.path
+    }
+
+    @Synchronized fun startNormal(context: Context): String {
+        if (socket != null) throw IOException("Mali broker is already in use")
+        System.loadLibrary("malivulkan")
+        if (nativeQuarantinedSessions() != 0) throw IOException("A previous Android release timed out; retained resources require app process restart")
+        val path = start(context)
+        normalOwned = true
+        return path
+    }
+
+    @Synchronized fun stopNormal(): Boolean {
+        if (!normalOwned) return true
+        nativeStop()
+        socket = null
+        normalOwned = false
+        return nativeQuarantinedSessions() == 0
     }
 
     /** Runs the glibc probe through the existing one-off Linux/proot command path. */
@@ -296,6 +316,7 @@ object SystemVulkanBroker {
 
     @Synchronized
     fun stop() {
+        if (normalOwned) throw IOException("Stop the normal session before stopping its Mali broker")
         if (socket == null) return
         nativeStop()
         socket = null

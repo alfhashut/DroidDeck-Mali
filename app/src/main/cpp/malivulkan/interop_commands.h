@@ -27,9 +27,19 @@ INTEROP_FIND(image, images)
 INTEROP_FIND(ahb, ahbs)
 INTEROP_FIND(sync, syncs)
 #undef INTEROP_FIND
+static int interop_ahb_held(struct native_device *d, const struct native_ahb *a) {
+    return a && a->id && (a->id == d->session.held || a->id == d->session.pending || mb_normal_owned(a->normal_key));
+}
+static int interop_normal_reference(struct native_device *d, uint32_t id) {
+    for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
+        struct native_ahb *a = &d->interop.ahbs[i];
+        if (interop_ahb_held(d, a) && (id == a->image || id == a->memory)) return 1;
+    }
+    return 0;
+}
 static int interop_referenced(struct native_device *d, uint32_t id, int pending_only) {
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
-        if (d->interop.ahbs[i].id && (d->interop.ahbs[i].id == d->session.held || d->interop.ahbs[i].id == d->session.pending) && (d->interop.ahbs[i].image == id || d->interop.ahbs[i].memory == id)) return 1;
+        if (d->interop.ahbs[i].id && interop_ahb_held(d, &d->interop.ahbs[i]) && (d->interop.ahbs[i].image == id || d->interop.ahbs[i].memory == id)) return 1;
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
         struct native_command *c = &d->submit.commands[i];
         if (!c->id || (pending_only && c->state != 3)) continue;
@@ -71,19 +81,17 @@ static void native_interop_close(struct native_device *d) {
     if (!v->enabled) return;
     /* A timed-out session retains its exact Android-owned image/allocation/AHB.
      * Everything else is safe after native_drain_device. */
-    struct native_ahb *held = interop_find_ahb(d, d->session.held);
-    struct native_ahb *pending = interop_find_ahb(d, d->session.pending);
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
-        if (v->syncs[i].id && v->syncs[i].fd >= 0) { close(v->syncs[i].fd); if (d->session.enabled) ++d->session.fds_closed; }
+        if (v->syncs[i].id && v->syncs[i].fd >= 0) { close(v->syncs[i].fd); if (d->session.enabled || d->normal.enabled) ++d->session.fds_closed; }
         if (v->buffers[i].id) v->DestroyBuffer(d->handle, v->buffers[i].handle, NULL);
-        if (v->images[i].id && (!held || v->images[i].id != held->image) && (!pending || v->images[i].id != pending->image)) v->DestroyImage(d->handle, v->images[i].handle, NULL);
+        if (v->images[i].id && !interop_normal_reference(d, v->images[i].id)) v->DestroyImage(d->handle, v->images[i].handle, NULL);
     }
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
-        if (v->memories[i].id && (!held || v->memories[i].id != held->memory) && (!pending || v->memories[i].id != pending->memory)) {
+        if (v->memories[i].id && !interop_normal_reference(d, v->memories[i].id)) {
             if (v->memories[i].map) v->UnmapMemory(d->handle, v->memories[i].handle);
             v->FreeMemory(d->handle, v->memories[i].handle, NULL);
         }
-        if (v->ahbs[i].id && &v->ahbs[i] != held && &v->ahbs[i] != pending) AHardwareBuffer_release(v->ahbs[i].handle);
+        if (v->ahbs[i].id && !interop_ahb_held(d, &v->ahbs[i])) AHardwareBuffer_release(v->ahbs[i].handle);
     }
 }
 static int interop_range(uint64_t total, uint64_t offset, uint64_t size) {
@@ -134,7 +142,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     switch (op) {
     case MB_BUFFER_CREATE: {
         uint64_t size = mb_get_u64(w + 4); uint32_t usage = mb_get_u32(w + 12);
-        if (!size || size > MB_INTEROP_MAX_MEMORY || !usage || (usage & ~(VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (d->renderer.enabled ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : 0)))) return MB_PROTOCOL_ERROR;
+        if (!size || size > (d->normal.enabled ? MB_NORMAL_MAX_MEMORY : MB_INTEROP_MAX_MEMORY) || !usage || (usage & ~(VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (d->renderer.enabled ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : 0)))) return MB_PROTOCOL_ERROR;
         NEW_INTEROP(buffers, buffer);
         VkBufferCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         *result = v->CreateBuffer(d->handle, &ci, NULL, &o->handle);
@@ -143,7 +151,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     }
     case MB_IMAGE_CREATE: {
         uint32_t width = id, height = mb_get_u32(w + 8), usage = mb_get_u32(w + 12);
-        if (!width || !height || width > 256 || height > 256 || !usage || (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) return MB_PROTOCOL_ERROR;
+        if (!width || !height || width > (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION : 256u) || height > (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION : 256u) || !usage || (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) return MB_PROTOCOL_ERROR;
         NEW_INTEROP(images, image);
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
             .extent = {width, height, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -169,7 +177,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     }
     case MB_MEMORY_ALLOCATE: {
         uint64_t size = mb_get_u64(w + 4); uint32_t type = mb_get_u32(w + 12);
-        if (!size || size > MB_INTEROP_MAX_MEMORY || type >= v->properties.memoryTypeCount) return MB_PROTOCOL_ERROR;
+        if (!size || size > (d->normal.enabled ? MB_NORMAL_MAX_MEMORY : MB_INTEROP_MAX_MEMORY) || type >= v->properties.memoryTypeCount) return MB_PROTOCOL_ERROR;
         NEW_INTEROP(memories, memory);
         VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = size, .memoryTypeIndex = type};
         *result = v->AllocateMemory(d->handle, &ai, NULL, &o->handle);
@@ -285,7 +293,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     case MB_AHB_CREATE: {
         if (!v->ahb_enabled) FAIL_NATIVE(VK_ERROR_EXTENSION_NOT_PRESENT);
         uint32_t width = id, height = mb_get_u32(w + 8);
-        if (!width || !height || width > 256 || height > 256 || s->next_resource_id > UINT32_MAX - 3) return MB_PROTOCOL_ERROR;
+        if (!width || !height || width > (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION : 256u) || height > (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION : 256u) || s->next_resource_id > UINT32_MAX - 3) return MB_PROTOCOL_ERROR;
         struct native_image *im = NULL; struct native_memory *m = NULL; struct native_ahb *a = NULL;
         for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
             if (!im && !v->images[i].id) im = &v->images[i];
@@ -352,7 +360,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     }
     case MB_AHB_RELEASE: {
         struct native_ahb *a = interop_find_ahb(d, id);
-        if (!a || d->session.held == a->id || d->session.pending == a->id || interop_find_image(d, a->image) || interop_find_memory(d, a->memory)) return MB_PROTOCOL_ERROR;
+        if (!a || interop_ahb_held(d, a) || interop_find_image(d, a->image) || interop_find_memory(d, a->memory)) return MB_PROTOCOL_ERROR;
         AHardwareBuffer_release(a->handle); memset(a, 0, sizeof(*a)); break;
     }
     case MB_SYNC_FENCE_CREATE: {
@@ -377,7 +385,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         NEW_INTEROP(syncs, sync);
         VkFenceGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR, .fence = f->handle, .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
         int fd = -1; *result = v->fence_fd(d->handle, &info, &fd);
-        if (*result == VK_SUCCESS) { o->id = new_id; o->fence = f->id; o->fd = fd; f->exported = 1; if (d->session.enabled && fd >= 0) ++d->session.fds_created; }
+        if (*result == VK_SUCCESS) { o->id = new_id; o->fence = f->id; o->fd = fd; f->exported = 1; if ((d->session.enabled || d->normal.enabled) && fd >= 0) ++d->session.fds_created; }
         else if (fd >= 0) { close(fd); }
         break;
     }
@@ -389,7 +397,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
             *result = interop_wait_sync(d, sync, ms);
         } else {
             if (!sync->completed) return MB_PROTOCOL_ERROR;
-            if (sync->fd >= 0) { close(sync->fd); if (d->session.enabled) ++d->session.fds_closed; }
+            if (sync->fd >= 0) { close(sync->fd); if (d->session.enabled || d->normal.enabled) ++d->session.fds_closed; }
             memset(sync, 0, sizeof(*sync));
         } break;
     }

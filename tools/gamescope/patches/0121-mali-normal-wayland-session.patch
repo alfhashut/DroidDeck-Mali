@@ -1,0 +1,1029 @@
+--- a/protocol/banner-ahb-v1.xml
++++ b/protocol/banner-ahb-v1.xml
+@@ -0,0 +1,120 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="banner_ahb_v1">
++  <copyright>
++    Copyright 2026 The412Banner
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <interface name="banner_ahb_v1" version="3">
++    <description summary="Android gralloc buffers behind dma-buf wl_buffers">
++      Zero-copy window layers on Android. A Vulkan swapchain image that the
++      client allocated as an Android AHardwareBuffer (gralloc) is still shared
++      as a dma-buf through zwp_linux_dmabuf_v1, so the compositor can import
++      and draw it the usual way. This interface additionally hands the
++      compositor the AHardwareBuffer itself, once per wl_buffer, so the
++      compositor can put the buffer straight on an Android SurfaceControl
++      layer (SurfaceFlinger / the display hardware composite it) without
++      copying it.
++
++      The AHardwareBuffer travels over a Unix socket: the client creates a
++      socketpair, writes the buffer's handle into one end with
++      AHardwareBuffer_sendHandleToUnixSocket, then sends the other end in the
++      attach request. The compositor reads it with
++      AHardwareBuffer_recvHandleFromUnixSocket and closes the socket. Its
++      reference to the AHardwareBuffer lives as long as the wl_buffer (plus
++      whatever the display still holds).
++
++      The compositor advertises this global whenever it can put buffers on a
++      display layer at all; whether it WANTS gralloc buffers right now is the
++      mode event (version 2), sent on bind and every time the user switches
++      zero-copy on or off during the session. A client decides per swapchain,
++      when it creates the swapchain, from the last mode it received, and a
++      client whose live swapchain was built for the other mode retires it
++      (VK_ERROR_OUT_OF_DATE_KHR on its next acquire or present) so the program
++      rebuilds it for the new mode. Buffers of the old swapchain stay fully
++      presentable until then: an attached AHardwareBuffer keeps its association
++      for the wl_buffer's lifetime whatever the mode is now. A version 1
++      client (no mode event) keeps deciding from its own environment. A
++      client that does not see the global (or does not want it) allocates
++      swapchain images the standard way; nothing else changes.
++
++      Synchronisation stays implicit: the dma-buf carries the client's render
++      fence (DMA_BUF_IOCTL_IMPORT_SYNC_FILE by the client's driver), the
++      compositor exports it as the layer's acquire fence, and the compositor
++      imports the display's release fence into the dma-buf before it sends
++      wl_buffer.release, so the client's next acquire waits on it.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the object">
++        Buffers already attached keep their AHardwareBuffer association.
++      </description>
++    </request>
++
++    <request name="attach">
++      <description summary="hand the compositor a buffer's AHardwareBuffer">
++        Associates the AHardwareBuffer readable from socket with the
++        (already created) dma-buf wl_buffer. width, height and stride
++        (pixels) describe the gralloc allocation; modifier_hi/lo is the DRM
++        format modifier the dma-buf was shared with (the same value passed to
++        zwp_linux_buffer_params_v1.add); image_count is the number of images
++        in the swapchain this buffer belongs to (for the compositor's log).
++        Sent once per wl_buffer, before the buffer is first attached to a
++        surface.
++      </description>
++      <arg name="buffer" type="object" interface="wl_buffer" summary="the dma-buf wl_buffer"/>
++      <arg name="socket" type="fd" summary="socket the AHardwareBuffer handle was written to"/>
++      <arg name="width" type="uint" summary="buffer width in pixels"/>
++      <arg name="height" type="uint" summary="buffer height in pixels"/>
++      <arg name="stride" type="uint" summary="gralloc row stride in pixels"/>
++      <arg name="modifier_hi" type="uint" summary="high 32 bits of the DRM format modifier"/>
++      <arg name="modifier_lo" type="uint" summary="low 32 bits of the DRM format modifier"/>
++      <arg name="image_count" type="uint" summary="images in the client's swapchain"/>
++    </request>
++
++    <event name="mode" since="2">
++      <description summary="whether the compositor wants gralloc swapchain images now">
++        Sent once right after bind and again whenever the compositor's
++        zero-copy state flips (the in-game switch). enabled = 1: swapchains
++        created from now on should use gralloc AHardwareBuffers and attach
++        them; 0: standard buffers. A live swapchain built for the other value
++        should be retired by the client (out of date) so the program rebuilds
++        it; until it is, its buffers are shown as before.
++      </description>
++      <arg name="enabled" type="uint" summary="1 = gralloc swapchain images wanted, 0 = not"/>
++    </event>
++    <request name="create_broker_buffer" since="3">
++      <description summary="create an AHB-only buffer from the local Mali broker">
++        Experimental same-app broker handoff. key is an opaque registry ID,
++        never a native pointer or Vulkan handle. The compositor acquires the
++        broker's exact AHardwareBuffer. No Linux DMA-BUF export is involved.
++        The producer must finish its real SYNC_FD wait and publish ownership
++        through the broker before committing. wl_buffer.release is sent only
++        after the real Android release fence has signalled. Destroying a
++        wl_buffer does not release an allocation still held by Android.
++      </description>
++      <arg name="buffer" type="new_id" interface="wl_buffer"/>
++      <arg name="key" type="uint"/>
++      <arg name="width" type="uint"/>
++      <arg name="height" type="uint"/>
++    </request>
++  </interface>
++</protocol>
+--- a/protocol/meson.build
++++ b/protocol/meson.build
+@@ -25,6 +25,7 @@
+ 	wl_protocol_dir / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
+ 
+ 	'color-management-v1.xml',
++    'banner-ahb-v1.xml',
+ 
+ 	# Wayland Protocols not yet in a release.
+ 	'xdg-toplevel-icon-v1.xml',
+--- a/src/Backends/WaylandBackend.cpp
++++ b/src/Backends/WaylandBackend.cpp
+@@ -1,3 +1,5 @@
++#include "mali_normal.hpp"
++#include <banner-ahb-v1-client-protocol.h>
+ #include "backend.h"
+ #include "rendervulkan.hpp"
+ #include "wlserver.hpp"
+@@ -221,6 +223,7 @@
+ 
+         void CommitLibDecor( libdecor_configuration *pConfiguration );
+         void Commit();
++        void PrepareDecorCommit() { if (m_bNeedsDecorCommit) { CommitLibDecor(nullptr); m_bNeedsDecorCommit = false; } }
+ 
+         wl_surface *GetSurface() const { return m_pSurface; }
+         libdecor_frame *GetFrame() const { return m_pFrame; }
+@@ -724,6 +727,7 @@
+         friend CWaylandFb;
+ 
+         wl_display *GetDisplay() const { return m_pDisplay; }
++        banner_ahb_v1 *m_pBrokerAHB = nullptr;
+         wl_shm *GetShm() const { return m_pShm; }
+         wl_compositor *GetCompositor() const { return m_pCompositor; }
+         wp_single_pixel_buffer_manager_v1 *GetSinglePixelBufferManager() const { return m_pSinglePixelBufferManager; }
+@@ -1028,6 +1032,11 @@
+ 
+     bool CWaylandConnector::Init()
+     {
++        if (mali_normal_active()) {
++            if (!m_Planes[0].Init(nullptr, nullptr)) return false;
++            libdecor_frame_set_fullscreen(m_Planes[0].GetFrame(), nullptr);
++            return mali_normal_bind(m_pBackend->GetDisplay(), m_Planes[0].GetSurface(), m_pBackend->m_pBrokerAHB);
++        }
+         for ( uint32_t i = 0; i < std::size( m_Planes ); i++ )
+         {
+             bool bSuccess = m_Planes[i].Init( i == 0 ? nullptr : &m_Planes[0], i == 0 ? nullptr : &m_Planes[ i - 1 ] );
+@@ -1074,6 +1083,10 @@
+ 
+     int CWaylandConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
+     {
++        if (mali_normal_active()) {
++            m_Planes[0].PrepareDecorCommit();
++            return vulkan_mali_normal_present(pFrameInfo);
++        }
+         UpdateFullscreenState();
+ 
+         bool bNeedsFullComposite = false;
+@@ -2097,12 +2110,12 @@
+             return false;
+         }
+ 
+-        if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
++        if ( !mali_normal_active() && !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
+         {
+             return false;
+         }
+         
+-        if ( !wlsession_init() )
++        if ( !mali_normal_active() && !wlsession_init() )
+         {
+             xdg_log.errorf( "Failed to initialize Wayland session" );
+             return false;
+@@ -2121,6 +2134,7 @@
+ 
+     bool CWaylandBackend::PostInit()
+     {
++        if (mali_normal_active()) return true;
+         if ( m_pSinglePixelBufferManager )
+         {
+             wl_buffer *pBlackBuffer = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer( m_pSinglePixelBufferManager, 0, 0, 0, ~0u );
+@@ -2509,6 +2523,11 @@
+ 
+     void CWaylandBackend::Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion )
+     {
++        if (mali_normal_active() && !strcmp(pInterface, "banner_ahb_v1") && uVersion >= 3) {
++            m_pBrokerAHB = static_cast<banner_ahb_v1 *>(wl_registry_bind(pRegistry, uName, &banner_ahb_v1_interface, 3));
++            static const banner_ahb_v1_listener listener{ [](void *, banner_ahb_v1 *, uint32_t) {} };
++            banner_ahb_v1_add_listener(m_pBrokerAHB, &listener, this);
++        }
+         if ( !strcmp( pInterface, wl_compositor_interface.name ) && uVersion >= 4u )
+         {
+             m_pCompositor = (wl_compositor *)wl_registry_bind( pRegistry, uName, &wl_compositor_interface, 4u );
+@@ -2876,10 +2895,20 @@
+         if ( nFD < 0 )
+         {
+             xdg_log.errorf( "Couldn't get Wayland display fd for input thread." );
++            if (mali_normal_active()) { mali_normal_failure("outer Wayland input connection lost"); return; }
+             abort();
+         }
+ 
+-        CFunctionWaitable waitable( nFD );
++        class CWaylandConnectionWaitable final : public IWaitable {
++            int m_nFD;
++        public:
++            explicit CWaylandConnectionWaitable(int fd) : m_nFD(fd) {}
++            int GetFD() override { return m_nFD; }
++            void OnPollHangUp() override {
++                if (mali_normal_active()) mali_normal_failure("Android Wayland input socket hung up");
++                else IWaitable::OnPollHangUp();
++            }
++        } waitable(nFD);
+         m_Waiter.AddWaitable( &waitable );
+ 
+         int nRet = 0;
+@@ -2888,6 +2917,7 @@
+             if ( ( nRet = wl_display_dispatch_queue_pending( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
+             {
+                 LogDisplayError( "Failed to dispatch input thread queue", m_pBackend->GetDisplay() );
++                if (mali_normal_active()) { mali_normal_failure("outer Wayland input connection lost"); return; }
+                 abort();
+             }
+ 
+@@ -2897,6 +2927,7 @@
+                     continue;
+ 
+                 LogDisplayError( "Failed to prepare read of input thread queue", m_pBackend->GetDisplay() );
++                if (mali_normal_active()) { mali_normal_failure("outer Wayland input connection lost"); return; }
+                 abort();
+             }
+ 
+@@ -2906,6 +2937,7 @@
+                 if ( nRet < 0 )
+                 {
+                     xdg_log.errorf_errno( "Input thread poll failed" );
++                    if (mali_normal_active()) { mali_normal_failure("outer Wayland input connection lost"); return; }
+                     abort();
+                 }
+ 
+@@ -2916,6 +2948,7 @@
+             if ( ( nRet = wl_display_read_events( m_pBackend->GetDisplay() ) ) < 0 )
+             {
+                 LogDisplayError( "Failed to read events on input thread", m_pBackend->GetDisplay() );
++                if (mali_normal_active()) { mali_normal_failure("outer Wayland input connection lost"); return; }
+                 abort();
+             }
+         }
+@@ -2954,6 +2987,7 @@
+ 
+     void CWaylandInputThread::HandleKey( uint32_t uKey, bool bPressed )
+     {
++        if (mali_normal_active()) { mali_normal_input(3, 0, 0, uKey, bPressed); return; }
+         if ( m_uKeyModifiers & m_uModMask[ GAMESCOPE_WAYLAND_MOD_META ] )
+         {
+             switch ( uKey )
+@@ -3125,6 +3159,7 @@
+     // Touch ids are offset by one: the nested pointer already moves wlserver's touch 0.
+     void CWaylandInputThread::Wayland_Touch_Down( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, wl_surface *pSurface, int32_t nId, wl_fixed_t fX, wl_fixed_t fY )
+     {
++        if (mali_normal_active()) { if (IsGamescopeToplevel(pSurface) && nId == 0) { mali_normal_input(1, wl_fixed_to_double(fX), wl_fixed_to_double(fY), 0, 0); mali_normal_input(2, 0, 0, BTN_LEFT, 1); } return; }
+         double flX, flY;
+         if ( !TouchToOutput( pSurface, fX, fY, &flX, &flY ) )
+             return;
+@@ -3135,6 +3170,7 @@
+     }
+     void CWaylandInputThread::Wayland_Touch_Up( wl_touch *pTouch, uint32_t uSerial, uint32_t uTime, int32_t nId )
+     {
++        if (mali_normal_active()) { if (nId == 0) mali_normal_input(2, 0, 0, BTN_LEFT, 0); return; }
+         if ( m_TouchSurfaces.erase( nId ) == 0 )
+             return;
+         wlserver_lock();
+@@ -3143,6 +3179,7 @@
+     }
+     void CWaylandInputThread::Wayland_Touch_Motion( wl_touch *pTouch, uint32_t uTime, int32_t nId, wl_fixed_t fX, wl_fixed_t fY )
+     {
++        if (mali_normal_active()) { if (nId == 0) mali_normal_input(1, wl_fixed_to_double(fX), wl_fixed_to_double(fY), 0, 0); return; }
+         auto it = m_TouchSurfaces.find( nId );
+         if ( it == m_TouchSurfaces.end() )
+             return;
+@@ -3158,6 +3195,7 @@
+     }
+     void CWaylandInputThread::Wayland_Touch_Cancel( wl_touch *pTouch )
+     {
++        if (mali_normal_active()) { mali_normal_input(2, 0, 0, BTN_LEFT, 0); return; }
+         wlserver_lock();
+         for ( auto &[ nId, pSurface ] : m_TouchSurfaces )
+             wlserver_touchup( nId + 1, ++m_uFakeTimestamp );
+@@ -3193,6 +3231,10 @@
+ 	}
+ 	void CWaylandInputThread::Wayland_Pointer_Motion( wl_pointer *pPointer, uint32_t uTime, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
+ 	{
++        if (mali_normal_active()) {
++            if (m_bMouseEntered) mali_normal_input(1, wl_fixed_to_double(fSurfaceX), wl_fixed_to_double(fSurfaceY), 0, 0);
++            return;
++        }
+ 		// Ignore any pointer events for which the `enter` event surface didn't pass `IsGamescopeToplevel` (libdecor frame)
+ 		if ( !m_bMouseEntered )
+ 			return;
+@@ -3231,6 +3273,7 @@
+     }
+     void CWaylandInputThread::Wayland_Pointer_Button( wl_pointer *pPointer, uint32_t uSerial, uint32_t uTime, uint32_t uButton, uint32_t uState )
+     {
++        if (mali_normal_active()) { if (m_bMouseEntered) mali_normal_input(2, 0, 0, uButton, uState); return; }
+         // Ignore any pointer events for which the `enter` event surface didn't pass `IsGamescopeToplevel` (libdecor frame)
+         if ( !m_bMouseEntered )
+             return;
+@@ -3283,6 +3326,7 @@
+     }
+     void CWaylandInputThread::Wayland_Pointer_Frame( wl_pointer *pPointer )
+     {
++        if (mali_normal_active()) { m_flScrollAccum[0] = m_flScrollAccum[1] = 0.0; return; }
+         defer( m_uAxisSource = WL_POINTER_AXIS_SOURCE_WHEEL );
+         double flX = m_flScrollAccum[0];
+         double flY = m_flScrollAccum[1];
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,3 +1,4 @@
++#include "mali_normal.hpp"
+ #include "Script/Script.h"
+ 
+ #include <X11/Xlib.h>
+@@ -194,6 +195,8 @@
+ 	"  --vk-ahb-present-test    display actual Vulkan AHardwareBuffer; independent diagnostic\n"
+ 	"  --vk-submit-test               execute one event command and verify fence completion; no rendering\n"
+ 	"  --mali-session-test       persistent Mali Gamescope backend diagnostic\n"
++    "  --mali-wayland-session          experimental normal Mali nested Wayland session\n"
++    "  --mali-interactive-client       ordinary interactive Wayland session client\n"
+ 	"  --mali-wayland-client-test  persistent Mali backend with real SHM Wayland client\n"
+ 	"  --vk-gamescope-renderer-init-test  initialize the real Gamescope Mali BLIT renderer; no backend\n"
+ 	"  --vk-gamescope-first-frame-test    render and present a real Gamescope Mali BLIT frame through AHB\n"
+@@ -744,6 +747,9 @@
+ 
+ int main(int argc, char **argv)
+ {
++    if (argc == 2 && !strcmp(argv[1], "--mali-interactive-client")) return mali_interactive_main();
++    for (int i = 1; i < argc && strcmp(argv[i], "--"); ++i)
++        if (!strcmp(argv[i], "--mali-wayland-session")) return mali_normal_main(argc, argv);
+ 	// The standalone diagnostic exits before any normal startup, including scripts/X11.
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-enumerate-only" ) == 0 )
+ 		return vulkan_enumerate_only();
+--- a/src/mali_interactive.cpp
++++ b/src/mali_interactive.cpp
+@@ -0,0 +1,149 @@
++/* Ordinary Wayland SHM application, launched via Gamescope's session argv. */
++#include "mali_normal.hpp"
++#include <wayland-client.h>
++#include <linux/input-event-codes.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <poll.h>
++#include <algorithm>
++#include <chrono>
++#include <csignal>
++#include <cstdio>
++#include <cstring>
++#include <cerrno>
++namespace {
++static volatile sig_atomic_t quit;
++static void Stop(int) { quit = 1; }
++constexpr unsigned W = 320, H = 180, SIDE = 24;
++struct Client {
++    wl_display *display = nullptr; wl_compositor *compositor = nullptr; wl_shm *shm = nullptr;
++    wl_seat *seat = nullptr; wl_pointer *pointer = nullptr; wl_keyboard *keyboard = nullptr;
++    wl_surface *surface = nullptr; wl_callback *callback = nullptr;
++    struct Buffer { wl_buffer *buffer = nullptr; bool busy = false; Client *owner = nullptr; } buffers[2];
++    bool ready = true, failed = false; unsigned commits = 0, releases = 0, callbacks = 0;
++    unsigned motions = 0, clicks = 0, keys = 0, color = 0; int x = 148, y = 78;
++};
++static void Move(Client *c, int x, int y) { c->x = std::clamp(x, 0, int(W - SIDE)); c->y = std::clamp(y, 0, int(H - SIDE)); }
++static void Motion(void *data, wl_pointer *, uint32_t, wl_fixed_t x, wl_fixed_t y) {
++    auto c = static_cast<Client *>(data); Move(c, wl_fixed_to_int(x) - SIDE / 2, wl_fixed_to_int(y) - SIDE / 2); ++c->motions;
++}
++static const wl_pointer_listener pointerListener = {
++    .enter = [](void *data, wl_pointer *p, uint32_t, wl_surface *, wl_fixed_t x, wl_fixed_t y) { Motion(data, p, 0, x, y); },
++    .leave = [](void *, wl_pointer *, uint32_t, wl_surface *) {},
++    .motion = Motion,
++    .button = [](void *data, wl_pointer *, uint32_t, uint32_t, uint32_t, uint32_t state) {
++        auto c = static_cast<Client *>(data); if (state) { ++c->clicks; c->color = (c->color + 1) % 4; }
++    },
++    .axis = [](void *, wl_pointer *, uint32_t, uint32_t, wl_fixed_t) {},
++    .frame = [](void *, wl_pointer *) {},
++    .axis_source = [](void *, wl_pointer *, uint32_t) {},
++    .axis_stop = [](void *, wl_pointer *, uint32_t, uint32_t) {},
++    .axis_discrete = [](void *, wl_pointer *, uint32_t, int32_t) {},
++};
++static const wl_keyboard_listener keyboardListener = {
++    .keymap = [](void *, wl_keyboard *, uint32_t, int32_t fd, uint32_t) { close(fd); },
++    .enter = [](void *, wl_keyboard *, uint32_t, wl_surface *, wl_array *) {},
++    .leave = [](void *, wl_keyboard *, uint32_t, wl_surface *) {},
++    .key = [](void *data, wl_keyboard *, uint32_t, uint32_t, uint32_t key, uint32_t state) {
++        if (!state) return;
++        auto c = static_cast<Client *>(data); ++c->keys;
++        if (key == KEY_ESC) { quit = 1; return; }
++        if (key == KEY_LEFT || key == KEY_A) Move(c, c->x - 8, c->y);
++        if (key == KEY_RIGHT || key == KEY_D) Move(c, c->x + 8, c->y);
++        if (key == KEY_UP || key == KEY_W) Move(c, c->x, c->y - 8);
++        if (key == KEY_DOWN || key == KEY_S) Move(c, c->x, c->y + 8);
++        if (key == KEY_SPACE || key == KEY_ENTER) c->color = (c->color + 1) % 4;
++    },
++    .modifiers = [](void *, wl_keyboard *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {},
++    .repeat_info = [](void *, wl_keyboard *, int32_t, int32_t) {},
++};
++static const wl_seat_listener seatListener = {
++    .capabilities = [](void *data, wl_seat *seat, uint32_t caps) {
++        auto c = static_cast<Client *>(data);
++        if ((caps & WL_SEAT_CAPABILITY_POINTER) && !c->pointer) { c->pointer = wl_seat_get_pointer(seat); wl_pointer_add_listener(c->pointer, &pointerListener, c); }
++        if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !c->keyboard) { c->keyboard = wl_seat_get_keyboard(seat); wl_keyboard_add_listener(c->keyboard, &keyboardListener, c); }
++    },
++    .name = [](void *, wl_seat *, const char *) {},
++};
++static const wl_registry_listener registryListener = {
++    .global = [](void *data, wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
++        auto c = static_cast<Client *>(data);
++        if (!strcmp(interface, "wl_compositor")) c->compositor = static_cast<wl_compositor *>(wl_registry_bind(registry, name, &wl_compositor_interface, std::min(version, 4u)));
++        if (!strcmp(interface, "wl_shm")) c->shm = static_cast<wl_shm *>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
++        if (!strcmp(interface, "wl_seat")) { c->seat = static_cast<wl_seat *>(wl_registry_bind(registry, name, &wl_seat_interface, std::min(version, 5u))); wl_seat_add_listener(c->seat, &seatListener, c); }
++    },
++    .global_remove = [](void *, wl_registry *, uint32_t) {},
++};
++static const wl_buffer_listener releaseListener{
++    [](void *data, wl_buffer *) { auto b = static_cast<Client::Buffer *>(data); if (!b->busy) b->owner->failed = true; b->busy = false; ++b->owner->releases; }
++};
++static const wl_callback_listener callbackListener{
++    [](void *data, wl_callback *callback, uint32_t) { auto c = static_cast<Client *>(data); wl_callback_destroy(callback); c->callback = nullptr; c->ready = true; ++c->callbacks; }
++};
++static bool Dispatch(Client &c, int timeout) {
++    while (wl_display_prepare_read(c.display)) if (wl_display_dispatch_pending(c.display) < 0) return false;
++    if (wl_display_flush(c.display) < 0 && errno != EAGAIN) { wl_display_cancel_read(c.display); return false; }
++    pollfd p{wl_display_get_fd(c.display), POLLIN, 0}; int n = poll(&p, 1, timeout);
++    if (n < 0 && errno == EINTR) { wl_display_cancel_read(c.display); return true; }
++    if (n == 0) { wl_display_cancel_read(c.display); return true; }
++    if (n < 0 || !(p.revents & POLLIN)) { wl_display_cancel_read(c.display); return false; }
++    return wl_display_read_events(c.display) >= 0 && wl_display_dispatch_pending(c.display) >= 0 && !c.failed;
++}
++}
++int mali_interactive_main() {
++    std::setvbuf(stdout, nullptr, _IOLBF, 0); quit = 0;
++    std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
++    Client c{}; c.display = wl_display_connect(nullptr);
++    if (!c.display) { std::perror("interactive Wayland connect"); return 1; }
++    auto registry = wl_display_get_registry(c.display); wl_registry_add_listener(registry, &registryListener, &c);
++    bool ok = wl_display_roundtrip(c.display) >= 0 && c.compositor && c.shm && c.seat;
++    constexpr size_t bytes = W * H * 4;
++    int fd = memfd_create("droiddeck-interactive", MFD_CLOEXEC); void *memory = MAP_FAILED; wl_shm_pool *pool = nullptr;
++    if (ok && fd >= 0 && ftruncate(fd, bytes * 2) == 0) memory = mmap(nullptr, bytes * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    ok &= memory != MAP_FAILED;
++    if (ok) {
++        pool = wl_shm_create_pool(c.shm, fd, bytes * 2); c.surface = wl_compositor_create_surface(c.compositor);
++        for (unsigned i = 0; i < 2; ++i) {
++            auto &b = c.buffers[i]; b.owner = &c;
++            b.buffer = wl_shm_pool_create_buffer(pool, i * bytes, W, H, W * 4, WL_SHM_FORMAT_ARGB8888);
++            wl_buffer_add_listener(b.buffer, &releaseListener, &b);
++        }
++        auto report = std::chrono::steady_clock::now();
++        std::puts("interactive client: pointer/touch moves square; click/Space changes colour; arrows/WASD move; Escape exits; runs until user exits");
++        while (ok && !quit) {
++            auto &b = c.buffers[c.commits % 2];
++            if (!c.ready || b.busy) { ok = Dispatch(c, 100); continue; }
++            auto pixels = static_cast<uint32_t *>(memory) + (c.commits % 2) * W * H;
++            std::fill(pixels, pixels + W * H, 0xff101824);
++            const uint32_t colors[] = {0xff35c9ef, 0xffe9b44c, 0xffe86f8c, 0xff79d987};
++            for (unsigned y = c.y; y < c.y + SIDE; ++y) for (unsigned x = c.x; x < c.x + SIDE; ++x) pixels[y * W + x] = colors[c.color];
++            // A moving heartbeat proves fresh frames even with no input.
++            unsigned head = (c.commits / 3) % W;
++            for (unsigned y = H - 4; y < H; ++y) for (unsigned x = head; x < std::min(head + 12, W); ++x) pixels[y * W + x] = 0xff79d987;
++            c.ready = false; b.busy = true; c.callback = wl_surface_frame(c.surface);
++            wl_callback_add_listener(c.callback, &callbackListener, &c);
++            wl_surface_attach(c.surface, b.buffer, 0, 0); wl_surface_damage(c.surface, 0, 0, W, H); wl_surface_commit(c.surface); ++c.commits;
++            ok = Dispatch(c, 100);
++            auto now = std::chrono::steady_clock::now();
++            if (now - report >= std::chrono::seconds(3)) {
++                std::printf("interactive input: motions=%u clicks=%u keys=%u square=%d,%d colour=%u frames=%u releases=%u\n", c.motions, c.clicks, c.keys, c.x, c.y, c.color, c.commits, c.releases); report = now;
++            }
++        }
++        wl_surface_attach(c.surface, nullptr, 0, 0); wl_surface_commit(c.surface);
++        wl_display_flush(c.display);
++        wl_surface_destroy(c.surface);
++    }
++    if (c.callback) wl_callback_destroy(c.callback);
++    for (auto &b : c.buffers) if (b.buffer) wl_buffer_destroy(b.buffer);
++    if (pool) wl_shm_pool_destroy(pool);
++    if (c.pointer) wl_pointer_destroy(c.pointer);
++    if (c.keyboard) wl_keyboard_destroy(c.keyboard);
++    if (c.seat) wl_seat_destroy(c.seat);
++    if (c.shm) wl_shm_destroy(c.shm);
++    if (c.compositor) wl_compositor_destroy(c.compositor);
++    wl_registry_destroy(registry); wl_display_flush(c.display); wl_display_disconnect(c.display);
++    if (memory != MAP_FAILED) munmap(memory, bytes * 2);
++    if (fd >= 0) close(fd);
++    std::printf("interactive client stopped: frames=%u callbacks=%u releases=%u motion=%u click=%u key=%u exit=%d\n", c.commits, c.callbacks, c.releases, c.motions, c.clicks, c.keys, ok ? 0 : 1);
++    return ok ? 0 : 1;
++}
+--- a/src/mali_normal.cpp
++++ b/src/mali_normal.cpp
+@@ -0,0 +1,265 @@
++/* Experimental normal single-client session. Output is the actual CWaylandBackend,
++ * input uses its existing seat listeners, SHM imports use Gamescope's renderer.
++ * The application is an argv child, with no diagnostic frame limit/injection. */
++#include "mali_normal.hpp"
++#include "backend.h"
++#include "backends.h"
++#include "rendervulkan.hpp"
++#include "wlr_begin.hpp"
++#include <wlr/types/wlr_compositor.h>
++#include <wlr/types/wlr_buffer.h>
++#include <wlr/types/wlr_seat.h>
++#include <wlr/interfaces/wlr_keyboard.h>
++#include "wlr_end.hpp"
++#include <wayland-client.h>
++#include <banner-ahb-v1-client-protocol.h>
++#include <xkbcommon/xkbcommon.h>
++#include <linux/input-event-codes.h>
++#include <sys/wait.h>
++#include <poll.h>
++#include <unistd.h>
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <csignal>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
++
++extern int g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedWidth, g_nNestedHeight;
++extern int g_nNestedRefresh, g_nOutputRefresh;
++extern bool g_bFullscreen, g_bBorderlessOutputWindow;
++namespace {
++static std::atomic<bool> failed;
++static volatile sig_atomic_t stopped;
++static void Stop(int) { stopped = 1; }
++struct Input { unsigned type; double x, y; uint32_t code, state; };
++static std::mutex inputLock;
++static std::deque<Input> inputs;
++struct Host {
++    wl_display *display = nullptr; wl_surface *surface = nullptr; banner_ahb_v1 *manager = nullptr;
++    struct Buffer { wl_buffer *buffer = nullptr; unsigned index = 0; bool busy = false; } buffers[3];
++} host;
++struct Server {
++    wl_display *display = nullptr; wlr_renderer *renderer = nullptr; wlr_surface *surface = nullptr;
++    wlr_seat *seat = nullptr; wlr_keyboard *keyboard = nullptr;
++    wl_listener created{}, committed{}, destroyed{};
++    pid_t child = -1; bool pending = false;
++    unsigned commits = 0, frames = 0, motions = 0, buttons = 0, keys = 0;
++} server;
++static void Released(void *data, wl_buffer *) {
++    auto b = static_cast<Host::Buffer *>(data);
++    if (!b->busy) { mali_normal_failure("duplicate output wl_buffer.release"); return; }
++    b->busy = false; mali_normal_released(b->index);
++}
++static const wl_buffer_listener releaseListener{Released};
++static bool Roundtrip() {
++    if (!host.display) return false;
++    bool done = false; wl_callback *callback = wl_display_sync(host.display);
++    if (!callback) return false;
++    static const wl_callback_listener listener{ [](void *data, wl_callback *, uint32_t) { *static_cast<bool *>(data) = true; } };
++    wl_callback_add_listener(callback, &listener, &done);
++    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++    while (!done && !failed && std::chrono::steady_clock::now() < deadline) {
++        gamescope::IBackend::Get()->PollState();
++        if (wl_display_get_error(host.display)) break;
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    wl_callback_destroy(callback); return done;
++}
++static void Commit(wl_listener *, void *) {
++    if (server.surface && wlr_surface_has_buffer(server.surface)) { server.pending = true; ++server.commits; }
++}
++static void Destroy(wl_listener *, void *) {
++    wl_list_remove(&server.committed.link); wl_list_remove(&server.destroyed.link);
++    server.surface = nullptr; server.pending = false;
++}
++static void NewSurface(wl_listener *, void *data) {
++    if (server.surface) { mali_normal_failure("Checkpoint 7 accepts one interactive surface"); return; }
++    server.surface = static_cast<wlr_surface *>(data);
++    server.committed.notify = Commit; server.destroyed.notify = Destroy;
++    wl_signal_add(&server.surface->events.commit, &server.committed);
++    wl_signal_add(&server.surface->events.destroy, &server.destroyed);
++    wlr_seat_keyboard_notify_enter(server.seat, server.surface, nullptr, 0, &server.keyboard->modifiers);
++}
++static bool Dispatch(int timeout) {
++    if (wl_event_loop_dispatch(wl_display_get_event_loop(server.display), timeout) < 0) return false;
++    std::deque<Input> queue;
++    { std::lock_guard lock(inputLock); queue.swap(inputs); }
++    if (server.surface && server.surface->current.width > 0 && server.surface->current.height > 0) {
++        uint32_t time = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++        for (auto &event : queue) {
++            if (event.type == 1) {
++                double x = std::clamp(event.x / g_nPreferredOutputWidth, 0.0, 1.0) * server.surface->current.width;
++                double y = std::clamp(event.y / g_nPreferredOutputHeight, 0.0, 1.0) * server.surface->current.height;
++                wlr_seat_pointer_notify_enter(server.seat, server.surface, x, y);
++                wlr_seat_pointer_notify_motion(server.seat, time, x, y); ++server.motions;
++            } else if (event.type == 2) {
++                wlr_seat_pointer_notify_button(server.seat, time, event.code, wl_pointer_button_state(event.state)); ++server.buttons;
++            } else if (event.type == 3) {
++                wlr_seat_keyboard_notify_key(server.seat, time, event.code, event.state); ++server.keys;
++            }
++        }
++        if (!queue.empty()) wlr_seat_pointer_notify_frame(server.seat);
++    }
++    wl_display_flush_clients(server.display); return !failed;
++}
++static bool StartServer(char **command) {
++    server.display = wl_display_create(); server.renderer = vulkan_renderer_create();
++    if (!server.display || !server.renderer || !wlr_renderer_init_wl_display(server.renderer, server.display)) return false;
++    auto compositor = wlr_compositor_create(server.display, 5, server.renderer);
++    server.seat = wlr_seat_create(server.display, "seat0");
++    server.keyboard = static_cast<wlr_keyboard *>(calloc(1, sizeof(wlr_keyboard)));
++    if (!compositor || !server.seat || !server.keyboard) return false;
++    wlr_keyboard_init(server.keyboard, nullptr, "DroidDeck nested keyboard");
++    auto context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++    auto keymap = context ? xkb_keymap_new_from_names(context, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS) : nullptr;
++    bool ok = keymap && wlr_keyboard_set_keymap(server.keyboard, keymap);
++    if (keymap) xkb_keymap_unref(keymap);
++    if (context) xkb_context_unref(context);
++    if (!ok) return false;
++    wlr_keyboard_set_repeat_info(server.keyboard, 25, 600);
++    wlr_seat_set_keyboard(server.seat, server.keyboard);
++    wlr_seat_set_capabilities(server.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
++    server.created.notify = NewSurface; wl_signal_add(&compositor->events.new_surface, &server.created);
++    const char *socket = wl_display_add_socket_auto(server.display);
++    if (!socket) return false;
++    std::string socketName(socket);
++    server.child = fork();
++    if (server.child < 0) return false;
++    if (!server.child) {
++        setenv("WAYLAND_DISPLAY", socketName.c_str(), 1);
++        execvp(command[0], command); std::perror("normal Wayland child exec"); _Exit(127);
++    }
++    std::printf("normal Wayland client pid=%d socket=%s; outer WAYLAND_DISPLAY=wayland-0; existing nested pointer/touch/keyboard seat\n", int(server.child), socketName.c_str());
++    return true;
++}
++static void StopServer() {
++    if (server.child > 0) {
++        kill(server.child, SIGTERM);
++        auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(500); int status = 0;
++        while (std::chrono::steady_clock::now() < end) {
++            pid_t r = waitpid(server.child, &status, WNOHANG);
++            if (r == server.child || (r < 0 && errno == ECHILD)) { server.child = -1; break; }
++            if (server.display) Dispatch(5);
++        }
++        if (server.child > 0) { kill(server.child, SIGKILL); while (waitpid(server.child, &status, 0) < 0 && errno == EINTR) {} }
++    }
++    if (server.display) {
++        wl_display_destroy_clients(server.display);
++        if (server.created.link.next) wl_list_remove(&server.created.link);
++        if (server.seat) wlr_seat_destroy(server.seat);
++        if (server.keyboard) { wlr_keyboard_finish(server.keyboard); free(server.keyboard); }
++        wl_display_destroy(server.display);
++    }
++    if (server.renderer) wlr_renderer_destroy(server.renderer);
++    std::printf("normal input summary: motion=%u button=%u keyboard=%u commits=%u frames=%u\n", server.motions, server.buttons, server.keys, server.commits, server.frames);
++    server = {};
++}
++}
++void mali_normal_failure(const char *reason) { if (!failed.exchange(true)) std::fprintf(stderr, "normal Mali session FAILED: %s\n", reason); }
++void mali_normal_input(unsigned type, double x, double y, uint32_t code, uint32_t state) {
++    std::lock_guard lock(inputLock);
++    if (type == 1 && !inputs.empty() && inputs.back().type == 1) { inputs.back() = {type, x, y, code, state}; return; }
++    if (inputs.size() >= 512) { mali_normal_failure("input queue overflow"); return; }
++    inputs.push_back({type, x, y, code, state});
++}
++bool mali_normal_bind(wl_display *display, wl_surface *surface, banner_ahb_v1 *manager) {
++    if (!display || !surface || !manager) return false;
++    host.display = display; host.surface = surface; host.manager = manager;
++    return true;
++}
++bool mali_normal_buffer(unsigned index, uint32_t key, unsigned width, unsigned height) {
++    if (!host.manager || index >= 3) return false;
++    auto &b = host.buffers[index]; b.index = index;
++    b.buffer = banner_ahb_v1_create_broker_buffer(host.manager, key, width, height);
++    if (!b.buffer) return false;
++    wl_buffer_add_listener(b.buffer, &releaseListener, &b);
++    return Roundtrip(); // proves the Android-local AHB was acquired before publish
++}
++void mali_normal_commit(unsigned index) {
++    auto &b = host.buffers[index];
++    if (b.busy || !b.buffer || !host.surface) { mali_normal_failure("normal output wl_buffer reused while busy"); return; }
++    b.busy = true; wl_surface_attach(host.surface, b.buffer, 0, 0);
++    wl_surface_damage_buffer(host.surface, 0, 0, INT32_MAX, INT32_MAX); wl_surface_commit(host.surface);
++    if (wl_display_flush(host.display) < 0 && errno != EAGAIN) mali_normal_failure("outer Wayland commit failed");
++}
++void mali_normal_stop_client() { StopServer(); }
++void mali_normal_detach_output() {
++    if (host.surface) { wl_surface_attach(host.surface, nullptr, 0, 0); wl_surface_commit(host.surface); wl_display_flush(host.display); }
++}
++void mali_normal_destroy_buffers() {
++    for (auto &b : host.buffers) { if (b.buffer) wl_buffer_destroy(b.buffer); b = {}; }
++    if (host.display) wl_display_flush(host.display);
++}
++int mali_normal_main(int argc, char **argv) {
++    std::setvbuf(stdout, nullptr, _IOLBF, 0);
++    const char *enabled = getenv("MALI_VULKAN_NORMAL_SESSION"), *outer = getenv("WAYLAND_DISPLAY");
++    if (!enabled || strcmp(enabled, "1") || !outer || strcmp(outer, "wayland-0")) {
++        std::fputs("normal Mali session requires its isolated environment and outer wayland-0\n", stderr); return 1;
++    }
++    unsigned width = 0, height = 0; char **command = nullptr; bool wayland = false;
++    for (int i = 1; i < argc; ++i) {
++        if (!strcmp(argv[i], "--")) { if (i + 1 < argc) command = argv + i + 1; break; }
++        if (!strcmp(argv[i], "--mali-wayland-session") || !strcmp(argv[i], "--expose-wayland") || !strcmp(argv[i], "-f")) continue;
++        if (!strcmp(argv[i], "--backend") && i + 1 < argc) { wayland = !strcmp(argv[++i], "wayland"); continue; }
++        if ((!strcmp(argv[i], "-W") || !strcmp(argv[i], "-H")) && i + 1 < argc) {
++            bool isWidth = !strcmp(argv[i], "-W"); char *end = nullptr; unsigned long value = strtoul(argv[++i], &end, 10);
++            if (!*argv[i] || *end || value < 32 || value > 4096) return 1;
++            (isWidth ? width : height) = value; continue;
++        }
++        std::fprintf(stderr, "unsupported normal Mali option: %s\n", argv[i]); return 1;
++    }
++    if (!width || !height || !command || !wayland) { std::fputs("normal Mali session needs --backend wayland -W width -H height -- client\n", stderr); return 1; }
++    g_maliNormalSessionActive = true; failed = false; stopped = 0;
++    std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
++    g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
++    g_nNestedRefresh = g_nOutputRefresh = 30000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
++    bool renderer = vulkan_mali_normal_init(width, height);
++    bool backend = renderer && gamescope::IBackend::Set<gamescope::CWaylandBackend>();
++    auto connector = backend ? gamescope::IBackend::Get()->CreateVirtualConnector(0) : nullptr;
++    bool ok = connector && gamescope::IBackend::Get()->PostInit() && vulkan_mali_normal_outputs() && StartServer(command);
++    auto next = std::chrono::steady_clock::now(); auto progress = next;
++    int childStatus = 0;
++    while (ok && !stopped && !failed) {
++        gamescope::IBackend::Get()->PollState();
++        if (wl_display_get_error(host.display)) { mali_normal_failure("Android compositor disconnected"); break; }
++        if (!Dispatch(0)) { ok = false; break; }
++        if (server.child > 0) {
++            pid_t r = waitpid(server.child, &childStatus, WNOHANG);
++            if (r == server.child) { server.child = -1; ok = WIFEXITED(childStatus) && WEXITSTATUS(childStatus) == 0; break; }
++        }
++        auto now = std::chrono::steady_clock::now();
++        if (server.pending && server.surface && now >= next) {
++            auto texture = wlr_surface_get_texture(server.surface);
++            auto wrapped = reinterpret_cast<VulkanWlrTexture_t *>(texture);
++            auto source = wrapped && wrapped->buf ? vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr) : nullptr;
++            if (!source) { ok = false; break; }
++            FrameInfo_t frame{}; auto &layer = *frame.layers.push();
++            layer.tex = source.get(); layer.opacity = 1.0f; layer.filter = GamescopeUpscaleFilter::NEAREST;
++            layer.scale = {source->width() / float(width), source->height() / float(height)};
++            layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU; layer.blackBorder = true; layer.applyColorMgmt = false; frame.outputEncodingEOTF = EOTF_Gamma22;
++            int result = connector->Present(&frame, false);
++            if (result == 0) {
++                timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time); wlr_surface_send_frame_done(server.surface, &time);
++                server.pending = false; ++server.frames; wl_display_flush_clients(server.display); progress = now;
++            } else if (result != EAGAIN) { ok = false; break; }
++            next = std::chrono::steady_clock::now() + std::chrono::nanoseconds(33333333);
++        }
++        if (now - progress > std::chrono::seconds(15)) { mali_normal_failure("normal session made no frame progress for 15 seconds"); break; }
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    }
++    ok &= !failed;
++    StopServer();
++    if (renderer) ok &= vulkan_mali_normal_stop() == 0;
++    connector.reset(); gamescope::IBackend::Set(nullptr);
++    if (host.manager) banner_ahb_v1_destroy(host.manager);
++    if (host.display) wl_display_disconnect(host.display);
++    host = {}; g_maliNormalSessionActive = false;
++    std::printf("normal Mali Wayland session exit=%d client status=%d\n", ok ? 0 : 1, childStatus);
++    return ok ? 0 : 1;
++}
+--- a/src/mali_normal.hpp
++++ b/src/mali_normal.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++struct FrameInfo_t;
++struct wl_display;
++struct wl_surface;
++struct banner_ahb_v1;
++extern bool g_maliNormalSessionActive;
++inline bool mali_normal_active() { return g_maliNormalSessionActive; }
++inline bool mali_normal_verbose() { const char *v = getenv("MALI_VULKAN_VERBOSE"); return v && !strcmp(v, "1"); }
++void mali_normal_input(unsigned type, double x, double y, uint32_t code, uint32_t state);
++void mali_normal_failure(const char *reason);
++bool mali_normal_bind(wl_display *, wl_surface *, banner_ahb_v1 *);
++bool mali_normal_buffer(unsigned index, uint32_t key, unsigned width, unsigned height);
++void mali_normal_commit(unsigned index);
++void mali_normal_stop_client();
++void mali_normal_detach_output();
++void mali_normal_destroy_buffers();
++void mali_normal_released(unsigned index);
++bool vulkan_mali_normal_init(unsigned width, unsigned height);
++bool vulkan_mali_normal_outputs();
++int vulkan_mali_normal_present(const FrameInfo_t *);
++int vulkan_mali_normal_stop();
++int mali_normal_main(int argc, char **argv);
++int mali_interactive_main();
+--- a/src/mali_normal.inc
++++ b/src/mali_normal.inc
+@@ -0,0 +1,146 @@
++/* Normal nested Wayland AHB output. Compiled in the real Gamescope renderer TU. */
++#include "mali_normal.hpp"
++#include "mali_output_pool.hpp"
++#include "normal_api.h"
++bool g_maliNormalSessionActive = false;
++namespace {
++struct NormalOutput {
++    struct Slot { dd_interop_output ahb{}; gamescope::OwningRc<CVulkanTexture> texture; uint32_t key = 0, frame = 0; } slots[3];
++    MaliOutputPool ownership;
++    PFN_vkDroidDeckInteropTEST interop = nullptr;
++    PFN_vkDroidDeckWaylandMALI transport = nullptr;
++    unsigned width = 0, height = 0, frame = 0, rendered = 0, presented = 0, released = 0, dropped = 0, late = 0;
++    uint64_t start = 0, report = 0, sequence = 0;
++    bool begun = false, stopping = false;
++    unsigned timeouts = 0;
++} normalOutput;
++static dd_interop_output NormalInterop(uint32_t op, dd_interop_input input = {}) {
++    dd_interop_output out{};
++    MaliRequire(MaliResult(normalOutput.interop(g_device.device(), op, &input, &out), "normal AHB/sync RPC"), "normal AHB/sync RPC");
++    return out;
++}
++static VkResult NormalRPC(uint32_t op, dd_normal_input input = {}, dd_normal_output *out = nullptr) {
++    dd_normal_output ignored{};
++    return normalOutput.transport(g_device.device(), op, &input, out ? out : &ignored);
++}
++static void NormalBaseline() {
++    dd_normal_output stats{};
++    MaliRequire(MaliResult(NormalRPC(MB_NORMAL_STATS, {}, &stats), "normal final accounting"), "normal final accounting");
++    for (unsigned i = 2; i < 20; ++i) MaliRequire(stats.counts[i] == 0, "normal native children did not return to baseline");
++    MaliRequire(stats.counts[0] == 1 && stats.counts[1] == 1 && !stats.owned && !stats.timeouts && stats.fds_created == stats.fds_closed,
++                "normal final ownership/FD baseline");
++    normalOutput.dropped = normalOutput.presented - stats.presented;
++    std::printf("normal actual Android output: presented=%u released=%u cancelled before display=%u late=%u\n", stats.presented, stats.released, normalOutput.dropped, normalOutput.late);
++    std::printf("normal final native children: AHB=0 sync=0 FDs=0 pending=0 AndroidHeld=0 release timeouts=0 exported=%u closed=%u; device/queue destroyed next\n", stats.fds_created, stats.fds_closed);
++}
++}
++bool vulkan_mali_normal_init(unsigned width, unsigned height) {
++    normalOutput = {}; normalOutput.width = width; normalOutput.height = height;
++    if (!MaliInitializeRenderer(true)) return false;
++    normalOutput.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
++    normalOutput.transport = (PFN_vkDroidDeckWaylandMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckWaylandMALI");
++    if (!normalOutput.interop || !normalOutput.transport) { g_device.ShutdownMaliDiagnostic(); return false; }
++    dd_normal_input begin{}; begin.verbose = mali_normal_verbose();
++    if (!MaliResult(NormalRPC(MB_NORMAL_BEGIN, begin), "normal begin")) { g_device.ShutdownMaliDiagnostic(); return false; }
++    normalOutput.begun = true;
++    currentOutputWidth = width; currentOutputHeight = height;
++    normalOutput.start = normalOutput.report = get_time_in_nanos();
++    s_maliSessionFailureCleanup = [] {
++        s_maliSessionFailureCleanup = nullptr;
++        normalOutput.stopping = true; mali_normal_stop_client(); mali_normal_detach_output();
++        if (normalOutput.begun && normalOutput.transport) {
++            VkResult r = NormalRPC(MB_NORMAL_END);
++            if (r == VK_TIMEOUT) { ++normalOutput.timeouts; std::fputs("normal Android release TIMEOUT: broker retains allocations; no PASS\n", stderr); }
++        }
++    };
++    return true;
++}
++bool vulkan_mali_normal_outputs() {
++    for (unsigned i = 0; i < 3; ++i) {
++        auto &slot = normalOutput.slots[i]; dd_interop_input input{};
++        input.width = normalOutput.width; input.height = normalOutput.height;
++        slot.ahb = NormalInterop(DD_AHB_CREATE, input); slot.texture = new CVulkanTexture();
++        if (!slot.texture->BInitMaliAHB(slot.ahb.image, input.width, input.height)) return false;
++        dd_normal_input registerInput{}; registerInput.token = slot.ahb.token; dd_normal_output out{};
++        if (NormalRPC(MB_NORMAL_REGISTER, registerInput, &out) != VK_SUCCESS || !out.key) return false;
++        slot.key = out.key;
++        if (!mali_normal_buffer(i, out.key, input.width, input.height)) return false;
++    }
++    std::printf("normal nested Wayland output: %ux%u pool=3 FP32 PASSTHRU real KHR timeline; routine readbacks/hashes disabled\n", normalOutput.width, normalOutput.height);
++    return true;
++}
++void mali_normal_released(unsigned index) {
++    MaliRequire(index < 3 && normalOutput.ownership.released(index), "normal unexpected/duplicate Wayland buffer release");
++    ++normalOutput.released;
++}
++int vulkan_mali_normal_present(const FrameInfo_t *frame) {
++    auto &s = normalOutput;
++    if (s.stopping) return -1;
++    int index = s.ownership.acquire(s.frame);
++    if (index < 0) { ++s.dropped; return EAGAIN; } // dispatch real releases before any reuse
++    auto &slot = s.slots[index]; slot.frame = ++s.frame;
++    auto producer = NormalInterop(DD_FENCE_CREATE); g_device.m_maliProducerFence = producer.fence;
++    g_device.m_maliReadbackBuffer = VK_NULL_HANDLE;
++    FrameInfo_t mutableFrame = *frame;
++    auto sequence = vulkan_composite(&mutableFrame, nullptr, false, slot.texture.get(), false, nullptr);
++    MaliRequire(sequence.has_value(), "normal Wayland Gamescope BLIT");
++    g_device.wait(*sequence, false); g_device.m_maliProducerFence = VK_NULL_HANDLE;
++    MaliRequire(*sequence > s.sequence && g_device.completedSeqNo() >= *sequence, "normal monotonic KHR timeline");
++    s.sequence = *sequence; ++s.rendered;
++    if (get_time_in_nanos() - s.start > uint64_t(s.rendered) * 33333333ull) ++s.late;
++    dd_interop_input input{}; input.fence = producer.fence;
++    auto sync = NormalInterop(DD_SYNC_EXPORT, input); input = {}; input.sync = sync.sync;
++    NormalInterop(DD_SYNC_WAIT, input); // real producer fence, never a fabricated acquire
++    MaliRequire(s.ownership.ready(index), "normal Rendering -> Ready");
++    dd_normal_input publish{}; publish.token = slot.ahb.token; publish.sync = sync.sync; publish.frame = slot.frame;
++    MaliRequire(MaliResult(NormalRPC(MB_NORMAL_PUBLISH, publish), "normal publish ownership"), "normal publish ownership");
++    MaliRequire(s.ownership.presented(index), "normal Ready -> Android-owned");
++    mali_normal_commit(index); ++s.presented;
++    g_device.wait(*sequence, true);
++    input = {}; input.sync = sync.sync; NormalInterop(DD_SYNC_CLOSE, input);
++    auto destroyFence = (PFN_vkDestroyFence)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDestroyFence");
++    destroyFence(g_device.device(), producer.fence, nullptr);
++    uint64_t now = get_time_in_nanos();
++    if (now - s.report >= 3000000000ull) {
++        dd_normal_output stats{};
++        MaliRequire(MaliResult(NormalRPC(MB_NORMAL_STATS, {}, &stats), "normal periodic accounting"), "normal periodic accounting");
++        double fps = stats.presented * 1e9 / double(now - s.start);
++        std::printf("normal performance: rendered=%u presented=%u releases=%u dropped=%u late=%u average FPS=%.2f Android-owned=%u pending GPU=%u open sync FDs=%u\n", s.rendered, stats.presented, stats.released, s.dropped, s.late, fps, stats.owned, stats.counts[19], stats.counts[18]);
++        s.report = now;
++    }
++    return 0;
++}
++int vulkan_mali_normal_stop() {
++    auto &s = normalOutput; s.stopping = true;
++    if (!s.begun) { g_device.ShutdownMaliDiagnostic(); return 1; }
++    mali_normal_detach_output();
++    VkResult end = NormalRPC(MB_NORMAL_END);
++    if (end != VK_SUCCESS) {
++        ++s.timeouts;
++        for (unsigned i = 0; i < 3; ++i) if (s.ownership.androidOwned(i))
++            std::fprintf(stderr, "normal teardown FAILED token=%u key=%u frame=%u state=ANDROID_OWNED; retained; VkResult=%d no PASS\n", s.slots[i].ahb.token, s.slots[i].key, s.slots[i].frame, int(end));
++        s_maliSessionFailureCleanup = nullptr;
++        g_device.FailMaliDiagnostic("normal Android release drain", end);
++    }
++    // This acknowledgement comes from the actual Android-local release registry,
++    // after every release fence; it is not a timeout assumption.
++    for (unsigned i = 0; i < 3; ++i) if (s.ownership.androidOwned(i)) mali_normal_released(i);
++    mali_normal_destroy_buffers();
++    for (unsigned i = 0; i < 3; ++i) {
++        auto &slot = s.slots[i]; MaliRequire(s.ownership.free(i), "normal output still Android-owned at destruction");
++        slot.texture = nullptr;
++        if (slot.ahb.image) g_device.vk.DestroyImage(g_device.device(), slot.ahb.image, nullptr);
++        if (slot.ahb.memory) g_device.vk.FreeMemory(g_device.device(), slot.ahb.memory, nullptr);
++        if (slot.ahb.token) { dd_interop_input release{}; release.token = slot.ahb.token; NormalInterop(DD_AHB_RELEASE, release); }
++    }
++    s_maliSessionFailureCleanup = nullptr; s_maliSessionCheckCleanup = NormalBaseline;
++    s_maliSessionCheckDestroyed = [] {
++        uint32_t count = 0;
++        MaliRequire(MaliResult(g_device.vk.EnumeratePhysicalDevices(g_device.instance(), &count, nullptr), "normal native device destroy acknowledgement"), "normal native device destroy acknowledgement");
++        MaliRequire(count != 0, "normal physical inventory after device destruction");
++        std::puts("normal native device/implicit queue destruction acknowledged; baseline devices=0 queues=0");
++    };
++    g_device.ShutdownMaliDiagnostic(); s_maliSessionCheckCleanup = nullptr; s_maliSessionCheckDestroyed = nullptr;
++    std::printf("normal session stopped: rendered=%u committed=%u released=%u release timeouts=%u; clean teardown\n", s.rendered, s.presented, s.released, s.timeouts);
++    return 0;
++}
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -120,6 +120,8 @@
+   'vblankmanager.cpp',
+   'rendervulkan.cpp',
+   'mali_session_wayland.cpp',
++  'mali_normal.cpp',
++  'mali_interactive.cpp',
+   'log.cpp',
+   'ime.cpp',
+   'mangoapp.cpp',
+--- a/src/normal_api.h
++++ b/src/normal_api.h
+@@ -0,0 +1,8 @@
++#ifndef DD_NORMAL_API_H
++#define DD_NORMAL_API_H
++#include <vulkan/vulkan.h>
++#include "normal_protocol.h"
++struct dd_normal_input { uint32_t token, sync, frame, verbose; };
++struct dd_normal_output { uint32_t key, counts[20], presented, released, owned, timeouts, fds_created, fds_closed; };
++typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckWaylandMALI)(VkDevice, uint32_t, const struct dd_normal_input *, struct dd_normal_output *);
++#endif
+--- a/src/normal_protocol.h
++++ b/src/normal_protocol.h
+@@ -0,0 +1,11 @@
++/* Optional normal Wayland transport on wire v7. Diagnostic 83-86 stay unchanged. */
++#ifndef DD_NORMAL_PROTOCOL_H
++#define DD_NORMAL_PROTOCOL_H
++#define MB_NORMAL_BEGIN 87u /* device,verbose -> no payload */
++#define MB_NORMAL_REGISTER 88u /* device,AHB -> Android-local registry key */
++#define MB_NORMAL_PUBLISH 89u /* device,AHB,sync,frame -> no payload */
++#define MB_NORMAL_END 90u /* device -> no payload; real bounded release wait */
++#define MB_NORMAL_STATS 91u /* device -> 20 resources + presented,released,owned,timeouts,FDcreated,FDclosed */
++#define MB_NORMAL_MAX_DIMENSION 4096u
++#define MB_NORMAL_MAX_MEMORY (64u * 1024u * 1024u)
++#endif
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1,3 +1,4 @@
++#include "mali_normal.hpp"
+ // Initialize Vulkan and composite stuff with a compute queue
+ 
+ #include <cassert>
+@@ -1908,8 +1909,8 @@
+             targetDescriptors[0].imageView == m_device->MaliDummyStorage() || imageDescriptors[0].imageLayout != VK_IMAGE_LAYOUT_GENERAL ||
+             targetDescriptors[0].imageLayout != VK_IMAGE_LAYOUT_GENERAL)
+             m_device->FailMaliDiagnostic("BLIT real source/output descriptor identity", VK_ERROR_INITIALIZATION_FAILED);
+-        if (mali_session_verbose()) std::puts("BLIT descriptor identity verified: layer 0 source/sampler binding=3 array index=0; exact AHB storage binding=1 array index=0; source/output GENERAL; dummy fill preserved both");
+-        if (mali_session_verbose()) std::printf("Gamescope BLIT dispatch X/Y/Z=%u/%u/%u\n", x, y, z);
++        if (mali_normal_active() ? mali_normal_verbose() : mali_session_verbose()) std::puts("BLIT descriptor identity verified: layer 0 source/sampler binding=3 array index=0; exact AHB storage binding=1 array index=0; source/output GENERAL; dummy fill preserved both");
++        if (mali_normal_active() ? mali_normal_verbose() : mali_session_verbose()) std::printf("Gamescope BLIT dispatch X/Y/Z=%u/%u/%u\n", x, y, z);
+     }
+ 	m_device->vk.UpdateDescriptorSets(m_device->device(), writeDescriptorSets.size(), writeDescriptorSets.data(), 0, nullptr);
+ 
+@@ -3944,7 +3945,7 @@
+ 		u_nitsToLinear = 1.0f / g_flInternalDisplayBrightnessNits;
+ 		u_itmSdrNits = g_flHDRItmSdrNits;
+ 		u_itmTargetNits = g_flHDRItmTargetNits;
+-        if (g_device.IsMaliDiagnostic() && mali_session_verbose()) {
++        if (g_device.IsMaliDiagnostic() && (mali_normal_active() ? mali_normal_verbose() : mali_session_verbose())) {
+             std::printf("BlitPushData: UBO bytes=%zu scale0=(%.2f,%.2f) offset0=(%.2f,%.2f) opacity0=%.2f borderMask=%u filter=%u alphaMode=%u rotation=%u CTM0=identity colorspaceMask=%u\n",
+                 sizeof(*this), scale[0].x, scale[0].y, offset[0].x, offset[0].y, opacity[0], borderMask, u_shaderFilter, u_alphaMode, u_rotation, frameInfo->colorspaceMask());
+         }
+@@ -4934,3 +4935,5 @@
+ #include "vulkan_renderer_test.inc"
+ 
+ #include "mali_session.inc"
++
++#include "mali_normal.inc"

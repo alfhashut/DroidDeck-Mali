@@ -2,6 +2,7 @@
  * See ahb_swapchain.h and ZERO_COPY_SPIKE.md. */
 #define _GNU_SOURCE
 #include "ahb_swapchain.h"
+#include "../../malivulkan/normal_ownership.h"
 #include "droiddeck_color.h"
 #include "droiddeck_ext.h"
 #include "sc_layer.h"
@@ -33,6 +34,7 @@ extern volatile int g_zero_copy;
  * the buffer is still on the layer / held by SurfaceFlinger, whichever is longer. */
 struct ahb_buf {
     uint64_t id;                        /* the token sc_layer.c hands back */
+    uint32_t broker_key;                /* zero for the existing DMA-BUF path */
     struct dmabuf_buffer *b;            /* one reference held for the life of this record */
     AHardwareBuffer *ahb;               /* our reference to the game's buffer */
     int w, h;
@@ -91,6 +93,7 @@ static void buf_free(struct ahb_buf *ab) {
     if (ab->fence_fd >= 0) { close(ab->fence_fd); ab->fence_fd = -1; }
     wl_list_remove(&ab->link);
     *droiddeck_dmabuf_ahb_slot(ab->b) = NULL;
+    if (ab->broker_key) mb_normal_detach(ab->broker_key);
     AHardwareBuffer_release(ab->ahb);
     droiddeck_dmabuf_unref(ab->b);
     free(ab);
@@ -112,6 +115,7 @@ static void on_buffer_resource_destroyed(struct wl_listener *l, void *data) {
 /* ---- release: SurfaceFlinger is done with the buffer -> the game's next acquire waits, then wl_buffer.release */
 
 static void send_deferred_release(struct ahb_buf *ab) {
+    if (ab->broker_key) mb_normal_release(ab->broker_key);
     if (ab->release_pending && ab->resource)
         droiddeck_release_buffer(ab->surface, ab->resource, ab->surface != NULL, ab->deferred_ns);
     ab->release_pending = 0;
@@ -120,6 +124,11 @@ static void send_deferred_release(struct ahb_buf *ab) {
 
 static int on_fence_readable(int fd, uint32_t mask, void *data) {
     struct ahb_buf *ab = data;
+    if (ab->broker_key) {
+        struct pollfd p = {.fd = fd, .events = POLLIN};
+        if (!(mask & WL_EVENT_READABLE) || poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN) || (p.revents & (POLLERR | POLLNVAL)))
+            return 0; /* fail closed: an error is not a release acknowledgement */
+    }
     wl_event_source_remove(ab->fence_src);
     ab->fence_src = NULL;
     close(ab->fence_fd);
@@ -150,12 +159,19 @@ static void handle_released(uint64_t id, int fd) {
             }
             /* Wait it out in the event loop (a sync_file is readable once signalled). */
             struct pollfd p = {.fd = fd, .events = POLLIN};
-            if (poll(&p, 1, 0) > 0) {
+            if (poll(&p, 1, 0) > 0 && (!ab->broker_key || ((p.revents & POLLIN) && !(p.revents & (POLLERR | POLLNVAL))))) {
                 close(fd);
             } else {
                 ab->fence_fd = fd;
                 ab->fence_src = wl_event_loop_add_fd(g_loop, fd, WL_EVENT_READABLE, on_fence_readable, ab);
-                if (!ab->fence_src) { close(fd); ab->fence_fd = -1; }
+                if (!ab->fence_src) {
+                    if (ab->broker_key) {
+                        ab->on_layer = 1; /* retain AHB/fence; native bounded wait will fail */
+                        droiddeck_log("layer", "Mali release fence watcher allocation failed: key=%u; retained", ab->broker_key);
+                        return;
+                    }
+                    close(fd); ab->fence_fd = -1;
+                }
                 else return; /* released from on_fence_readable */
             }
         }
@@ -221,6 +237,14 @@ int ahb_swapchain_present(struct dmabuf_buffer *b, struct surface *s, int scene_
     }
     int r = sc_layer_present_ahb(ab->ahb, ab->w, ab->h, acquire, (void *)(uintptr_t)ab->id, scene_w, scene_h,
                                  s ? droiddeck_surface_color(s) : NULL, ab->format);
+    if (ab->broker_key && r != 0) {
+        /* sc_layer did not apply a transaction. Cancel only an unpublished commit;
+         * an older submission still requires its actual release callback. */
+        mb_normal_not_submitted(ab->broker_key);
+        if (ab->resource) wl_resource_post_error(ab->resource, 0, "Mali AHB could not reach the Android display layer");
+        return -1;
+    }
+    if (ab->broker_key && !mb_normal_submit(ab->broker_key)) return -1;
     if (r < 0) return -1;
     if (r == 1) return 0; /* nothing of it on screen: not on the layer, nothing to release later */
     if (!ab->on_layer) {
@@ -246,7 +270,16 @@ int ahb_swapchain_last_frame_age_ms(void) {
 
 int ahb_swapchain_defer_release(struct dmabuf_buffer *b, struct wl_resource *buffer, struct surface *s, int paced) {
     struct ahb_buf *ab = b ? *droiddeck_dmabuf_ahb_slot(b) : NULL;
-    if (!ab || !ab->on_layer || !buffer || ab->resource != buffer) return 0;
+    if (!ab || (!ab->on_layer && !(ab->broker_key && mb_normal_owned(ab->broker_key))) || !buffer || ab->resource != buffer) return 0;
+    if (ab->broker_key && !ab->on_layer) {
+        struct mb_normal_state state;
+        if (mb_normal_snapshot(ab->broker_key, &state) && !state.submitted) {
+            /* The surface replaced/detached a commit before any display transaction.
+             * Cancellation is not an Android release and never increments released. */
+            mb_normal_not_submitted(ab->broker_key);
+            return 0;
+        }
+    }
     ab->release_pending = 1;
     ab->deferred_ns = now_ns();
     ab->surface = paced ? s : NULL;
@@ -341,9 +374,31 @@ static void ahb_attach(struct wl_client *c, struct wl_resource *r, struct wl_res
     }
 }
 
+static void ahb_create_broker_buffer(struct wl_client *client, struct wl_resource *manager, uint32_t id,
+                                     uint32_t key, uint32_t width, uint32_t height) {
+    AHardwareBuffer *ahb = mb_normal_import(key, width, height);
+    if (!ahb) { wl_resource_post_error(manager, 0, "invalid or retired Mali AHB key %u", key); return; }
+    struct wl_resource *resource = droiddeck_create_ahb_buffer(client, id, width, height);
+    struct ahb_buf *ab = calloc(1, sizeof(*ab));
+    if (!resource || !ab) {
+        if (resource) wl_resource_destroy(resource);
+        free(ab); mb_normal_detach(key); AHardwareBuffer_release(ahb); wl_client_post_no_memory(client); return;
+    }
+    AHardwareBuffer_Desc desc; AHardwareBuffer_describe(ahb, &desc);
+    ab->id = g_next_id++; ab->broker_key = key; ab->ahb = ahb;
+    ab->b = droiddeck_dmabuf_from_resource(resource); droiddeck_dmabuf_ref(ab->b);
+    ab->w = width; ab->h = height; ab->stride = desc.stride; ab->format = desc.format;
+    ab->image_count = 3; ab->client = client; ab->resource = resource; ab->fence_fd = -1;
+    ab->resource_destroy.notify = on_buffer_resource_destroyed;
+    wl_resource_add_destroy_listener(resource, &ab->resource_destroy);
+    wl_list_insert(g_bufs.prev, &ab->link); *droiddeck_dmabuf_ahb_slot(ab->b) = ab;
+    droiddeck_log("layer", "Mali normal AHB-only wl_buffer key=%u size=%ux%u; no DMA-BUF export", key, width, height);
+}
+
 static const struct banner_ahb_v1_interface ahb_impl = {
     .destroy = ahb_destroy,
     .attach = ahb_attach,
+    .create_broker_buffer = ahb_create_broker_buffer,
 };
 
 static void on_client_resource_destroyed(struct wl_resource *r) {
@@ -352,7 +407,7 @@ static void on_client_resource_destroyed(struct wl_resource *r) {
 
 static void bind_ahb(struct wl_client *c, void *data, uint32_t ver, uint32_t id) {
     static struct wl_client *last_named;
-    if (ver > 2) ver = 2;
+    if (ver > 3) ver = 3;
     struct wl_resource *r = wl_resource_create(c, &banner_ahb_v1_interface, (int)ver, id);
     if (!r) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(r, &ahb_impl, NULL, on_client_resource_destroyed);
@@ -416,7 +471,7 @@ void ahb_swapchain_init(struct wl_display *display) {
         return;
     }
     wl_event_loop_add_fd(g_loop, g_rel_pipe[0], WL_EVENT_READABLE, on_release_pipe, NULL);
-    if (!wl_global_create(display, &banner_ahb_v1_interface, 2, NULL, bind_ahb)) {
+    if (!wl_global_create(display, &banner_ahb_v1_interface, 3, NULL, bind_ahb)) {
         droiddeck_log("error", "zero-copy: banner_ahb_v1 global creation failed");
         return;
     }

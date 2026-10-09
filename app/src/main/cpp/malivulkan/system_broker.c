@@ -25,6 +25,8 @@
 #include "renderer_protocol.h"
 #include "renderer_objects.h"
 #include "interop_consumer.h"
+#include "normal_protocol.h"
+#include "normal_ownership.h"
 
 static _Thread_local int session_quiet;
 #define LOG(...) do { if (!session_quiet) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__); } while (0)
@@ -61,6 +63,7 @@ struct vk_session {
             uint32_t last_sync, last_fence, release_timeouts, cleanup_done;
             uint32_t pending, pending_frame, pending_sync, pending_fence;
         } session;
+        struct { uint32_t enabled, verbose, stopping, presented, released, timeouts; } normal;
         VkDevice handle;
         PFN_vkDestroyDevice destroy;
         PFN_vkGetDeviceQueue get_queue;
@@ -89,7 +92,9 @@ static VkResult native_global(void *, uint32_t *, uint32_t *, VkExtensionPropert
 static void native_close_device(struct native_device *d);
 static VkResult native_session_end(struct native_device *d);
 static void native_session_log(struct native_device *d, const char *stage);
-static int native_verbose(struct native_device *d) { return !d->session.enabled || d->session.presented < 3; }
+static VkResult native_normal_end(struct native_device *d);
+static uint32_t native_normal_command(struct vk_session *, uint32_t, const uint8_t *, uint32_t, uint8_t *, uint32_t *, uint32_t *, VkResult *);
+static int native_verbose(struct native_device *d) { return d->normal.enabled ? d->normal.verbose : !d->session.enabled || d->session.presented < 3; }
 
 static int close_session(struct vk_session *s) {
     int retained = 0;
@@ -190,6 +195,7 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 #include "submit_commands.h"
 #include "renderer_commands.h"
 #include "session_commands.h"
+#include "normal_commands.h"
 #include "device_commands.h"
 
 /* Preserve the original version-1 one-shot probe and its six-field reply. */
@@ -321,6 +327,10 @@ static void serve(int fd) {
             uint32_t extra = 0;
             status = native_renderer_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
+        } else if (version == MB_RENDERER_VERSION && op >= MB_NORMAL_BEGIN && op <= MB_NORMAL_STATS && s->instance && s->listed) {
+            uint32_t extra = 0;
+            status = native_normal_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (status == MB_OK) bytes += extra;
         } else if (op == MB_DESTROY && !request_bytes && s->instance) {
             if (!close_session(s)) result = VK_TIMEOUT;
             status = MB_OK; finish = 1;
@@ -334,7 +344,7 @@ static void serve(int fd) {
         mb_put_u32(header + 4, version);
         if (status != MB_OK || result != VK_SUCCESS) session_quiet = 0;
         int verbose = 1;
-        for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i) if (s->logical[i].session.enabled && !native_verbose(&s->logical[i])) verbose = 0;
+        for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i) if ((s->logical[i].session.enabled || s->logical[i].normal.enabled) && !native_verbose(&s->logical[i])) verbose = 0;
         if (verbose || status != MB_OK || result != VK_SUCCESS) LOG("query RPC opcode=%u status=%u VkResult=%d count=%u", op, status, (int)result, count);
         if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes)) {
             ERROR("write response: %s", strerror(errno)); break;
@@ -489,4 +499,12 @@ Java_com_droiddeck_launcher_gpu_SystemVulkanBroker_nativeStop(JNIEnv *env, jclas
     running = 0;
     pthread_mutex_unlock(&lock);
     LOG("broker stopped");
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droiddeck_launcher_gpu_SystemVulkanBroker_nativeQuarantinedSessions(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz; jint count = 0;
+    pthread_mutex_lock(&lock);
+    for (struct vk_session *s = quarantined_sessions; s; s = s->quarantined_next) ++count;
+    pthread_mutex_unlock(&lock); return count;
 }

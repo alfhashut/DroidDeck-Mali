@@ -788,7 +788,7 @@ object SessionPrefs {
      * The mode whose per-mode settings apply: a program run under gamescope (MODE_RUN) is a
      * fullscreen session like Steam's, so it takes Steam's display, driver and HDR choices.
      */
-    fun prefMode(mode: String): String = if (mode == SessionService.MODE_RUN) SessionService.MODE_STEAM else mode
+    fun prefMode(mode: String): String = if (mode == SessionService.MODE_RUN || mode == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE) SessionService.MODE_STEAM else mode
 
     fun pipAutoEnter(context: Context): Boolean = prefs(context).getBoolean("pipAutoEnter", false)
 

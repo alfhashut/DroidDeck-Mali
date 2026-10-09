@@ -734,6 +734,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         else intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM
 
     private fun pausedTitle(): String = when (SessionState.mode) {
+        com.droiddeck.launcher.gpu.MaliSessionSelection.MODE -> getString(R.string.session_mali_paused)
         SessionService.MODE_DESKTOP -> getString(R.string.session_desktop_paused)
         SessionService.MODE_RUN -> com.droiddeck.launcher.frontend.Library.nameForProgram(SessionState.program)
             ?.let { getString(R.string.session_named_paused, it) } ?: getString(R.string.session_program_paused)
@@ -741,6 +742,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun loadingTitle(): String = when (loadingMode()) {
+        com.droiddeck.launcher.gpu.MaliSessionSelection.MODE -> getString(R.string.session_starting_mali)
         SessionService.MODE_DESKTOP ->
             if (!SessionState.running && intent.getStringExtra(SessionService.EXTRA_STEAM_UI) != null) getString(R.string.session_starting_steam_desktop)
             else getString(R.string.session_starting_desktop)
@@ -954,7 +956,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         // Turnip, not the system Adreno driver: importing the dma-bufs gamescope commits needs
         // VK_EXT_image_drm_format_modifier, which the system driver does not implement.
         val turnip = TurnipDriver(this)
-        val driverId = if (CompositorHost.isStarted) null else turnip.install()
+        val maliSession = loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE
+        if (!CompositorHost.isStarted) android.system.Os.setenv("DROIDDECK_MALI_NORMAL_SESSION", if (maliSession) "1" else "0", true)
+        val driverId = if (CompositorHost.isStarted || maliSession) null else turnip.install()
 
         // The output size belongs to the session, not to the Surface: gamescope's display is
         // sized once when the session starts and cannot change. A foldable recreates the Surface
@@ -1000,7 +1004,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 probe.maxLuminance, probe.maxAverageLuminance, probe.minLuminance,
                 probe.ratioAvailable, probe.ratio, Build.VERSION.SDK_INT,
             )
-            val wanted = SessionPrefs.hdr(this, mode)
+            val wanted = !maliSession && SessionPrefs.hdr(this, mode)
             val on = wanted && probe.reason == null
             SessionState.hdr = on
             if (on) {
@@ -1100,6 +1104,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
      * first use translates the shader chain out of Lossless.dll, which takes seconds.
      */
     private fun applyFrameGen() {
+        if (loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE) {
+            WaylandCompositor.nativeSetFrameGenArmed(false, 0, 0)
+            return
+        }
         val hz = refreshHz()
         Thread({
             val problem = FrameGen.apply(this, hz)

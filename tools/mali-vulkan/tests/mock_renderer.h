@@ -106,16 +106,17 @@ static void mock_CmdBindDescriptorSets(VkCommandBuffer command, VkPipelineBindPo
     (void)offsets; struct mock_object *c = (void *)command; struct mock_render *l = (void *)layout, *s = (void *)sets[0]; assert(c->state == 1 && point == VK_PIPELINE_BIND_POINT_COMPUTE && !first && n == 1 && !dynamic && l->parent == s->parent); c->descriptor = s;
 }
 static void mock_CmdDispatch(VkCommandBuffer command, uint32_t x, uint32_t y, uint32_t z) {
-    struct mock_object *c = (void *)command; assert(c->state == 1 && c->pipeline && c->descriptor && x == 32 && y == 32 && z == 1 && c->op_count < 64);
+    struct mock_object *c = (void *)command; assert(c->state == 1 && c->pipeline && c->descriptor && (mode >= 71 ? x <= 512 && y <= 512 : x == 32 && y == 32) && z == 1 && c->op_count < 64);
     c->ops[c->op_count++] = (struct mock_op){.kind = 4, .renderer_set = c->descriptor, .pattern = ((struct mock_render *)c->pipeline)->colorspace}; ++dispatches;
 }
 static void mock_renderer_execute(struct mock_op *op) {
     struct mock_render *set = op->renderer_set; assert(set && set->kind == MB_R_SET);
     struct mock_storage *uniform = set->descriptors[0][0].buffer, *src = set->descriptors[3][0].view->image, *dst = set->descriptors[1][0].view->image;
-    assert(src != dst && dst->external && src->width == 256 && src->height == 256 && dst->width == 256 && dst->height == 256);
+    assert(src != dst && dst->external);
+    if (mode < 71) assert(src->width == 256 && src->height == 256 && dst->width == 256 && dst->height == 256);
     const uint8_t *data = uniform->memory->gpu + uniform->offset + set->descriptors[0][0].offset;
     float scale[2], offset[2]; memcpy(scale, data, 8); memcpy(offset, data + 8 * 8, 8);
-    assert((scale[0] == 1 || scale[0] == 2) && scale[0] == scale[1]);
+    assert((mode >= 71 || scale[0] == 1 || scale[0] == 2) && scale[0] == scale[1]);
     assert(set->descriptors[5][0].view->type == VK_IMAGE_VIEW_TYPE_1D && set->descriptors[6][0].view->type == VK_IMAGE_VIEW_TYPE_3D);
     assert(set->descriptors[3][0].sampler->type && set->descriptors[3][0].sampler->nearest);
     assert(set->descriptors[3][0].view->format == VK_FORMAT_R8G8B8A8_UNORM && set->descriptors[1][0].view->format == VK_FORMAT_R8G8B8A8_UNORM);
@@ -127,12 +128,12 @@ static void mock_renderer_execute(struct mock_op *op) {
     memcpy(&alpha, data + 560, 4); memcpy(&rotation, data + 580, 4);
     assert(set->descriptors[0][0].range == 584 && opacity == 1 && border == 1 && (filter == 1 || (filter == 15 && scale[0] == 1)) && !alpha && !rotation);
     for (unsigned j = 0; j < 12; ++j) assert(ctm[j] == (j == 0 || j == 5 || j == 10 ? 1.0f : 0.0f));
-    for (unsigned y = 0; y < 256; ++y) for (unsigned x = 0; x < 256; ++x) {
-        uint8_t *p = dst->memory->gpu + dst->offset + (y * 256 + x) * 4;
+    for (unsigned y = 0; y < dst->height; ++y) for (unsigned x = 0; x < dst->width; ++x) {
+        uint8_t *p = dst->memory->gpu + dst->offset + (y * dst->width + x) * 4;
         float sx = (x + offset[0]) * scale[0], sy = (y + offset[1]) * scale[1];
-        if (sx < 0 || sy < 0 || sx >= 256 || sy >= 256) { p[0] = p[1] = p[2] = 0; p[3] = 255; }
+        if (sx < 0 || sy < 0 || sx >= src->width || sy >= src->height) { p[0] = p[1] = p[2] = 0; p[3] = 255; }
         else {
-            memcpy(p, src->memory->gpu + src->offset + (((unsigned)sy * 256 + (unsigned)sx) * 4), 4);
+            memcpy(p, src->memory->gpu + src->offset + (((unsigned)sy * src->width + (unsigned)sx) * 4), 4);
             /* Match composite.h: valid dummy LUT has one mip even when output
              * color management is disabled. Only PASSTHRU skips this branch. */
             if (op->pattern != 4) {

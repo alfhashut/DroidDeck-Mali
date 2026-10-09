@@ -14,13 +14,19 @@
 #include "submit_protocol.h"
 #include "renderer_protocol.h"
 #include "interop_protocol.h"
+#include "normal_api.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
 #endif
 
 #define EXPORT __attribute__((visibility("default")))
 static unsigned session_frames;
-#define LOG(...) do { if (session_frames >= 3) break; fprintf(stderr, "MaliProxyICD: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
+static int normal_quiet(void) {
+    const char *normal = getenv("MALI_VULKAN_NORMAL_SESSION"), *verbose = getenv("MALI_VULKAN_VERBOSE");
+    return normal && !strcmp(normal, "1") && (!verbose || strcmp(verbose, "1"));
+}
+#define ERROR(...) do { fprintf(stderr, "MaliProxyICD ERROR: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define LOG(...) do { if (session_frames >= 3 || normal_quiet()) break; fprintf(stderr, "MaliProxyICD: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
 
 struct proxy_device {
     VK_LOADER_DATA loader;
@@ -67,7 +73,7 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
     *reply_bytes = bytes;
     if (mb_get_u32(reply) == MB_OK && mb_get_u32(reply + 4) == VK_SUCCESS) return VK_SUCCESS;
     session_frames = 0;
-    LOG("broker opcode=%u status=%u VkResult bits=0x%x", op, mb_get_u32(reply), mb_get_u32(reply + 4));
+    ERROR("broker opcode=%u status=%u VkResult bits=0x%x", op, mb_get_u32(reply), mb_get_u32(reply + 4));
     /* Preserve the native submission result, including statuses and device loss. */
     if (s->wire_version >= MB_SUBMIT_VERSION &&
         (mb_get_u32(reply) == MB_OK || mb_get_u32(reply) == MB_VULKAN_ERROR)) {
@@ -89,7 +95,7 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
     return VK_ERROR_INITIALIZATION_FAILED;
 broken:
     session_frames = 0;
-    LOG("socket/protocol failure on opcode=%u: %s", op, strerror(errno));
+    ERROR("socket/protocol failure on opcode=%u: %s", op, strerror(errno));
     /* Prevent a partial/bad stream from being reused; disconnect cleans up remotely. */
     shutdown(s->fd, SHUT_RDWR);
     return VK_ERROR_INITIALIZATION_FAILED;
@@ -224,7 +230,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_EnumeratePhysicalDevices(VkInstance 
         uint32_t *count, VkPhysicalDevice *devices) {
     if (instance && ((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {
         const char *session = getenv("MALI_VULKAN_SESSION_TEST");
-        if (session && !strcmp(session, "1") && ((struct proxy_instance *)instance)->device_destroy_result != VK_SUCCESS)
+        const char *normal = getenv("MALI_VULKAN_NORMAL_SESSION");
+        if (((session && !strcmp(session, "1")) || (normal && !strcmp(normal, "1"))) && ((struct proxy_instance *)instance)->device_destroy_result != VK_SUCCESS)
             return ((struct proxy_instance *)instance)->device_destroy_result;
     }
 
@@ -347,6 +354,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
 #include "interop_entries.def"
 #undef MB_INTEROP_ENTRY
         if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
+        if (!strcmp(name, "vkDroidDeckWaylandMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckWaylandMALI;
         if (!strcmp(name, "vkDroidDeckSessionTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckSessionTEST;
     }
     if (((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {

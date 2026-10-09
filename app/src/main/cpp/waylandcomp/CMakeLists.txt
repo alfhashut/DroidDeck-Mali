@@ -4,6 +4,10 @@
 # generated/ (no host wayland-scanner needed at app build time). Built by the app
 # (add_subdirectory from ../CMakeLists.txt) and on its own by standalone/ for
 # build-waylandcomp.yml.
+if (NOT TARGET maliahb)
+    add_library(maliahb SHARED ../malivulkan/normal_ownership.c)
+    target_link_libraries(maliahb android)
+endif()
 add_library(droiddeckwayland SHARED
         src/compositor.c
         src/vk_present.c
@@ -105,6 +109,7 @@ set_target_properties(wayland-server PROPERTIES IMPORTED_LOCATION
 # compositor uses Turnip's driver, which supports dmabuf import (drm_format_modifier).
 target_link_libraries(droiddeckwayland
         wayland-server
+        maliahb
         adrenotools
         dl
         log

@@ -64,6 +64,7 @@ static void native_drain_device(struct native_device *d) {
 static void native_close_device(struct native_device *d) {
     if (d->session.cleanup_done) return;
     native_drain_device(d);
+    if (d->normal.enabled) (void)native_normal_end(d);
     if (d->session.enabled) { (void)native_session_end(d); native_session_log(d, "before native device destruction"); }
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
         struct native_fence *f = &d->submit.fences[i];
@@ -87,7 +88,7 @@ static void native_close_device(struct native_device *d) {
         return;
     }
     d->destroy(d->handle, NULL); LOG("vkDestroyDevice id=%u", d->id);
-    int accounted = d->session.enabled;
+    int accounted = d->session.enabled || d->normal.enabled;
     if (accounted) {
         session_quiet = 0;
         LOG("session exported FDs created=%u closed=%u Android held=%u after safe native cleanup", d->session.fds_created, d->session.fds_closed, d->session.held);

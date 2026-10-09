@@ -132,6 +132,12 @@ static void dmabuf_build_formats(void) {
     char line[320];
     int pos = 0, compressed = 0;
     g_dmabuf_fmts_ready = 1;
+    const char *normal = getenv("DROIDDECK_MALI_NORMAL_SESSION");
+    if (normal && !strcmp(normal, "1")) {
+        g_dmabuf_nfmt = 0;
+        droiddeck_log("dmabuf", "Mali normal session uses AHB-only output; no DMA-BUF formats advertised");
+        return;
+    }
     g_dmabuf_nfmt = droiddeck_color_hdr_open() ? DMABUF_NFMT_MAX : DMABUF_NFMT_SDR;
     for (int f = 0; f < g_dmabuf_nfmt; f++) {
         uint64_t got[DMABUF_NMOD];

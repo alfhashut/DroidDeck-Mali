@@ -502,7 +502,7 @@ jobs:
                                (b"vk-enumerate-only", b"vk-capabilities", b"vk-create-device-test", b"vk-submit-test", b"vk-buffer-memory-test", b"vk-image-memory-test",
                                 b"vk-ahb-test", b"vk-ahb-present-test",
                                 b"vk-gamescope-renderer-init-test", b"vk-gamescope-first-frame-test",
-                                b"mali-session-test", b"mali-wayland-client-test")) else "OLD")
+                                b"mali-session-test", b"mali-wayland-client-test", b"mali-wayland-session", b"mali-interactive-client")) else "OLD")
           print(result)
           sys.exit(0 if result == "NEW" else 1)
           PY

@@ -1546,10 +1546,28 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Starts a session; with no runtime on a non-Adreno, the same warning Setup gives comes first, before any download. */
+    private var selectingSessionGpu = false
     private fun startSession(intent: Intent, steamSession: Boolean = false): Boolean {
-        if (busy || LinuxRuntimeInstaller.isBusy()) return false
+        if (busy || LinuxRuntimeInstaller.isBusy() || SessionState.phase == SessionPhase.STOPPING) return false
+        val gpu = com.droiddeck.launcher.gpu.VulkanInfo.cachedOrNull()
+        if (gpu == null) {
+            if (selectingSessionGpu) return false
+            selectingSessionGpu = true
+            Thread({
+                com.droiddeck.launcher.gpu.VulkanInfo.query()
+                ui.post { selectingSessionGpu = false; if (!isFinishing && !isDestroyed) startSession(intent, steamSession) }
+            }, "session-gpu-selection").start()
+            return true
+        }
+        val mali = com.droiddeck.launcher.gpu.MaliSessionSelection.supported(gpu)
+        if (mali) {
+            if (!SessionState.running && SessionState.phase !in setOf(SessionPhase.IDLE, SessionPhase.FAILED)) return false
+            intent.putExtra(SessionService.EXTRA_MODE, com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
+            intent.removeExtra(SessionService.EXTRA_STEAM_UI)
+            intent.removeExtra(SessionService.EXTRA_STEAM_URL)
+        }
         refreshPhantomStatus()
-        if (steamSession && PhantomProcessLimit.blocksSteam(phantomProcessStatus)) {
+        if (steamSession && !mali && PhantomProcessLimit.blocksSteam(phantomProcessStatus)) {
             showPhantomGate = true
             return false
         }

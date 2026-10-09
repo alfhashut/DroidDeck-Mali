@@ -206,7 +206,7 @@ class SessionService : Service() {
             }
         }
         startForeground(NOTIFICATION_ID, buildNotification())
-        if (SessionState.running) return START_NOT_STICKY
+        if (SessionState.running || SessionState.phase == SessionPhase.STOPPING) return START_NOT_STICKY
         if (SessionState.stopRequested) {
             SessionState.running = true
             stopSession(0)
@@ -306,6 +306,7 @@ class SessionService : Service() {
     // ── The session ─────────────────────────────────────────────────────────────────────────
 
     private fun runSession(gen: Int) {
+        if (SessionState.mode == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE) { runMaliSession(gen); return }
         SessionTerminal.clear()
         try {
             LinuxRuntime.writeAccounts(this)
@@ -546,6 +547,75 @@ class SessionService : Service() {
             mainHandler.post { updateSuspendPolicy() }
             updateDownloadMonitoring()
         }
+    }
+
+    /** Checkpoint 7 owns a normal proot session, with no Steam/Proton components. */
+    private val maliStartupLock = Any()
+    private var maliGuestStartedAt: Long? = null
+
+    private fun runMaliSession(gen: Int) {
+        try {
+            val root = LinuxRuntime.rootDir(this)
+            val sessionRoot = LinuxRuntime.sessionRoot(this).apply { mkdirs() }
+            val runtimeDir = File(filesDir, ".wayland-rt").apply { mkdirs() }
+            LinuxRuntime.writeAccounts(this)
+            killStragglers()
+            SessionFiles.stage(this, root)
+            val directory = openSessionFolder()
+            SessionEvents.record("mali.broker.starting")
+            val vulkan = synchronized(maliStartupLock) {
+                if (gen != sessionGen || !SessionState.running) return
+                com.droiddeck.launcher.gpu.MaliNormalBroker.start(this)
+            }
+            SessionEvents.record("mali.broker.ready", mapOf("handshake" to "native Vulkan inventory", "gpu" to "Mali-G52 (experimental)"))
+            if (gen != sessionGen || !SessionState.running) return
+            val size = SessionState.outputSize
+            val guest = arrayListOf("/usr/bin/env", "-i", "HOME=/root", "USER=root", "PATH=/usr/local/bin:/usr/bin:/bin",
+                "LANG=C.UTF-8", "XDG_RUNTIME_DIR=" + LinuxRuntime.GUEST_RUNTIME_DIR, "XDG_SESSION_TYPE=wayland", "WAYLAND_DISPLAY=wayland-0",
+                "GAMESCOPE_FORCE_GENERAL_QUEUE=1", "TZ=" + java.util.TimeZone.getDefault().id,
+                "GLIBC_TUNABLES=glibc.pthread.rseq=0", "BL_WIDTH=" + size.first, "BL_HEIGHT=" + size.second,
+                "BL_LOG=" + File(directory, "session.log").path, "BL_DEBUG_DIR=" + directory.path)
+            guest.addAll(vulkan)
+            guest.add(LinuxRuntime.SESSION_SCRIPT); guest.add(com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
+            val command = LinuxRuntime.command(this, sessionRoot, runtimeDir, Environment.getExternalStorageDirectory(), guest)
+            val hostEnv = HostEnvironment()
+            hostEnv["PROOT_LOADER"] = LinuxRuntime.prootLoader(this).path
+            hostEnv["PROOT_TMP_DIR"] = cacheDir.path
+            if (SessionPrefs.prootNoSeccomp(this)) hostEnv["PROOT_NO_SECCOMP"] = "1"
+            LinuxRuntime.prootLibraryPath(this).takeIf { it.isNotEmpty() }?.let { hostEnv["LD_LIBRARY_PATH"] = it }
+            val line = command.joinToString(" ") { it.replace("\\", "\\\\").replace(" ", "\\ ") }
+            synchronized(stopLock) {
+                if (gen != sessionGen || !SessionState.running) return
+                val pid = HostProcess.start(line, hostEnv.asArray(), root, { status ->
+                    if (gen == sessionGen) stopSession(status ?: -1)
+                }, null)
+                check(pid > 1) { "Mali session process could not start (pid=$pid)" }
+                sessionPid = pid
+                maliGuestStartedAt = readStat(pid)?.second
+                SessionEvents.guestStarted(pid)
+                suspendController = SessionSuspendController({ sessionPid }, { emptyList() }, {}, {})
+            }
+            mainHandler.post { updateSuspendPolicy() }
+        } catch (error: Throwable) {
+            if (gen != sessionGen || !SessionState.running) return
+            Log.e(TAG, "Mali normal session startup", error)
+            SessionEvents.fail("MALI_SESSION_START", error.message ?: "Mali normal session startup failed", -1)
+            stopSession(-1)
+        }
+    }
+
+    private fun stopMaliGuest(prootPid: Int, startedAt: Long?) {
+        if (prootPid <= 1 || startedAt == null || readStat(prootPid)?.second != startedAt) return
+        // Give Gamescope its producer-stop + real five-second release drain before
+        // proot's generic tree teardown. Never kill the broker ahead of that drain.
+        val tree = descendants(prootPid)
+        for ((pid, started) in tree) {
+            val command = runCatching { File("/proc/$pid/cmdline").readText() }.getOrNull() ?: continue
+            if (command.contains("--mali-wayland-session") && readStat(pid)?.second == started)
+                runCatching { android.os.Process.sendSignal(pid, 15) }
+        }
+        waitForExit(prootPid, 7000)
+        if (readStat(prootPid)?.second == startedAt) teardown(prootPid, startedAt)
     }
 
     /** The session's own log folder, opened and filled with what is known before anything starts. */
@@ -1465,6 +1535,8 @@ class SessionService : Service() {
         // tree it had - snapshotted first, each pid checked against its start time so a number
         // reused by a new process is never touched.
         val prootPid = sessionPid
+        val maliStartedAt = maliGuestStartedAt
+        maliGuestStartedAt = null
         sessionPid = -1
         val auxiliary = synchronized(auxiliaryProcessesLock) {
             auxiliaryProcesses.toMap().also { auxiliaryProcesses.clear() }
@@ -1489,6 +1561,34 @@ class SessionService : Service() {
         components.clear()
         FakeInputWriter.releaseAllRingSlots()
         val steamClientMayRun = SessionState.mode == MODE_STEAM || SessionState.mode == MODE_DESKTOP
+        if (SessionState.mode == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE) {
+            val finishMali: () -> Unit = {
+                Thread({
+                    var finalStatus = status
+                    try {
+                        stopMaliGuest(prootPid, maliStartedAt)
+                        auxiliary.forEach { (pid, started) -> teardown(pid, started) }
+                    } catch (error: Throwable) {
+                        SessionEvents.fail("MALI_STOP_FAILED", error.message ?: "Mali cleanup failed", -1)
+                        finalStatus = -1
+                    } finally {
+                        synchronized(maliStartupLock) {
+                            val drained = runCatching { com.droiddeck.launcher.gpu.MaliNormalBroker.stop() }
+                            if (drained.isFailure) {
+                                SessionEvents.fail("MALI_BROKER_STOP", drained.exceptionOrNull()?.message ?: "Mali broker stop failed", -1)
+                                finalStatus = -1
+                            } else if (!drained.getOrThrow()) {
+                                SessionEvents.fail("MALI_RELEASE_TIMEOUT", "Android still owns a Mali output buffer; allocation retained safely", -1)
+                                finalStatus = -1
+                            }
+                        }
+                    }
+                    finishSessionStop(finalStatus, stoppedGen)
+                }, "mali-session-teardown").start()
+            }
+            if (controller != null) controller.closeAndResume(finishMali) else finishMali()
+            return
+        }
         val finishAfterTeardown: () -> Unit = {
             if (prootPid > 1 || auxiliary.isNotEmpty()) {
                 Thread({

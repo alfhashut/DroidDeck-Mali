@@ -60,7 +60,7 @@ static int renderer_has_children(struct native_device *d, struct native_renderer
 static int native_renderer_can_submit(struct native_device *d, struct native_command *c) {
     if (d->session.release_timeouts) return 0;
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
-        if (d->interop.ahbs[i].id && (d->interop.ahbs[i].id == d->session.held || d->interop.ahbs[i].id == d->session.pending))
+        if (d->interop.ahbs[i].id && interop_ahb_held(d, &d->interop.ahbs[i]))
             for (unsigned j = 0; j < c->renderer_image_count; ++j)
                 if (c->renderer_images[j].id == d->interop.ahbs[i].image) return 0;
     if (!renderer_descriptors_live(d, c)) return 0;
@@ -267,7 +267,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
                         REQUIRE(sampler && (expected == VK_IMAGE_VIEW_TYPE_2D || !sampler->type));
                     } else REQUIRE(!sid);
                     images[image_at++] = (VkDescriptorImageInfo){sampler ? sampler->handle.sampler : VK_NULL_HANDLE, view->handle.view, (VkImageLayout)layout};
-                    if (d->interop.ahb_enabled && j == 0 && (binding == 1 || binding == 3))
+                    if (d->interop.ahb_enabled && native_verbose(d) && j == 0 && (binding == 1 || binding == 3))
                         LOG("BLIT native descriptor set ID=%u binding=%u array index=%u image broker ID=%u image-view broker ID=%u sampler broker ID=%u viewType=%u format=%u usage=0x%x layout=%u AHB=%u",
                             set->id, binding, j, im->id, view->id, sampler ? sampler->id : 0, view->type, view->format, view->usage, layout, im->ahb);
                     unsigned k = staged.descriptor_count++; staged.descriptors[k].binding = binding; staged.descriptors[k].element = j; staged.descriptors[k].type = type; staged.descriptors[k].view = vid; staged.descriptors[k].sampler = sampler ? sampler->id : 0;
@@ -293,7 +293,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
             struct native_renderer_object *p = renderer_find(d, c->pipeline, MB_R_PIPELINE), *set = renderer_find(d, c->descriptor_set, MB_R_SET);
             struct native_renderer_object *l = p ? renderer_find(d, p->parent, MB_R_PIPELINE_LAYOUT) : NULL;
             REQUIRE(p && set && l && l->parent == set->type && set->descriptor_count == 39);
-            uint32_t x = mb_get_u32(w + 8), y = mb_get_u32(w + 12), z = mb_get_u32(w + 16); REQUIRE(x && y && x <= 32 && y <= 32 && z == 1 && x <= v->limits.maxComputeWorkGroupCount[0] && y <= v->limits.maxComputeWorkGroupCount[1]);
+            uint32_t x = mb_get_u32(w + 8), y = mb_get_u32(w + 12), z = mb_get_u32(w + 16); REQUIRE(x && y && x <= (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION / 8 : 32u) && y <= (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION / 8 : 32u) && z == 1 && x <= v->limits.maxComputeWorkGroupCount[0] && y <= v->limits.maxComputeWorkGroupCount[1]);
             if (v->limits.maxComputeWorkGroupInvocations < 64 || v->limits.maxComputeWorkGroupSize[0] < 8 || v->limits.maxComputeWorkGroupSize[1] < 8) { *result = VK_ERROR_FEATURE_NOT_PRESENT; break; }
             for (unsigned i = 0; i < set->descriptor_count; ++i) {
                 if (set->descriptors[i].buffer) { REQUIRE(!interop_ref(c, set->descriptors[i].buffer)); continue; }
@@ -328,7 +328,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
     }
     case MB_RENDERER_IMAGE: {
         REQUIRE(bytes >= 32); uint32_t width = mb_get_u32(w + 8), height = mb_get_u32(w + 12), depth = mb_get_u32(w + 16), usage = mb_get_u32(w + 20), flags = mb_get_u32(w + 24), n = mb_get_u32(w + 28);
-        REQUIRE(id <= VK_IMAGE_TYPE_3D && width && height && depth && width <= 256 && height <= 256 && depth <= 1 && (id != VK_IMAGE_TYPE_1D || height == 1) && usage && !(usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) && !(flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && n <= 2);
+        REQUIRE(id <= VK_IMAGE_TYPE_3D && width && height && depth && width <= (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION : 256u) && height <= (d->normal.enabled ? MB_NORMAL_MAX_DIMENSION : 256u) && depth <= 1 && (id != VK_IMAGE_TYPE_1D || height == 1) && usage && !(usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) && !(flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && n <= 2);
         SIZE(32 + n * 4); VkFormat formats[2]; for (unsigned i = 0; i < n; ++i) { formats[i] = (VkFormat)mb_get_u32(w + 32 + i * 4); REQUIRE(formats[i] == (i ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM)); }
         REQUIRE((flags && n == 2) || (!flags && !n));
         struct native_image *im = NULL; for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) if (!d->interop.images[i].id) { im = &d->interop.images[i]; break; }

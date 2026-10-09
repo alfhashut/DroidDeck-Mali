@@ -606,6 +606,22 @@ static struct dmabuf_buffer *get_dmabuf(struct wl_resource *buffer) {
     return NULL;
 }
 
+static void ahb_only_resource_destroy(struct wl_resource *resource) {
+    dmabuf_buffer_unref(wl_resource_get_user_data(resource));
+}
+struct wl_resource *droiddeck_create_ahb_buffer(struct wl_client *client, uint32_t id, uint32_t width, uint32_t height) {
+    if (!width || !height || width > 4096 || height > 4096) return NULL;
+    struct dmabuf_buffer *buffer = calloc(1, sizeof(*buffer));
+    if (!buffer) return NULL;
+    buffer->refs = 1; buffer->width = width; buffer->height = height;
+    buffer->format = FOURCC('A', 'B', '2', '4');
+    for (unsigned i = 0; i < MAX_PLANES; ++i) buffer->fd[i] = -1;
+    struct wl_resource *resource = wl_resource_create(client, &wl_buffer_interface, 1, id);
+    if (!resource) { free(buffer); return NULL; }
+    wl_resource_set_implementation(resource, &dbuf_buffer_impl, buffer, ahb_only_resource_destroy);
+    return resource;
+}
+
 /* ------------------------------------------------------------------ surface state */
 
 static void surface_size(const struct surface *s, int *w, int *h) {
@@ -793,7 +809,7 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
     s->buf_w = b->width;
     s->buf_h = b->height;
     s->buf_alpha = (b->format & 0xff) == 'A';
-    s->has_content = b->img != NULL;
+    s->has_content = b->img != NULL || (b->n_planes == 0 && ahb_swapchain_has_ahb(b));
     g_stat_dmabuf++;
     const int announced_now = !s->announced_vulkan;
     if (!s->announced_vulkan) {
@@ -1843,7 +1859,14 @@ static struct surface *ahb_layer_only_candidate(int scene_w, int scene_h) {
     s = wl_container_of(g_toplevels.prev, s, toplevel_link);
     if (!s->dmabuf_buf || s->dmabuf_buf->img || !ahb_swapchain_has_ahb(s->dmabuf_buf)) return NULL;
     if ((g_desktop && !s->placed) || s->x != 0 || s->y != 0 || s->src_set || s->dst_set) return NULL;
-    if (!wl_list_empty(&s->children)) return NULL;
+    if (!wl_list_empty(&s->children)) {
+        if (s->dmabuf_buf->n_planes != 0) return NULL;
+        /* Borderless libdecor may retain empty decoration subsurfaces. A visible
+         * child still prevents the AHB-only fullscreen handoff. */
+        struct surface *child;
+        wl_list_for_each(child, &s->children, child_link)
+            if (child->has_content || child->dmabuf_buf) return NULL;
+    }
     if (g_hide_shell && !strcmp(client_name(wl_resource_get_client(s->resource)), "explorer.exe")) return NULL;
     surface_size(s, &w, &h);
     if (w != scene_w || h != scene_h || s->buf_w != scene_w || s->buf_h != scene_h) return NULL;

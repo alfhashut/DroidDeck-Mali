@@ -57,7 +57,7 @@ class IcdTests(unittest.TestCase):
         build("tests/device_contract.c", "device_contract", ["-l:libvulkan.so.1"])
         build("tests/submit_contract.c", "submit_contract", ["-l:libvulkan.so.1"])
         build("tests/icd_contract.c", "icd_contract", ["-ldl"])
-        build("tests/broker_mock.c", "broker_mock", ["-pthread", "-I" + str(ROOT / "tests"),
+        build("tests/broker_mock.c", "broker_mock", [str(ROOT / "../../app/src/main/cpp/malivulkan/normal_ownership.c"), "-pthread", "-I" + str(ROOT / "tests"),
               "-I" + str(java / "include"), "-I" + str(java / "include/linux")])
         cls.manifest = cls.directory / "mali_proxy_icd.json"
         cls.manifest.write_bytes((ROOT / "mali_proxy_icd.json").read_bytes())

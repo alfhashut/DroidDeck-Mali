@@ -48,3 +48,6 @@ void text_input_host_commit(const char *utf8, size_t len);
 void text_input_host_preedit(const char *utf8, size_t len, int cursor_begin, int cursor_end);
 void text_input_host_delete(int before, int after);
 void toplevel_icon_init(struct wl_display *display);
+
+/* AHB-only wl_buffer: no synthetic DMA-BUF plane or export capability. */
+struct wl_resource *droiddeck_create_ahb_buffer(struct wl_client *client, uint32_t id, uint32_t width, uint32_t height);

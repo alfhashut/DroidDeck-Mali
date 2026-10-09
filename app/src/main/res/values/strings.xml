@@ -1233,6 +1233,8 @@
     <!-- %1$s is the program's name -->
     <string name="session_starting_named">Starting %1$s</string>
     <string name="session_starting_program">Starting the program</string>
+    <string name="session_starting_mali">Starting Mali session (experimental)</string>
+    <string name="session_mali_paused">Mali session is paused</string>
     <string name="session_no_logs">No logs for this session.</string>
     <string name="session_logs_archive_failed">Could not create the session log archive.</string>
     <string name="session_logs_share_failed">Could not share the session logs.</string>

@@ -29,6 +29,19 @@ if [ -n "${BL_LOG:-}" ] && [ -z "${BL_INSIDE:-}" ]; then
   echo "== rootfs: $(cat /.version 2>/dev/null || echo unversioned)"
 fi
 
+# Mali is an isolated normal session. The explicit environment was verified by
+# the Android service; failures never fall through to Turnip or Steam setup.
+if [ "$mode" = mali-wayland ]; then
+  [ "${MALI_VULKAN_NORMAL_SESSION:-}" = 1 ] || { echo 'Mali normal session environment missing'; exit 65; }
+  [ "${WAYLAND_DISPLAY:-}" = wayland-0 ] || { echo 'Mali outer Wayland socket must be wayland-0'; exit 65; }
+  [ -S "${XDG_RUNTIME_DIR:?}/wayland-0" ] || { echo 'Android Wayland compositor socket is not ready'; exit 65; }
+  [ -S "${MALI_VULKAN_BROKER_SOCKET:?}" ] || { echo 'Mali broker socket disappeared after readiness handshake'; exit 65; }
+  [ -s "${VK_ICD_FILENAMES:?}" ] && [ "${VK_DRIVER_FILES:-}" = "$VK_ICD_FILENAMES" ] || { echo 'Mali proxy manifest missing'; exit 65; }
+  step 'Mali GPU support (experimental): normal nested Wayland session; no Steam'
+  exec gamescope --backend wayland --mali-wayland-session --expose-wayland -f \
+    -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- /usr/local/bin/gamescope --mali-interactive-client
+fi
+
 # Until the runtime is stable, Steam's own logs are copied beside the session log at exit so a
 # failed launch can be handed over as one folder.
 collect_steam_logs() {

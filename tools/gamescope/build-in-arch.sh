@@ -102,7 +102,7 @@ cat out/gamescope-submit.log
 test "$SUBMIT_STATUS" -eq 1
 grep -F 'gamescope: submit test vkCreateInstance failed:' out/gamescope-submit.log
 # All memory and renderer paths must be in this packaged executable and exit before startup.
-for diagnostic in vk-buffer-memory-test vk-image-memory-test vk-ahb-test vk-ahb-present-test vk-gamescope-renderer-init-test vk-gamescope-first-frame-test mali-session-test mali-wayland-client-test; do
+for diagnostic in vk-buffer-memory-test vk-image-memory-test vk-ahb-test vk-ahb-present-test vk-gamescope-renderer-init-test vk-gamescope-first-frame-test mali-session-test mali-wayland-client-test mali-wayland-session mali-interactive-client; do
   grep -F -- "--$diagnostic" out/gamescope-help.log
   set +e
   env VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
