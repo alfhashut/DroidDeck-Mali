@@ -1,5 +1,8 @@
 # Checkpoint 5: exact-source renderer audit
 
+Current phone status: **5A proven; 5B black-frame cause reproduced and fixed in
+source, awaiting phone retest**. See [the black-frame investigation](#black-frame-investigation-after-phone-checkpoint-5a) for the current fix and RPC map.
+
 Audit completed before implementation, against Gamescope **3.16.29**, applying every
 repository patch in lexical order through `0117-vulkan-memory-ahb-tests.patch`,
 with zero fuzz. Repository baseline: `798ae0f1c9645f036678095c3d5b776a825cf03d`.
@@ -72,7 +75,7 @@ Repository-wide descriptor-write search finds writes only in
 | `CVulkanCmdBuffer::dispatch`, 1799–1816 | 3: combined image sampler, 16 × sampler2D | Unbound slots and YCbCr inputs leave regular image views zero. Every sampler is already a real cached sampler. Use initialized transparent 2D sampled image for absent regular views. |
 | Same loop | 4: combined image sampler, 16 × sampler2D | All non-YCbCr inputs leave views zero. Normal binding uses immutable YCbCr sampler. Diagnostic supports **RGB only**, ycbcrMask=0; use ordinary real immutable sampler and ordinary valid 2D image for inactive binding. Do not claim NV12 conversion support in this path. |
 | `dispatch`, 1820–1834 | 5: combined image sampler, 2 × sampler1D | Missing shaper LUT. Use actual initialized 1D sampled image, with normalized real sampler and matching layout. |
-| Same block | 6: combined image sampler, 2 × sampler3D | Missing 3D LUT. Use actual initialized 3D sampled image, not a 2D view. Color management is disabled for this diagnostic, so neither LUT is sampled. |
+| Same block | 6: combined image sampler, 2 × sampler3D | Missing 3D LUT. Use actual initialized 3D sampled image, not a 2D view. The initial implementation assumed disabled color management made these inactive. The black-frame investigation below corrects that assumption: the diagnostic must explicitly use the existing PASSTHRU shader path. |
 | `dispatch`, 1837–1848 | 2: storage image, image2D | RGB output fills only target[0]; chroma target[1] stays zero (including its ignored sampler). Use separate real zero-initialized 2D storage image in GENERAL. BLIT writes only binding 1. |
 | `ReshadeEffectPipeline::execute`, 1735–1755 | Storage image of effect-defined type | Failed `findTexture` yields null view. **Not reached**: ReShade disabled. An arbitrary effect may read/write this resource; no universal safe zero-image substitute claimed. Reject enabling effects in the diagnostic. |
 
@@ -86,9 +89,10 @@ valid input image rather than a null view.
 Dummies need SAMPLED / STORAGE usage appropriate to each binding, TRANSFER_DST
 for real zero initialization, native allocated/bound memory, correctly typed
 views, transfer-write → compute-read/write barriers, and GENERAL (or matching
-shader-read-only) layout. Only inactive LUT bindings may use zero LUTs: zero
-LUTs would not preserve enabled color-management behavior. This diagnostic
-must prohibit that path. No robustness feature may be advertised as a result.
+shader-read-only) layout. Only shader-inactive LUT bindings may use zero LUTs: zero
+LUTs would not preserve enabled color-management behavior. The existing PASSTHRU
+colorspace explicitly skips the shader LUT path; DRM-only color-management flags
+do not suffice (see the black-frame correction below). No robustness feature may be advertised as a result.
 
 ## Actual renderer execution and reached API set
 
@@ -174,8 +178,8 @@ partial initialization. Native device idle is necessary on errors/device loss.
 Checkpoint 5 is implemented for **one source-built APK**, with two independent
 options/buttons. Host tests execute the actual complete modified renderer
 translation unit against the production proxy/broker and a **mock native driver**.
-They do not prove Mali shader execution or Android display on the phone.
-Checkpoints 1–4D remain phone verified; checkpoint 5 awaits the phone procedure below.
+They do not prove corrected frame pixels or Android display on the phone.
+Checkpoints 1–4D and renderer initialization 5A are now phone verified; corrected 5B awaits the phone procedure below.
 
 ### 1–5. Requirements, mappings, null descriptors, fallback, dynamic rendering
 
@@ -329,7 +333,7 @@ Printed samples: (96,96) RED=(255,0,0,255), (160,96) GREEN=(0,255,0,255),
 (128,128) WHITE and (16,16) BLACK=(0,0,0,255). AHB CPU inspection additionally checks
 actual bytes if lockable; GPU-only AHB still requires actual same-image readback.
 
-### 11. Validation
+### 11. Original checkpoint-5 validation (before phone investigation)
 
 - All Mali suites: **62 tests PASS** (including 13 new renderer tests).
 - Existing Gamescope diagnostics/complete patch stack: **25 tests PASS**;
@@ -375,7 +379,7 @@ GLM, libdrm, pixman, X11, xkbcommon and Wayland headers, glslangValidator and
 wayland-scanner. The renderer suite generates shaders and protocol headers,
 applies all repository patches with zero fuzz and compiles the actual renderer.
 
-### 12. Remaining hardware acceptance
+### 12. Original hardware acceptance status (before phone investigation)
 
 **No checkpoint-5 real-phone PASS is claimed.** Required descriptor/compute limits (including 36 per-stage samplers/images)
 are checked explicitly; an unmet limit stops 5A with `VK_ERROR_FEATURE_NOT_PRESENT (-8)`.
@@ -390,7 +394,7 @@ A full packaged Gamescope executable and signed APK were not built locally;
 GitHub Actions below builds both from the same commit. Local Gradle/JUnit checks are not verified: this environment has JDK27, whereas
 the workflow configures JDK17. Host link tests and the AArch64 renderer compile supplement, rather than replace, that full package build.
 
-### 13–14. Full diff and git status
+### 13–14. Original checkpoint-5 review artifacts
 
 The working tree contains the implementation and audit on `mali-gpu-experiment`.
 **No commit and no push were made.** Review artifacts outside the repository:
@@ -439,7 +443,7 @@ teardown and exit code 0. It does not allocate/present an AHB.
 Each 5B run must show the **centered RED GREEN / BLUE WHITE square with black border**
 for about three seconds. Confirm that arrangement visually. Logs must show the
 actual `vulkan_composite -> BLIT -> CVulkanCmdBuffer::dispatch` path, native KHR
-sequence/counter completion, selected exact RGBA values, **mismatches=0** and
+sequence/counter completion (now 4 after pre-BLIT source readback), selected exact RGBA values, **mismatches=0** and
 **differing pixels=49152**, exact AHB Android acquisition/completion/release,
 clean teardown, first-frame PASS and exit code 0. A -1 SYNC_FD can mean an already
 signaled real fence, as in 4D; it is not a fabricated fd. GPU-only AHB may report
@@ -449,3 +453,141 @@ Keep UI/proot and MaliVulkanBroker logs for both runs. Any nonzero exit, missing
 release, incorrect pixels or wrong visible arrangement is a failed acceptance.
 Checkpoint 5 ends with that verified frame; no normal session, client, Steam,
 Proton, DXVK or game is launched by these diagnostics.
+
+
+## Black-frame investigation after phone checkpoint 5A
+
+Baseline for this investigation: repository HEAD `6132bb7` (clean tree), exact
+3.16.29 archive with every patch through 0118 applied with zero fuzz. The phone
+proves 5A and reports two identical 5B failures: native timeline sequence/counter
+3, all sampled output pixels opaque black, 16,384 mismatches (the centered square).
+The original source is reconstructed under `/tmp/droiddeck-5-fix/before`.
+
+### Audit performed before the fix
+
+1. `vulkan_create_texture_from_bits`: ordinary mutable optimal RGBA8 256x256;
+   native device-local allocation/bind; actual Gamescope mapped upload buffer.
+2. `copyBufferToImage`: packed upload at the real upload-ring offset, destination
+   GENERAL, transfer write, end-of-command barrier; native timeline completion.
+3. `CVulkanTexture::BInit`: UNORM `srgbView()` (upstream naming means raw sRGB
+   bytes), SRGB `linearView()`; one mip, typed 2D sampled views. Layer 0 selects
+   the UNORM view, NEAREST/unnormalized real sampler.
+4. `FrameInfo_t`: one opaque RGB layer, scale (2,2), offset (-64,-64), centered
+   128x128 output, black border. `BlitPushData_t` uses (-63.75,-63.75) texel-center
+   offset, opacity 1 and identity CTM; normal BLIT construction is reused.
+5. `bind_all_layers`: source texture at slot 0. Descriptor binding 3 element 0
+   is the actual source view and sampler. Dummy fill tests each view for null;
+   it does **not** overwrite this element. Slots 1–15 are valid 2D dummies.
+6. Storage binding 1 element 0 is the actual AHB UNORM view, GENERAL, STORAGE
+   usage. Only unused chroma binding 2 element 0 receives the dummy storage view.
+7. Proxy RPC 70 preserves binding, element, count and typed view/sampler IDs;
+   broker reconstructs seven nonoverlapping native write ranges. No descriptor
+   rollover or overwritten source/target was found.
+8. Existing BLIT pipeline, set 0 and 32x32x1 workgroups (8x8x1 local size).
+   Shader-write to transfer-read barrier precedes same-AHB GPU readback;
+   FOREIGN release follows readback. The binary producer fence is tied to the
+   actual compositor submit, with real internal KHR timeline synchronization.
+9. **Root cause:** `shaders/composite.h::apply_layer_color_mgmt` enables LUTs
+   when `textureQueryLevels(s_shaperLut[plane_eotf]) != 0`. Replacing a null LUT
+   with a valid one-mip zero image changes that condition to true. A zero 3D LUT
+   returns RGB=(0,0,0), preserving alpha=1. `applyColorMgmt` is explicitly marked
+   **drm only**; output EOTF_Count does not skip the LUT query. The initial audit's
+   statement that those dummy LUTs were inactive was incorrect. The old host
+   model tested geometry/copying but omitted this shader branch.
+
+### Exact frame RPC map
+
+Protocol remains v7. Renderer opcodes reached, including initialization/cleanup:
+
+| Opcode | Where used |
+| --- | --- |
+| 60 / 61 | Native internal timeline creation / typed renderer teardown |
+| 62 / 63 | Actual completion counter / bounded KHR wait |
+| 64 / 65 | Real source, dummy and AHB views / nearest or linear samplers |
+| 66 / 67 / 68 / 69 | Seven-binding layout, pipeline layout, pool, 24 sets |
+| 70 | Seven descriptor writes: 0 UBO, 1 actual AHB, 2 storage dummy, 3 source+2D dummies, 4 inactive NV12 dummies, 5 1D LUT dummies, 6 3D LUT dummies |
+| 71 / 72 | Exact upstream BLIT SPIR-V / native compute specialization |
+| 73 / 74 / 75 | Bind BLIT, bind set 0, dispatch 32x32x1 |
+| 76 | Native queue submit with timeline; final AHB work also has producer fence |
+| 77 | Completed command reset when reused (not a required per-frame operation) |
+| 78 | Ordinary source and four typed dummy images |
+| 79 | Dummy initialization, upload, source readback, sampling/storage and final release barriers |
+| 80 | Source upload; added pre-BLIT source image readback; final AHB image readback |
+| 81 / 82 | Dummy GPU zero initialization / genuine native idle at teardown |
+
+Shared RPCs used: instance/device/physical queries 2–15; device destroy 16;
+command pools/buffers 17–22; buffer create/destroy/requirements 32–34;
+memory allocation/free/map/unmap/read/write/invalidate 35–41/43;
+buffer bind 37; ordinary image destroy/requirements/bind 45–47;
+readback host buffer barrier 49; exact AHB allocate/import 52, release 53;
+producer fence create 54, export/wait/close 55–57; exact-buffer inspect/present
+58–59; fence destroy 28. No new RPC, pNext type or native handle serialization
+is needed for the fix.
+
+
+### Fix report (current retest)
+
+1. **Root cause:** valid zero LUTs changed the shader's null-descriptor presence
+   test. SRGB therefore applied the zero 1D/3D LUT and lost every RGB contribution.
+   The corrected host model reproduces exactly 16,384 opaque-black mismatches.
+   Source/output descriptor overwrite was audited and ruled out.
+2. **Exact changes:** new incremental Gamescope patch **0119** selects existing
+   `GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU` only for 5B. This is also used by
+   normal upstream BLIT callers for no-LUT content; the shader itself is untouched.
+   V7 pipeline validation additionally permits that exact colorspace mask (4),
+   retaining mask 1 for unchanged 5A initialization. No protocol version change,
+   new API/RPC, new shader, alternate renderer or changed Vulkan adaptation.
+   Source creation adds TRANSFER_SRC and performs actual GPU image readback before
+   `vulkan_composite`, checking all 65,536 pixels against source content
+   and printing four representative RGBA values. It fails before BLIT on mismatch.
+   A separate native timeline submission makes final sequence/counter **4/4**.
+   Source readback reuses and unmaps the existing readback buffer before BLIT.
+   Transfer-write/read, host-read and compute-read barriers are explicit.
+   Logs/checks cover FrameInfo, real UBO (584 bytes, identity CTM, opacity=1), source
+   and sampler binding 3[0], exact AHB binding 1[0], stable broker image/view/sampler/
+   set/pipeline IDs, specialization, layouts, usages, barriers and 32x32x1 dispatch.
+   Logs contain no native pointers. Dummy fill remains null-only, with real
+   source/target identity checked after filling.
+3. **Direct AHB:** retained. The source explains the black contribution without
+   an AHB-storage blocker. No intermediate rendering target or copy fallback
+   was introduced. Corrected direct-AHB pixels still require phone acceptance.
+4. **Tests:** **65 Mali tests PASS**, including **16 renderer/transport tests**;
+   **25 Gamescope tests PASS**, with every patch applied/reversed with zero fuzz.
+   Patch 0119 passes strict whitespace/applicability checks.
+   **57 AArch64 QEMU broker/consumer tests PASS**, including the actual host
+   Gamescope renderer against the AArch64 production broker and mock driver.
+   Native broker/consumer compile with `-Wall -Wextra -Werror`; the final complete
+   Gamescope renderer TU also cross-compiles for AArch64. `git diff --check` passes.
+   These are host/mock checks; corrected phone 5B and a fresh APK remain pending.
+   Android NDK/full APK/repository-wide checks from the original checkpoint are
+   historical above; they were not rerun for this focused fix.
+   The new legacy fixture rebuilds the actual renderer with only the diagnostic
+   SRGB selection restored: source readback passes, native compute/timeline
+   completes, but final readback fails with the phone's black pattern. The fixed
+   fixture uses the same shader/geometry/AHB and passes. Native descriptor checks
+   verify layer-0 indices, real source survives dummy fill, sampler nearest/
+   unnormalized, UNORM target, nonzero opacity, identity CTM and the real UBO.
+   Mode 62 corrupts the source upload and proves zero dispatches/consumers follow.
+5. **Changed files:** `app/src/main/cpp/malivulkan/renderer_commands.h`;
+   `tools/gamescope/patches/0119-vulkan-blit-input-proof.patch`;
+   `tools/gamescope/test_vk_enumerate_only.py`;
+   `tools/mali-vulkan/GAMESCOPE_RENDERER.md`, `interop_icd.h`, `renderer_icd.h`,
+   `submit_icd.h`, `test_renderer.py`, `tests/mock_interop.h`, `tests/mock_renderer.h`.
+   0118 and the 5A initialization implementation are unchanged.
+6. **Full diff:** `/tmp/droiddeck-5-fix/black-frame-fix.diff`, against HEAD
+   `6132bb731342531bf2e1d67321f2382555b0f507`, including new patch 0119.
+7. **Git status:** `/tmp/droiddeck-5-fix/git-status.txt`; no commit/push performed.
+8. **Phone retest:** publish the reviewed changes yourself; use one fresh Actions
+   APK containing both diagnostics and refresh the installed guest runtime so
+   Gamescope includes 0119. Re-run existing 4D4, then 5A, then **5B twice on the
+   same broker/APK**. 5A must retain its successful initialization/clean teardown.
+   Each 5B must first print `Gamescope input texture verification: PASS`, with
+   (64,64) RED, (192,64) GREEN, (64,192) BLUE, (192,192) WHITE and source mismatches=0.
+   Confirm layer count 1, opacity 1, PASSTHRU=4, expected geometry, source/sampler
+   3[0], actual AHB storage 1[0] and their stable IDs in UI/proot and broker logs.
+   Final internal timeline is now sequence=4 counter=4. Require all 65,536 final
+   pixels correct, mismatches=0, differing pixels=49152, exact-AHB acquisition/
+   release, clean teardown and exit 0. Visually confirm the unchanged centered
+   128x128 RED/GREEN over BLUE/WHITE with a 64px opaque black border for three
+   seconds, twice. A source failure must stop before dispatch; any final mismatch
+   must still fail without presenting or printing PASS. Keep both runs' logs.

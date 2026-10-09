@@ -5,6 +5,7 @@ static atomic_int renderer_created, renderer_destroyed, dispatches, shader_bytes
 struct mock_render {
     struct mock_logical *device; uint32_t kind, type, parent_count;
     uint64_t value;
+    uint32_t colorspace, format, nearest;
     struct mock_storage *image;
     struct mock_render *parent, *children[24];
     struct { struct mock_render *view, *sampler; struct mock_storage *buffer; uint64_t offset, range; } descriptors[7][16];
@@ -44,11 +45,11 @@ static VkResult mock_CreateImageView(VkDevice device, const VkImageViewCreateInf
     assert(!a && !ci->flags); struct mock_storage *im = (void *)ci->image; assert(im->memory && im->device == (void *)device);
     assert(ci->viewType == (im->type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : im->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D));
     if (mode == 51) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    struct mock_render *o = mock_render_new(device, MB_R_VIEW); o->image = im; o->type = ci->viewType; *out = (VkImageView)o; return VK_SUCCESS;
+    struct mock_render *o = mock_render_new(device, MB_R_VIEW); o->image = im; o->type = ci->viewType; o->format = ci->format; *out = (VkImageView)o; return VK_SUCCESS;
 }
 static VkResult mock_CreateSampler(VkDevice device, const VkSamplerCreateInfo *ci, const VkAllocationCallbacks *a, VkSampler *out) {
     assert(!a && !ci->pNext && !ci->flags && ci->addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-    struct mock_render *o = mock_render_new(device, MB_R_SAMPLER); o->type = ci->unnormalizedCoordinates; *out = (VkSampler)o; return VK_SUCCESS;
+    struct mock_render *o = mock_render_new(device, MB_R_SAMPLER); o->type = ci->unnormalizedCoordinates; o->nearest = ci->magFilter == VK_FILTER_NEAREST; *out = (VkSampler)o; return VK_SUCCESS;
 }
 static VkResult mock_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     assert(!a && !ci->pNext && !ci->flags && ci->bindingCount == 7);
@@ -94,9 +95,9 @@ static VkResult mock_CreateShaderModule(VkDevice device, const VkShaderModuleCre
 static VkResult mock_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     assert(!cache && n == 1 && !a && !ci->pNext && !ci->flags && ci->stage.stage == VK_SHADER_STAGE_COMPUTE_BIT && !strcmp(ci->stage.pName, "main"));
     const VkSpecializationInfo *spec = ci->stage.pSpecializationInfo; assert(spec && spec->mapEntryCount == 7 && spec->dataSize == 28);
-    const uint32_t *d = spec->pData; assert(d[0] == 1 && !d[1] && d[4] == 1 && d[5] == 2);
+    const uint32_t *d = spec->pData; assert(d[0] == 1 && !d[1] && (d[4] == 1 || d[4] == 4) && d[5] == 2);
     if (mode == 49) return VK_ERROR_INITIALIZATION_FAILED;
-    struct mock_render *o = mock_render_new(device, MB_R_PIPELINE); o->parent = (void *)ci->layout; *out = (VkPipeline)o; return VK_SUCCESS;
+    struct mock_render *o = mock_render_new(device, MB_R_PIPELINE); o->parent = (void *)ci->layout; o->colorspace = d[4]; *out = (VkPipeline)o; return VK_SUCCESS;
 }
 static void mock_CmdBindPipeline(VkCommandBuffer command, VkPipelineBindPoint point, VkPipeline pipeline) {
     struct mock_object *c = (void *)command; struct mock_render *p = (void *)pipeline; assert(c->state == 1 && point == VK_PIPELINE_BIND_POINT_COMPUTE && p->kind == MB_R_PIPELINE && p->device == c->device); c->pipeline = p;
@@ -106,7 +107,7 @@ static void mock_CmdBindDescriptorSets(VkCommandBuffer command, VkPipelineBindPo
 }
 static void mock_CmdDispatch(VkCommandBuffer command, uint32_t x, uint32_t y, uint32_t z) {
     struct mock_object *c = (void *)command; assert(c->state == 1 && c->pipeline && c->descriptor && x == 32 && y == 32 && z == 1 && c->op_count < 64);
-    c->ops[c->op_count++] = (struct mock_op){.kind = 4, .renderer_set = c->descriptor}; ++dispatches;
+    c->ops[c->op_count++] = (struct mock_op){.kind = 4, .renderer_set = c->descriptor, .pattern = ((struct mock_render *)c->pipeline)->colorspace}; ++dispatches;
 }
 static void mock_renderer_execute(struct mock_op *op) {
     struct mock_render *set = op->renderer_set; assert(set && set->kind == MB_R_SET);
@@ -116,11 +117,29 @@ static void mock_renderer_execute(struct mock_op *op) {
     float scale[2], offset[2]; memcpy(scale, data, 8); memcpy(offset, data + 8 * 8, 8);
     assert(scale[0] == 2 && scale[1] == 2 && offset[0] == -63.75f && offset[1] == -63.75f);
     assert(set->descriptors[5][0].view->type == VK_IMAGE_VIEW_TYPE_1D && set->descriptors[6][0].view->type == VK_IMAGE_VIEW_TYPE_3D);
+    assert(set->descriptors[3][0].sampler->type && set->descriptors[3][0].sampler->nearest);
+    assert(set->descriptors[3][0].view->format == VK_FORMAT_R8G8B8A8_UNORM && set->descriptors[1][0].view->format == VK_FORMAT_R8G8B8A8_UNORM);
+    for (unsigned j = 1; j < 16; ++j) assert(set->descriptors[3][j].view->image->width == 1 && set->descriptors[3][j].view->image != src);
+    assert(set->descriptors[2][0].view->image != dst && !set->descriptors[2][0].view->image->external);
+    float opacity, ctm[12]; uint32_t border, filter, alpha, rotation;
+    memcpy(&opacity, data + 128, 4); memcpy(ctm, data + 160, sizeof(ctm));
+    memcpy(&border, data + 544, 4); memcpy(&filter, data + 556, 4);
+    memcpy(&alpha, data + 560, 4); memcpy(&rotation, data + 580, 4);
+    assert(set->descriptors[0][0].range == 584 && opacity == 1 && border == 1 && filter == 1 && !alpha && !rotation);
+    for (unsigned j = 0; j < 12; ++j) assert(ctm[j] == (j == 0 || j == 5 || j == 10 ? 1.0f : 0.0f));
     for (unsigned y = 0; y < 256; ++y) for (unsigned x = 0; x < 256; ++x) {
         uint8_t *p = dst->memory->gpu + dst->offset + (y * 256 + x) * 4;
         float sx = (x + offset[0]) * scale[0], sy = (y + offset[1]) * scale[1];
         if (sx < 0 || sy < 0 || sx >= 256 || sy >= 256) { p[0] = p[1] = p[2] = 0; p[3] = 255; }
-        else memcpy(p, src->memory->gpu + src->offset + (((unsigned)sy * 256 + (unsigned)sx) * 4), 4);
+        else {
+            memcpy(p, src->memory->gpu + src->offset + (((unsigned)sy * 256 + (unsigned)sx) * 4), 4);
+            /* Match composite.h: valid dummy LUT has one mip even when output
+             * color management is disabled. Only PASSTHRU skips this branch. */
+            if (op->pattern != 4) {
+                struct mock_storage *lut = set->descriptors[6][0].view->image;
+                memcpy(p, lut->memory->gpu + lut->offset, 3);
+            }
+        }
     }
     if (mode == 53) dst->memory->gpu[0] = 99;
 }

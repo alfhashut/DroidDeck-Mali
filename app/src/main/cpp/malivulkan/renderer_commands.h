@@ -222,10 +222,11 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
     case MB_RENDERER_PIPELINE: {
         SIZE(40); struct native_renderer_object *shader = renderer_find(d, id, MB_R_SHADER), *layout = renderer_find(d, mb_get_u32(w + 8), MB_R_PIPELINE_LAYOUT); REQUIRE(shader && layout);
         uint32_t data[7]; VkSpecializationMapEntry entries[7]; for (unsigned i = 0; i < 7; ++i) { data[i] = mb_get_u32(w + 12 + i * 4); entries[i] = (VkSpecializationMapEntry){i, i * 4, 4}; }
-        REQUIRE(data[0] == 1 && !data[1] && !data[2] && !data[3] && data[4] == 1 && data[5] == 2 && !data[6]);
+        REQUIRE(data[0] == 1 && !data[1] && !data[2] && !data[3] && (data[4] == 1 || data[4] == 4) && data[5] == 2 && !data[6]);
         VkSpecializationInfo spec = {.mapEntryCount = 7, .pMapEntries = entries, .dataSize = sizeof(data), .pData = data};
         VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader->handle.shader, .pName = "main", .pSpecializationInfo = &spec}, .layout = layout->handle.pipeline_layout};
+        if (d->interop.ahb_enabled) LOG("BLIT native specialization: layer count=%u ycbcrMask=%u debug=%u blur layers=%u colorspaceMask=%u output EOTF=%u ITM=%u", data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
         *result = v->CreateComputePipelines(d->handle, VK_NULL_HANDLE, 1, &ci, NULL, &o->handle.pipeline); o->kind = MB_R_PIPELINE; o->parent = layout->id; break;
     }
     case MB_RENDERER_UPDATE: {
@@ -261,6 +262,9 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
                         REQUIRE(sampler && (expected == VK_IMAGE_VIEW_TYPE_2D || !sampler->type));
                     } else REQUIRE(!sid);
                     images[image_at++] = (VkDescriptorImageInfo){sampler ? sampler->handle.sampler : VK_NULL_HANDLE, view->handle.view, (VkImageLayout)layout};
+                    if (d->interop.ahb_enabled && j == 0 && (binding == 1 || binding == 3))
+                        LOG("BLIT native descriptor set ID=%u binding=%u array index=%u image broker ID=%u image-view broker ID=%u sampler broker ID=%u viewType=%u format=%u usage=0x%x layout=%u AHB=%u",
+                            set->id, binding, j, im->id, view->id, sampler ? sampler->id : 0, view->type, view->format, view->usage, layout, im->ahb);
                     unsigned k = staged.descriptor_count++; staged.descriptors[k].binding = binding; staged.descriptors[k].element = j; staged.descriptors[k].type = type; staged.descriptors[k].view = vid; staged.descriptors[k].sampler = sampler ? sampler->id : 0;
                 }
             }
@@ -294,6 +298,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
                 if (set->descriptors[i].binding == 1) { REQUIRE(x * 8 >= im->width && y * 8 >= im->height); if (im->ahb) c->image_id = im->id; }
             }
             c->descriptor_revision = set->descriptor_revision;
+            if (d->interop.ahb_enabled) LOG("BLIT native before dispatch: pipeline ID=%u descriptor set ID=%u command ID=%u final AHB image broker ID=%u dispatch X/Y/Z=%u/%u/%u; all sampled/storage layouts GENERAL, queue owned", p->id, set->id, c->id, c->image_id, x, y, z);
             v->CmdDispatch(c->handle, x, y, z);
         }
         ++c->recorded; break;
@@ -345,6 +350,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
             REQUIRE(acquire ? im->ahb && c->renderer_images[j].foreign : release ? im->ahb && !c->renderer_images[j].foreign && !da : !c->renderer_images[j].foreign && ((sf == d->family && df == d->family) || (sf == VK_QUEUE_FAMILY_IGNORED && df == VK_QUEUE_FAMILY_IGNORED)));
             REQUIRE(!(da & VK_ACCESS_SHADER_WRITE_BIT) || (im->usage & VK_IMAGE_USAGE_STORAGE_BIT));
             barriers[i] = (VkImageMemoryBarrier){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = sa, .dstAccessMask = da, .oldLayout = (VkImageLayout)old, .newLayout = (VkImageLayout)next, .srcQueueFamilyIndex = sf, .dstQueueFamilyIndex = df, .image = im->handle, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            if (d->interop.ahb_enabled) LOG("BLIT native image barrier: image broker ID=%u layout=%u->%u access=0x%x->0x%x queue=%u->%u stages=0x%x->0x%x", iid, old, next, sa, da, sf, df, src, dst);
             c->renderer_images[j].final = (VkImageLayout)next; c->renderer_images[j].foreign = release;
         }
         d->interop.CmdPipelineBarrier(c->handle, src, dst, 0, 0, NULL, 0, NULL, n, barriers); ++c->recorded; break;
@@ -363,6 +369,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
             struct native_buffer *b = interop_find_buffer(d, bid); REQUIRE(b && b->memory && direction <= 1 && width == im->width && height == im->height && depth == (im->depth ? im->depth : 1) && !(offset % 4) && interop_range(b->size, offset, (uint64_t)width * height * depth * 4) && !interop_ref(c, bid));
             REQUIRE(direction ? (im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && (b->usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && (layout == VK_IMAGE_LAYOUT_GENERAL || layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) : (im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (b->usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) && (layout == VK_IMAGE_LAYOUT_GENERAL || layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));
             VkBufferImageCopy region = {.bufferOffset = offset, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {width, height, depth}};
+            if (d->interop.ahb_enabled) LOG("BLIT native %s: image broker ID=%u buffer ID=%u offset=%llu extent=%ux%ux%u layout=%u", direction ? "source upload" : "image GPU readback", iid, bid, (unsigned long long)offset, width, height, depth, layout);
             if (direction) d->interop.CmdCopyBufferToImage(c->handle, b->handle, im->handle, (VkImageLayout)layout, 1, &region); else d->interop.CmdCopyImageToBuffer(c->handle, im->handle, (VkImageLayout)layout, b->handle, 1, &region);
         }
         ++c->recorded; break;

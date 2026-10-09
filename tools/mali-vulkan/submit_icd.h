@@ -4,7 +4,7 @@ struct proxy_resource {
     VK_LOADER_DATA loader;
     struct proxy_logical *owner;
     struct proxy_resource *next;
-    uint32_t id, pool;
+    uint32_t id, pool, image_id; /* image_id is view metadata for diagnostic logs */
     enum proxy_resource_kind kind;
     atomic_int live;
     uint8_t *mirror;

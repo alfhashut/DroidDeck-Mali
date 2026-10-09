@@ -91,7 +91,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateImageView(VkDevice device, con
     if (usage && (usage->sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO || usage->pNext)) return VK_ERROR_FEATURE_NOT_PRESENT;
     struct proxy_logical *d = (struct proxy_logical *)device; struct proxy_resource *im = submit_find(d, (uintptr_t)ci->image, PROXY_IMAGE); if (!im) return VK_ERROR_INITIALIZATION_FAILED;
     uint8_t args[16]; const uint32_t fields[] = {im->id, ci->viewType, ci->format, usage ? usage->usage : 0}; for (unsigned i = 0; i < 4; ++i) mb_put_u32(args + i * 4, fields[i]);
-    struct proxy_resource *o; VkResult r = renderer_new(d, MB_RENDERER_VIEW, PROXY_VIEW, args, 16, &o); if (r == VK_SUCCESS) *out = (VkImageView)(uintptr_t)o; return r;
+    struct proxy_resource *o; VkResult r = renderer_new(d, MB_RENDERER_VIEW, PROXY_VIEW, args, 16, &o); if (r == VK_SUCCESS) { o->image_id = im->id; *out = (VkImageView)(uintptr_t)o; } return r;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
@@ -156,6 +156,19 @@ static VKAPI_ATTR void VKAPI_CALL proxy_UpdateDescriptorSets(VkDevice device, ui
         } else goto done;
     }
     r = renderer_rpc(d, MB_RENDERER_UPDATE, args, at, NULL, 0);
+    if (r == VK_SUCCESS) for (unsigned i = 0; i < count; ++i) {
+        const VkWriteDescriptorSet *w = writes + i;
+        if (w->dstBinding != 1 && w->dstBinding != 3) continue;
+        struct proxy_resource *set = submit_find(d, (uintptr_t)w->dstSet, PROXY_DESCRIPTOR_SET);
+        for (unsigned j = 0; j < w->descriptorCount; ++j) {
+            const VkDescriptorImageInfo *ii = w->pImageInfo + j;
+            struct proxy_resource *view = submit_find(d, (uintptr_t)ii->imageView, PROXY_VIEW);
+            struct proxy_resource *sam = submit_find(d, (uintptr_t)ii->sampler, PROXY_SAMPLER);
+            LOG("BLIT %s descriptor set ID=%u binding=%u array index=%u image broker ID=%u image-view broker ID=%u sampler broker ID=%u layout=%u",
+                w->dstBinding == 1 ? "output storage" : "source/sampler", set->id, w->dstBinding, w->dstArrayElement + j,
+                view->image_id, view->id, sam ? sam->id : 0, ii->imageLayout);
+        }
+    }
 done: submit_void_error(d, "vkUpdateDescriptorSets", r);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
@@ -179,12 +192,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateComputePipelines(VkDevice devi
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_CmdBindPipeline(VkCommandBuffer command, VkPipelineBindPoint point, VkPipeline pipeline) {
     struct proxy_resource *c = interop_command(command); if (!c) return; struct proxy_resource *p = submit_find(c->owner, (uintptr_t)pipeline, PROXY_PIPELINE); VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
-    if (p && point == VK_PIPELINE_BIND_POINT_COMPUTE) { uint8_t args[8]; mb_put_u32(args, c->id); mb_put_u32(args + 4, p->id); r = renderer_rpc(c->owner, MB_RENDERER_BIND_PIPELINE, args, 8, NULL, 0); } submit_void_error(c->owner, "vkCmdBindPipeline", r);
+    if (p && point == VK_PIPELINE_BIND_POINT_COMPUTE) { uint8_t args[8]; mb_put_u32(args, c->id); mb_put_u32(args + 4, p->id); r = renderer_rpc(c->owner, MB_RENDERER_BIND_PIPELINE, args, 8, NULL, 0); } if (r == VK_SUCCESS) LOG("BLIT pipeline ID=%u command ID=%u", p->id, c->id); submit_void_error(c->owner, "vkCmdBindPipeline", r);
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_CmdBindDescriptorSets(VkCommandBuffer command, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet *sets, uint32_t dynamic_count, const uint32_t *offsets) {
     (void)offsets; struct proxy_resource *c = interop_command(command); if (!c) return;
     struct proxy_resource *l = submit_find(c->owner, (uintptr_t)layout, PROXY_PIPELINE_LAYOUT), *set = count == 1 && sets ? submit_find(c->owner, (uintptr_t)sets[0], PROXY_DESCRIPTOR_SET) : NULL; VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
-    if (l && set && point == VK_PIPELINE_BIND_POINT_COMPUTE && !first && !dynamic_count) { uint8_t args[12]; mb_put_u32(args, c->id); mb_put_u32(args + 4, l->id); mb_put_u32(args + 8, set->id); r = renderer_rpc(c->owner, MB_RENDERER_BIND_SET, args, 12, NULL, 0); } submit_void_error(c->owner, "vkCmdBindDescriptorSets", r);
+    if (l && set && point == VK_PIPELINE_BIND_POINT_COMPUTE && !first && !dynamic_count) { uint8_t args[12]; mb_put_u32(args, c->id); mb_put_u32(args + 4, l->id); mb_put_u32(args + 8, set->id); r = renderer_rpc(c->owner, MB_RENDERER_BIND_SET, args, 12, NULL, 0); } if (r == VK_SUCCESS) LOG("BLIT bound descriptor set ID=%u pipeline layout ID=%u command ID=%u set index=0", set->id, l->id, c->id); submit_void_error(c->owner, "vkCmdBindDescriptorSets", r);
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_CmdDispatch(VkCommandBuffer command, uint32_t x, uint32_t y, uint32_t z) {
     struct proxy_resource *c = interop_command(command); if (!c) return; uint8_t args[16]; uint32_t fields[] = {c->id, x, y, z}; for (unsigned i = 0; i < 4; ++i) mb_put_u32(args + i * 4, fields[i]); VkResult r = renderer_rpc(c->owner, MB_RENDERER_DISPATCH, args, 16, NULL, 0); submit_void_error(c->owner, "vkCmdDispatch", r);

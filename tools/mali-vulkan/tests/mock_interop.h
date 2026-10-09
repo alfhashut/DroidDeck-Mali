@@ -99,7 +99,7 @@ static void mock_CmdFillBuffer(VkCommandBuffer c, VkBuffer b, VkDeviceSize offse
     struct mock_op *op = mock_record(c, 1); op->buffer = (void *)b; op->offset = offset; op->size = size; op->pattern = pattern;
 }
 static void mock_CmdPipelineBarrier(VkCommandBuffer c, VkPipelineStageFlags s, VkPipelineStageFlags d, VkDependencyFlags flags, uint32_t mc, const VkMemoryBarrier *m, uint32_t bc, const VkBufferMemoryBarrier *b, uint32_t ic, const VkImageMemoryBarrier *im) {
-    (void)s; (void)d; (void)b; (void)im; assert(!flags && !mc && !m && (bc + ic == 1 || (mode >= 43 && !bc && ic > 0 && ic <= 16))); (void)mock_record(c, 0);
+    (void)s; (void)d; (void)b; (void)im; assert(!flags && !mc && !m && (bc + ic == 1 || (mode >= 43 && !bc && ic <= 16))); (void)mock_record(c, 0);
 }
 static void mock_CmdClearColorImage(VkCommandBuffer c, VkImage im, VkImageLayout l, const VkClearColorValue *color, uint32_t n, const VkImageSubresourceRange *r) {
     assert((l == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL || (mode >= 43 && l == VK_IMAGE_LAYOUT_GENERAL)) && n == 1 && r->levelCount == 1 && r->layerCount == 1);
@@ -120,6 +120,7 @@ static void mock_interop_execute(struct mock_object *c) {
         if (op->kind == 2) for (uint64_t j = 0; j < im->size; j += 4) memcpy(im->memory->gpu + im->offset + j, op->color, 4);
         if (op->kind == 3) memcpy(b->memory->gpu + b->offset, im->memory->gpu + im->offset, (size_t)im->size);
         if (op->kind == 5) memcpy(im->memory->gpu + im->offset, b->memory->gpu + b->offset, (size_t)im->size);
+        if (mode == 62 && op->kind == 5 && im->width == 256 && !im->external) im->memory->gpu[im->offset + (64 * 256 + 64) * 4] = 0;
         if (mode == 36 && op->kind == 3) b->memory->gpu[b->offset] ^= 255; /* Channel/content corruption must fail. */
     }
 }

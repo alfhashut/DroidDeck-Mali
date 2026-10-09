@@ -218,6 +218,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckInteropTEST(VkDevice device
         if (r != VK_SUCCESS) { free(im); free(m); free(a); return r; }
         interop_publish(d, im, PROXY_IMAGE, mb_get_u32(reply)); interop_publish(d, m, PROXY_MEMORY, mb_get_u32(reply + 4)); interop_publish(d, a, PROXY_AHB, mb_get_u32(reply + 8));
         out->image = (VkImage)(uintptr_t)im; out->memory = (VkDeviceMemory)(uintptr_t)m; out->token = a->id;
+        if (d->owner->wire_version == MB_RENDERER_VERSION) LOG("BLIT final AHB image broker ID=%u memory ID=%u AHB token=%u", im->id, m->id, a->id);
         out->width = mb_get_u32(reply + 12); out->height = mb_get_u32(reply + 16); out->format = mb_get_u32(reply + 20); out->layers = mb_get_u32(reply + 24); out->usage = mb_get_u64(reply + 28); return VK_SUCCESS;
     }
     if (op == DD_FENCE_CREATE || op == DD_SYNC_EXPORT) {

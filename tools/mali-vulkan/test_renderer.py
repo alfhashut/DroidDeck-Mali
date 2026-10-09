@@ -184,10 +184,24 @@ class GamescopeRendererTests(RendererFixture):
             subprocess.run(compiler + flags + ["-c", str(src), "-o", str(obj)], check=True)
         cls.binary = build / "renderer-test"
         subprocess.run(compiler + ["-Wl,--gc-sections", *objects, "-ldl", "-pthread", "-ldrm", "-o", str(cls.binary)], check=True)
+        # Exercise the old SRGB frame with the current faithful LUT model. This
+        # changes only the diagnostic's colorspace, never the deployed shader.
+        legacy_inc = (cls.source / "src/vulkan_renderer_test.inc").read_text().replace(
+            "layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;",
+            "layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;")
+        assert legacy_inc != (cls.source / "src/vulkan_renderer_test.inc").read_text()
+        (build / "vulkan_renderer_legacy.inc").write_text(legacy_inc)
+        legacy_cpp = build / "renderer-legacy.cpp"
+        legacy_cpp.write_text((cls.source / "src/rendervulkan.cpp").read_text().replace(
+            '#include "vulkan_renderer_test.inc"', '#include "vulkan_renderer_legacy.inc"'))
+        legacy_obj = build / "renderer-legacy.o"
+        subprocess.run(compiler + flags + ["-c", str(legacy_cpp), "-o", str(legacy_obj)], check=True)
+        cls.legacy_binary = build / "renderer-legacy"
+        subprocess.run(compiler + ["-Wl,--gc-sections", str(legacy_obj), objects[1], "-ldl", "-pthread", "-ldrm", "-o", str(cls.legacy_binary)], check=True)
 
-    def run_renderer(self, path, frame=False):
+    def run_renderer(self, path, frame=False, legacy=False):
         env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(self.manifest), VK_ICD_FILENAMES=str(self.manifest), VK_LOADER_LAYERS_DISABLE="*", DISPLAY="invalid-for-renderer", WAYLAND_DISPLAY="invalid-for-renderer")
-        return subprocess.run([str(self.binary)] + (["frame"] if frame else []), env=env, capture_output=True, text=True, timeout=40)
+        return subprocess.run([str(self.legacy_binary if legacy else self.binary)] + (["frame"] if frame else []), env=env, capture_output=True, text=True, timeout=40)
 
     def test_actual_renderer_initialization_no_backend(self):
         with self.broker(43) as path:
@@ -203,10 +217,52 @@ class GamescopeRendererTests(RendererFixture):
             for repeat in range(2):
                 result = self.run_renderer(path, True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                for text in ("vulkan_composite -> BLIT -> CVulkanCmdBuffer::dispatch", "sequence=3 counter=3", "RGBA=(255,0,0,255)", "RGBA=(0,255,0,255)", "RGBA=(0,0,255,255)", "RGBA=(255,255,255,255)", "RGBA=(0,0,0,255)", "mismatches=0 source-vs-final differing pixels=49152", "Gamescope first frame PASS", "clean renderer teardown"):
+                for text in ("vulkan_composite -> BLIT -> CVulkanCmdBuffer::dispatch", "sequence=4 counter=4", "RGBA=(255,0,0,255)", "RGBA=(0,255,0,255)", "RGBA=(0,0,255,255)", "RGBA=(255,255,255,255)", "RGBA=(0,0,0,255)", "mismatches=0 source-vs-final differing pixels=49152", "Gamescope first frame PASS", "clean renderer teardown"):
                     self.assertIn(text, result.stdout)
         self.assertIn("AHB=2/2 consumers=2 CPU=2", self.cleanup_output)
-        self.assertIn("objects=86/86 dispatches=2", self.cleanup_output)
+        self.assertIn("objects=88/88 dispatches=2", self.cleanup_output)
+
+    def test_legacy_srgb_dummy_lut_reproduces_phone_black_frame(self):
+        with self.broker(43) as path:
+            result = self.run_renderer(path, True, legacy=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("Gamescope input texture verification: PASS", result.stdout)
+            self.assertIn("sequence=4 counter=4", result.stdout)
+            self.assertIn("actual final AHB readback: mismatches=16384", result.stdout)
+            self.assertIn("pixel(96,96) RGBA=(0,0,0,255)", result.stdout)
+            self.assertNotIn("Gamescope first frame PASS", result.stdout)
+        self.assertIn("consumers=0", self.cleanup_output)
+
+    def test_corrupt_source_readback_stops_before_blit(self):
+        with self.broker(62) as path:
+            result = self.run_renderer(path, True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("Gamescope input texture mismatches=1", result.stdout)
+            self.assertNotIn("Gamescope input texture verification: PASS", result.stdout)
+            self.assertNotIn("real renderer path:", result.stdout)
+            self.assertNotIn("Gamescope first frame PASS", result.stdout)
+        self.assertIn("dispatches=0", self.cleanup_output)
+        self.assertIn("consumers=0", self.cleanup_output)
+
+    def test_real_source_sampler_array_and_ahb_storage_bindings(self):
+        with self.broker(43) as path:
+            result = self.run_renderer(path, True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Gamescope input texture verification: PASS", result.stdout)
+            for value in ("pixel(64,64) RGBA=(255,0,0,255)", "pixel(192,64) RGBA=(0,255,0,255)",
+                          "pixel(64,192) RGBA=(0,0,255,255)", "pixel(192,192) RGBA=(255,255,255,255)",
+                          "FrameInfo layer count=1 output=256x256", "opacity=1.00", "scale=(2.00,2.00)",
+                          "offset=(-64.00,-64.00)", "colorspace=4 PASSTHRU", "opacity0=1.00",
+                          "offset0=(-63.75,-63.75)", "CTM0=identity", "dummy fill preserved both", "dispatch X/Y/Z=32/32/1"):
+                self.assertIn(value, result.stdout)
+            source = re.search(r"source/sampler descriptor set ID=(\d+) binding=3 array index=0 image broker ID=(\d+) image-view broker ID=(\d+) sampler broker ID=(\d+) layout=1", result.stderr)
+            target = re.search(r"output storage descriptor set ID=(\d+) binding=1 array index=0 image broker ID=(\d+) image-view broker ID=(\d+) sampler broker ID=0 layout=1", result.stderr)
+            ahb = re.search(r"final AHB image broker ID=(\d+)", result.stderr)
+            self.assertIsNotNone(source); self.assertIsNotNone(target); self.assertIsNotNone(ahb)
+            self.assertEqual(source[1], target[1]); self.assertNotEqual(source[2], target[2]); self.assertEqual(target[2], ahb[1])
+            self.assertTrue(int(source[4]) > 0)
+            self.assertIn(f"BLIT bound descriptor set ID={source[1]}", result.stderr)
+        self.assertRegex(self.broker_errors, rf"native before dispatch: pipeline ID=\d+ descriptor set ID={source[1]} .*final AHB image broker ID={target[2]} dispatch X/Y/Z=32/32/1")
 
     def test_extension_and_feature_failures_preserve_real_vkresult(self):
         for mode, code in ((59, -8), (60, -8), (44, -7), (45, -7), (46, -8), (47, -8), (48, -2), (49, -3), (50, 2), (51, -1), (54, -4), (58, -4)):
