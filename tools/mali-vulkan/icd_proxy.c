@@ -41,6 +41,8 @@ struct proxy_instance {
     pthread_mutex_t lock;
     uint32_t count;
     uint32_t wire_version;
+    int perf_enabled;
+    struct dd_perf_rpc perf;
     VkResult device_destroy_result;
     struct proxy_logical *logical;
     struct proxy_device devices[MB_MAX_DEVICES];
@@ -49,7 +51,7 @@ _Static_assert(offsetof(struct proxy_instance, loader) == 0, "instance dispatch 
 _Static_assert(offsetof(struct proxy_device, loader) == 0, "physical-device dispatch word");
 
 /* A connection owns the remote instance; IDs only have meaning on that connection. */
-static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *request,
+static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_t *request,
                     uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
     int teardown = s->wire_version >= MB_SUBMIT_VERSION && (op == MB_DEVICE_DESTROY || op == MB_DESTROY || op == MB_AHB_PRESENT || op == MB_SESSION_PRESENT || op == MB_SESSION_END);
     /* Await safe GPU teardown or consumer release acknowledgement, even after a finite producer timeout. */
@@ -101,6 +103,19 @@ broken:
     return VK_ERROR_INITIALIZATION_FAILED;
 }
 
+/* Callers already hold the connection lock. Include failed exchanges, too. */
+static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *request,
+                    uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
+    uint64_t start = s->perf_enabled ? dd_perf_now() : 0;
+    VkResult r = rpc_exchange(s, op, request, request_bytes, reply, reply_bytes, capacity);
+    if (s->perf_enabled) {
+        dd_perf_add(&s->perf, op, dd_perf_now() - start);
+        if (r == VK_SUCCESS && request_bytes >= 20 && op == MB_MEMORY_WRITE) s->perf.upload_bytes += mb_get_u32(request + 16);
+        if (r == VK_SUCCESS && request_bytes >= 20 && op == MB_MEMORY_READ) s->perf.download_bytes += mb_get_u32(request + 16);
+    }
+    return r;
+}
+
 static void proxy_free_logical(struct proxy_instance *);
 
 static VkResult cap_InstanceExtensions(const char *, uint32_t *, VkExtensionProperties *);
@@ -144,6 +159,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
     }
     struct proxy_instance *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    const char *normal = getenv("MALI_VULKAN_NORMAL_SESSION");
+    s->perf_enabled = normal && !strcmp(normal, "1");
     s->wire_version = mb_renderer_mode() ? MB_RENDERER_VERSION : mb_interop_mode() ? MB_INTEROP_VERSION : mb_submit_mode() ? MB_SUBMIT_VERSION : mb_device_mode() ? MB_DEVICE_VERSION : (mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION);
     s->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     strcpy(address.sun_path, path);
@@ -355,6 +372,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
 #undef MB_INTEROP_ENTRY
         if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
         if (!strcmp(name, "vkDroidDeckWaylandMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckWaylandMALI;
+        if (!strcmp(name, "vkDroidDeckPerformanceMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformanceMALI;
         if (!strcmp(name, "vkDroidDeckSessionTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckSessionTEST;
     }
     if (((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {

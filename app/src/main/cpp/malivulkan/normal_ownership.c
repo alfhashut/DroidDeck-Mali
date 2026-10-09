@@ -10,6 +10,10 @@ static pthread_mutex_t normal_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t normal_changed = PTHREAD_COND_INITIALIZER;
 static uint32_t normal_sequence;
 static struct record { struct mb_normal_state state; AHardwareBuffer *buffer; } records[NORMAL_MAX_BUFFERS];
+static uint64_t normal_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * UINT64_C(1000000000) + (uint64_t)t.tv_nsec;
+}
 
 static struct record *find(uint32_t key) {
     if (!key) return NULL;
@@ -45,7 +49,7 @@ AHardwareBuffer *mb_normal_import(uint32_t key, uint32_t width, uint32_t height)
 int mb_normal_publish(uint32_t key, uint32_t frame, uint32_t sync, uint32_t fence) {
     pthread_mutex_lock(&normal_lock); struct record *r = find(key);
     int ok = r && !r->state.retired && r->state.consumers && !r->state.owned && frame && sync && fence;
-    if (ok) { r->state.owned = 1; r->state.submitted = 0; r->state.frame = frame; r->state.sync = sync; r->state.fence = fence; }
+    if (ok) { r->state.owned = 1; r->state.submitted = 0; r->state.frame = frame; r->state.sync = sync; r->state.fence = fence; r->state.published_ns = normal_now(); }
     pthread_mutex_unlock(&normal_lock); return ok;
 }
 int mb_normal_submit(uint32_t key) {
@@ -54,12 +58,21 @@ int mb_normal_submit(uint32_t key) {
     /* Retirement stops the producer. Already queued commits may still reach Android
      * while the broker waits for their real release. */
     int ok = r && r->state.retired < 2 && r->state.owned && r->state.consumers;
-    if (ok && !r->state.submitted) { r->state.submitted = 1; ++r->state.presented; }
+    if (ok && !r->state.submitted) {
+        r->state.submitted = 1; ++r->state.presented; r->state.submitted_ns = normal_now();
+        r->state.timing.queue_ns += r->state.submitted_ns - r->state.published_ns;
+    }
     pthread_mutex_unlock(&normal_lock); return ok;
+}
+void mb_normal_present_timing(uint32_t key, uint64_t ns) {
+    pthread_mutex_lock(&normal_lock); struct record *r = find(key);
+    if (r) { ++r->state.timing.present_calls; r->state.timing.present_ns += ns; }
+    pthread_mutex_unlock(&normal_lock);
 }
 void mb_normal_release(uint32_t key) {
     pthread_mutex_lock(&normal_lock); struct record *r = find(key);
     if (r && r->state.owned && r->state.submitted) {
+        r->state.timing.held_ns += normal_now() - r->state.submitted_ns;
         r->state.owned = 0; r->state.submitted = 0; ++r->state.released; collect(r); pthread_cond_broadcast(&normal_changed);
     }
     pthread_mutex_unlock(&normal_lock);

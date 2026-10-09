@@ -15,6 +15,44 @@ static void native_normal_totals(struct native_device *d, uint32_t *presented, u
         if (mb_normal_snapshot(d->interop.ahbs[i].normal_key, &state)) { *presented += state.presented; *released += state.released; }
     }
 }
+static void native_normal_performance(struct native_device *d) {
+    uint64_t calls = 0, ns = 0, worst = 0; unsigned worst_op = 0;
+    for (unsigned i = 0; i < DD_PERF_OPS; ++i) {
+        calls += d->normal.perf.op[i].count; ns += d->normal.perf.op[i].ns;
+        if (d->normal.perf.op[i].worst > worst) { worst = d->normal.perf.op[i].worst; worst_op = i; }
+    }
+    /* One aggregated line per guest reporting window, even in quiet mode. */
+    __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker",
+        "MaliPerf native: RPCs=%llu service=%.3fms worst=%.3fms opcode=%u vkQueueSubmit=%.3fms/%llu timeline=%.3fms/%llu SYNC_FD-export=%.3fms/%llu sync-wait=%.3fms/%llu broker-thread-CPU=%.3fms (window totals; CPU includes reply/loop work; service includes payload read/validation, excludes reply; native calls overlap service)",
+        (unsigned long long)calls, ns / 1e6, worst / 1e6, worst_op,
+        d->normal.native_ns[0] / 1e6, (unsigned long long)d->normal.native_calls[0],
+        d->normal.native_ns[1] / 1e6, (unsigned long long)d->normal.native_calls[1],
+        d->normal.native_ns[2] / 1e6, (unsigned long long)d->normal.native_calls[2],
+        d->normal.native_ns[3] / 1e6, (unsigned long long)d->normal.native_calls[3],
+        (dd_perf_cpu_now() - d->normal.cpu_start_ns) / 1e6);
+    struct mb_normal_timing total = {0}; uint32_t presented = 0, released = 0;
+    native_normal_totals(d, &presented, &released);
+    for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
+        struct mb_normal_state state;
+        if (!mb_normal_snapshot(d->interop.ahbs[i].normal_key, &state)) continue;
+        total.present_calls += state.timing.present_calls; total.present_ns += state.timing.present_ns;
+        total.queue_ns += state.timing.queue_ns; total.held_ns += state.timing.held_ns;
+        if (state.owned) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker",
+            "MaliPerf held: key=%u frame=%u submitted=%u sync=%u fence=%u age=%.3fms",
+            state.key, state.frame, state.submitted, state.sync, state.fence, (dd_perf_now() - state.published_ns) / 1e6);
+    }
+    struct mb_normal_timing *old = &d->normal.previous_android;
+    __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker",
+        "MaliPerf Android: transaction-enqueue=%.3fms/%llu publish-to-submit=%.3fms release-held=%.3fms presented-total=%u released-total=%u owned=%u (window totals; release-held is async buffer lifetime, not CPU blocking or scanout latency)",
+        (total.present_ns - old->present_ns) / 1e6, (unsigned long long)(total.present_calls - old->present_calls),
+        (total.queue_ns - old->queue_ns) / 1e6, (total.held_ns - old->held_ns) / 1e6,
+        presented, released, native_normal_held(d));
+    *old = total;
+    memset(&d->normal.perf, 0, sizeof(d->normal.perf));
+    memset(d->normal.native_ns, 0, sizeof(d->normal.native_ns));
+    memset(d->normal.native_calls, 0, sizeof(d->normal.native_calls));
+    d->normal.cpu_start_ns = dd_perf_cpu_now();
+}
 static VkResult native_normal_end(struct native_device *d) {
     if (d->normal.timeouts) return VK_TIMEOUT;
     if (!d->normal.enabled || d->normal.stopping == 2) return d->normal.timeouts ? VK_TIMEOUT : VK_SUCCESS;
@@ -25,7 +63,12 @@ static VkResult native_normal_end(struct native_device *d) {
     }
     d->normal.stopping = 1;
     unsigned outstanding = native_normal_held(d);
-    if (!mb_normal_wait(keys, n, MB_NORMAL_RELEASE_WAIT_MS)) {
+    uint64_t release_start = dd_perf_now();
+    int all_released = mb_normal_wait(keys, n, MB_NORMAL_RELEASE_WAIT_MS);
+    __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", "MaliPerf teardown: Android-release-wait=%.3fms outstanding-at-stop=%u timeout=%u",
+                        (dd_perf_now() - release_start) / 1e6, outstanding, !all_released);
+    native_normal_performance(d);
+    if (!all_released) {
         d->normal.timeouts = 1; d->session.release_timeouts = 1; session_quiet = 0;
         for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
             struct native_ahb *a = &d->interop.ahbs[i]; struct mb_normal_state state;
@@ -57,6 +100,7 @@ static uint32_t native_normal_command(struct vk_session *s, uint32_t op, const u
     if (op == MB_NORMAL_BEGIN) {
         if (d->normal.enabled || mb_get_u32(w + 4) > 1) return MB_PROTOCOL_ERROR;
         d->normal.enabled = 1; d->normal.verbose = mb_get_u32(w + 4);
+        d->normal.cpu_start_ns = dd_perf_cpu_now();
         native_session_log(d, "normal start (connection baseline zero)"); session_quiet = !d->normal.verbose;
         return MB_OK;
     }
@@ -84,6 +128,7 @@ static uint32_t native_normal_command(struct vk_session *s, uint32_t op, const u
     } else if (op == MB_NORMAL_END) {
         native_drain_device(d); *result = native_normal_end(d);
     } else if (op == MB_NORMAL_STATS) {
+        if (d->normal.stopping != 2) native_normal_performance(d);
         uint32_t c[20], presented, released; native_session_counts(d, c); native_normal_totals(d, &presented, &released);
         for (unsigned i = 0; i < 20; ++i) mb_put_u32(reply + i * 4, c[i]);
         uint32_t totals[] = {presented, released, native_normal_held(d), d->normal.timeouts, d->session.fds_created, d->session.fds_closed};

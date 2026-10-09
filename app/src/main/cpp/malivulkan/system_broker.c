@@ -27,6 +27,7 @@
 #include "interop_consumer.h"
 #include "normal_protocol.h"
 #include "normal_ownership.h"
+#include "normal_perf.h"
 
 static _Thread_local int session_quiet;
 #define LOG(...) do { if (!session_quiet) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__); } while (0)
@@ -63,7 +64,13 @@ struct vk_session {
             uint32_t last_sync, last_fence, release_timeouts, cleanup_done;
             uint32_t pending, pending_frame, pending_sync, pending_fence;
         } session;
-        struct { uint32_t enabled, verbose, stopping, presented, released, timeouts; } normal;
+        struct {
+            uint32_t enabled, verbose, stopping, presented, released, timeouts;
+            struct dd_perf_rpc perf;
+            uint64_t native_ns[4], native_calls[4]; /* submit, timeline, export, sync wait */
+            uint64_t cpu_start_ns;
+            struct mb_normal_timing previous_android;
+        } normal;
         VkDevice handle;
         PFN_vkDestroyDevice destroy;
         PFN_vkGetDeviceQueue get_queue;
@@ -95,6 +102,10 @@ static void native_session_log(struct native_device *d, const char *stage);
 static VkResult native_normal_end(struct native_device *d);
 static uint32_t native_normal_command(struct vk_session *, uint32_t, const uint8_t *, uint32_t, uint8_t *, uint32_t *, uint32_t *, VkResult *);
 static int native_verbose(struct native_device *d) { return d->normal.enabled ? d->normal.verbose : !d->session.enabled || d->session.presented < 3; }
+static uint64_t native_perf_start(struct native_device *d) { return d->normal.enabled ? dd_perf_now() : 0; }
+static void native_perf_end(struct native_device *d, unsigned kind, uint64_t start) {
+    if (start) { d->normal.native_ns[kind] += dd_perf_now() - start; ++d->normal.native_calls[kind]; }
+}
 
 static int close_session(struct vk_session *s) {
     int retained = 0;
@@ -240,6 +251,12 @@ static void serve(int fd) {
         uint32_t status = MB_PROTOCOL_ERROR, count = 0;
         VkResult result = VK_SUCCESS;
         int finish = 0;
+        struct native_device *measured = NULL;
+        for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
+            if (s->logical[i].normal.enabled && !s->logical[i].normal.stopping) { measured = &s->logical[i]; break; }
+        /* Excludes idle waiting for a header. Includes payload read, validation
+         * and native execution; excludes reply write and log formatting. */
+        uint64_t service_start = measured ? dd_perf_now() : 0;
         if (mb_get_u32(header) != MB_MAGIC || request_bytes > MB_RENDERER_MAX_REQUEST) {
             finish = 1;
         } else if (version == MB_VERSION && op == MB_ENUMERATE && !request_bytes && !s->library) {
@@ -338,6 +355,8 @@ static void serve(int fd) {
             finish = 1;
         }
         if (version == MB_RENDERER_VERSION && status == MB_PROTOCOL_ERROR) finish = 1;
+        if (measured && measured->normal.enabled && op != MB_NORMAL_STATS)
+            dd_perf_add(&measured->normal.perf, op, dd_perf_now() - service_start);
         mb_put_u32(payload, status); mb_put_u32(payload + 4, (uint32_t)result); mb_put_u32(payload + 8, count);
         if (version == MB_VERSION) mb_header(header, bytes);
         else mb_session_header(header, op, bytes);

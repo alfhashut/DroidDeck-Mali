@@ -280,6 +280,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckSessionTEST(VkDevice device
 
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckPerformanceMALI(VkDevice device, struct dd_perf_rpc *out, VkBool32 reset) {
+    if (!device || !out) return VK_ERROR_INITIALIZATION_FAILED;
+    struct proxy_instance *s = ((struct proxy_logical *)device)->owner;
+    if (!s->perf_enabled || s->wire_version != MB_RENDERER_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
+    pthread_mutex_lock(&s->lock);
+    *out = s->perf;
+    if (reset) memset(&s->perf, 0, sizeof(s->perf));
+    pthread_mutex_unlock(&s->lock);
+    return VK_SUCCESS;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckWaylandMALI(VkDevice device, uint32_t op, const struct dd_normal_input *in, struct dd_normal_output *out) {
     const char *enabled = getenv("MALI_VULKAN_NORMAL_SESSION");
     if (!device || !in || !out || !enabled || strcmp(enabled, "1")) return VK_ERROR_FEATURE_NOT_PRESENT;

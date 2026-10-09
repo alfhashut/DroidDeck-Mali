@@ -100,7 +100,7 @@ static int interop_range(uint64_t total, uint64_t offset, uint64_t size) {
 static int interop_memory_pending(struct native_device *d, struct native_memory *m) {
     return m->bound && interop_referenced(d, m->bound, 1);
 }
-static VkResult interop_wait_sync(struct native_device *d, struct native_sync *sync, uint32_t ms) {
+static VkResult interop_wait_sync_impl(struct native_device *d, struct native_sync *sync, uint32_t ms) {
     if (sync->completed) return VK_SUCCESS;
     if (sync->fd >= 0) {
         struct pollfd p = {.fd = sync->fd, .events = POLLIN}; int n;
@@ -111,6 +111,12 @@ static VkResult interop_wait_sync(struct native_device *d, struct native_sync *s
     sync->completed = 1; native_complete_fence(d, sync->fence);
     if (native_verbose(d)) LOG("SYNC_FD producer completed sync ID=%u; command resources now safe", sync->id);
     return VK_SUCCESS;
+}
+static VkResult interop_wait_sync(struct native_device *d, struct native_sync *sync, uint32_t ms) {
+    uint64_t start = native_perf_start(d);
+    VkResult result = interop_wait_sync_impl(d, sync, ms);
+    native_perf_end(d, 3, start);
+    return result;
 }
 static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const uint8_t *w,
         uint32_t bytes, uint8_t *reply, uint32_t *extra, uint32_t *count, VkResult *result) {
@@ -384,7 +390,9 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         if (!v->ahb_enabled || !f || !f->exportable || !f->submitted || f->exported || mb_get_u32(w + 8) != VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT) return MB_PROTOCOL_ERROR;
         NEW_INTEROP(syncs, sync);
         VkFenceGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR, .fence = f->handle, .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+        uint64_t perf_start = native_perf_start(d);
         int fd = -1; *result = v->fence_fd(d->handle, &info, &fd);
+        native_perf_end(d, 2, perf_start);
         if (*result == VK_SUCCESS) { o->id = new_id; o->fence = f->id; o->fd = fd; f->exported = 1; if ((d->session.enabled || d->normal.enabled) && fd >= 0) ++d->session.fds_created; }
         else if (fd >= 0) { close(fd); }
         break;

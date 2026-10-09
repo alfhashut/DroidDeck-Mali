@@ -576,6 +576,10 @@ class SessionService : Service() {
                 "GLIBC_TUNABLES=glibc.pthread.rseq=0", "BL_WIDTH=" + size.first, "BL_HEIGHT=" + size.second,
                 "BL_LOG=" + File(directory, "session.log").path, "BL_DEBUG_DIR=" + directory.path)
             guest.addAll(vulkan)
+            // Checkpoint 7P A/B switch only. Keep the Mali Vulkan/socket environment
+            // isolated from arbitrary overrides in the existing droiddeck-env file.
+            extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_BASELINE=0" || it == "MALI_VULKAN_PERF_BASELINE=1" }
+                ?.let { guest.add(it) }
             guest.add(LinuxRuntime.SESSION_SCRIPT); guest.add(com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
             val command = LinuxRuntime.command(this, sessionRoot, runtimeDir, Environment.getExternalStorageDirectory(), guest)
             val hostEnv = HostEnvironment()

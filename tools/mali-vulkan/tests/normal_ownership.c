@@ -24,6 +24,11 @@ int main(void) {
         assert(!mb_normal_import(keys[i], 1280, 720));
         assert(mb_normal_publish(keys[i], i + 1, 100 + i, 200 + i));
         assert(mb_normal_submit(keys[i])); assert(mb_normal_owned(keys[i]));
+        mb_normal_present_timing(keys[i], 1234);
+        struct mb_normal_state measured; assert(mb_normal_snapshot(keys[i], &measured));
+        assert(measured.published_ns && measured.submitted_ns >= measured.published_ns);
+        assert(measured.timing.present_calls == 1 && measured.timing.present_ns == 1234);
+        assert(measured.timing.held_ns == 0 && measured.released == 0);
         assert(!mb_normal_publish(keys[i], 10, 10, 10));
         mb_normal_not_submitted(keys[i]); assert(mb_normal_owned(keys[i]));
     }
@@ -33,11 +38,14 @@ int main(void) {
     for (unsigned i = 0; i < 3; ++i) {
         struct mb_normal_state state; assert(mb_normal_snapshot(keys[i], &state));
         assert(!state.owned && state.presented == 1 && state.released == 1);
+        assert(state.timing.held_ns > 0); /* Actual callback, never a timeout. */
     }
     assert(mb_normal_publish(keys[2], 99, 77, 88)); assert(mb_normal_submit(keys[2]));
+    struct mb_normal_state before_timeout; assert(mb_normal_snapshot(keys[2], &before_timeout));
     mb_normal_retire(keys[2]); assert(!mb_normal_wait(keys, 3, 30));
     struct mb_normal_state state; assert(mb_normal_snapshot(keys[2], &state));
     assert(state.owned && state.frame == 99 && state.sync == 77 && state.fence == 88 && state.presented == 2 && state.released == 1);
+    assert(state.timing.held_ns == before_timeout.timing.held_ns);
     assert(!mb_normal_publish(keys[2], 100, 78, 89)); assert(mb_normal_submit(keys[2])); /* same held Android buffer, no producer reuse */
     mb_normal_detach(keys[2]); AHardwareBuffer_release(&buffers[2]);
     mb_normal_forget(keys[2]); assert(mb_normal_owned(keys[2])); assert(buffers[2].refs == 2);

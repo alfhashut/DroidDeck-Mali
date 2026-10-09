@@ -235,8 +235,10 @@ int ahb_swapchain_present(struct dmabuf_buffer *b, struct surface *s, int scene_
         int r;
         do { r = poll(&p, 1, 100); } while (r < 0 && errno == EINTR);
     }
+    int64_t present_start = ab->broker_key ? now_ns() : 0;
     int r = sc_layer_present_ahb(ab->ahb, ab->w, ab->h, acquire, (void *)(uintptr_t)ab->id, scene_w, scene_h,
                                  s ? droiddeck_surface_color(s) : NULL, ab->format);
+    if (ab->broker_key) mb_normal_present_timing(ab->broker_key, (uint64_t)(now_ns() - present_start));
     if (ab->broker_key && r != 0) {
         /* sc_layer did not apply a transaction. Cancel only an unpublished commit;
          * an older submission still requires its actual release callback. */
