@@ -102,7 +102,7 @@ static VkResult mock_WaitForFences(VkDevice device, uint32_t count, const VkFenc
     return f->state ? VK_SUCCESS : VK_TIMEOUT;
 }
 static VkResult mock_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *si, VkFence fence) {
-    if (mode == 54) return VK_ERROR_DEVICE_LOST;
+    if (mode == 54 || (mode == 66 && submits >= 7)) return VK_ERROR_DEVICE_LOST;
     struct mock_logical *d = (struct mock_logical *)queue;
     assert(count == 1 && !si->waitSemaphoreCount && si->commandBufferCount == 1 && ((mode >= 43 && si->pNext && si->signalSemaphoreCount == 1) || (!si->pNext && !si->signalSemaphoreCount)));
     struct mock_object *c = (struct mock_object *)si->pCommandBuffers[0], *f = (struct mock_object *)fence;

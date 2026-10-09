@@ -17,4 +17,11 @@ struct dd_interop_output {
 };
 typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckInteropTEST)(VkDevice, uint32_t,
     const struct dd_interop_input *, struct dd_interop_output *);
+/* Separate ABI: old checkpoint callers keep their original output size. */
+enum { DD_SESSION_BEGIN = 1, DD_SESSION_PRESENT, DD_SESSION_END, DD_SESSION_STATS };
+struct dd_session_output {
+    uint32_t token, counts[20], presented, released, fds_created, fds_closed, max_owned;
+};
+typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckSessionTEST)(VkDevice, uint32_t,
+    const struct dd_interop_input *, struct dd_session_output *);
 #endif

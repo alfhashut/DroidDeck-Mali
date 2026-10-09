@@ -62,7 +62,9 @@ static void native_drain_device(struct native_device *d) {
         }
 }
 static void native_close_device(struct native_device *d) {
+    if (d->session.cleanup_done) return;
     native_drain_device(d);
+    if (d->session.enabled) { (void)native_session_end(d); native_session_log(d, "before native device destruction"); }
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
         struct native_fence *f = &d->submit.fences[i];
         if (f->id) { d->submit.DestroyFence(d->handle, f->handle, NULL); LOG("fence destroyed device ID=%u fence ID=%u (cleanup)", d->id, f->id); }
@@ -79,8 +81,20 @@ static void native_close_device(struct native_device *d) {
     }
     native_renderer_close(d);
     native_interop_close(d);
+    if (d->session.release_timeouts) {
+        d->session.cleanup_done = 1;
+        ERROR("Android release wait TIMEOUT: safe child cleanup completed; buffer token=%u frame=%u remains ANDROID_OWNED; allocation/device/instance retained; no PASS", d->session.held, d->session.presented);
+        return;
+    }
     d->destroy(d->handle, NULL); LOG("vkDestroyDevice id=%u", d->id);
+    int accounted = d->session.enabled;
+    if (accounted) {
+        session_quiet = 0;
+        LOG("session exported FDs created=%u closed=%u Android held=%u after safe native cleanup", d->session.fds_created, d->session.fds_closed, d->session.held);
+    }
     memset(d, 0, sizeof(*d));
+    if (accounted) { session_quiet = 0; }
+    if (accounted) native_session_log(d, "after native device destruction: baseline");
 }
 static uint32_t native_submit_command(struct vk_session *s, uint32_t op, const uint8_t *wire,
         uint32_t bytes, uint8_t *reply, uint32_t *extra, uint32_t *count, VkResult *result) {

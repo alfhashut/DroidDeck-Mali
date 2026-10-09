@@ -28,6 +28,8 @@ INTEROP_FIND(ahb, ahbs)
 INTEROP_FIND(sync, syncs)
 #undef INTEROP_FIND
 static int interop_referenced(struct native_device *d, uint32_t id, int pending_only) {
+    for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
+        if (d->interop.ahbs[i].id && (d->interop.ahbs[i].id == d->session.held || d->interop.ahbs[i].id == d->session.pending) && (d->interop.ahbs[i].image == id || d->interop.ahbs[i].memory == id)) return 1;
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
         struct native_command *c = &d->submit.commands[i];
         if (!c->id || (pending_only && c->state != 3)) continue;
@@ -51,6 +53,7 @@ static void native_interop_complete(struct native_device *d, struct native_comma
     if (image) { image->layout = c->final_layout; image->foreign = c->image_foreign; }
 }
 static int native_interop_can_submit(struct native_device *d, struct native_command *c) {
+    if (d->session.release_timeouts) return 0;
     if (!d->interop.enabled) return 1;
     if (c->renderer) return native_renderer_can_submit(d, c);
     struct native_image *image = interop_find_image(d, c->image_id);
@@ -66,18 +69,21 @@ static int native_interop_can_submit(struct native_device *d, struct native_comm
 static void native_interop_close(struct native_device *d) {
     struct native_interop *v = &d->interop;
     if (!v->enabled) return;
-    /* Consumer RPC is synchronous through its release callback/fence, so no active consumer here. */
+    /* A timed-out session retains its exact Android-owned image/allocation/AHB.
+     * Everything else is safe after native_drain_device. */
+    struct native_ahb *held = interop_find_ahb(d, d->session.held);
+    struct native_ahb *pending = interop_find_ahb(d, d->session.pending);
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
-        if (v->syncs[i].id && v->syncs[i].fd >= 0) close(v->syncs[i].fd);
+        if (v->syncs[i].id && v->syncs[i].fd >= 0) { close(v->syncs[i].fd); if (d->session.enabled) ++d->session.fds_closed; }
         if (v->buffers[i].id) v->DestroyBuffer(d->handle, v->buffers[i].handle, NULL);
-        if (v->images[i].id) v->DestroyImage(d->handle, v->images[i].handle, NULL);
+        if (v->images[i].id && (!held || v->images[i].id != held->image) && (!pending || v->images[i].id != pending->image)) v->DestroyImage(d->handle, v->images[i].handle, NULL);
     }
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
-        if (v->memories[i].id) {
+        if (v->memories[i].id && (!held || v->memories[i].id != held->memory) && (!pending || v->memories[i].id != pending->memory)) {
             if (v->memories[i].map) v->UnmapMemory(d->handle, v->memories[i].handle);
             v->FreeMemory(d->handle, v->memories[i].handle, NULL);
         }
-        if (v->ahbs[i].id) AHardwareBuffer_release(v->ahbs[i].handle);
+        if (v->ahbs[i].id && &v->ahbs[i] != held && &v->ahbs[i] != pending) AHardwareBuffer_release(v->ahbs[i].handle);
     }
 }
 static int interop_range(uint64_t total, uint64_t offset, uint64_t size) {
@@ -95,7 +101,8 @@ static VkResult interop_wait_sync(struct native_device *d, struct native_sync *s
         if (n < 0 || !(p.revents & POLLIN) || (p.revents & (POLLERR | POLLNVAL))) return VK_ERROR_UNKNOWN;
     }
     sync->completed = 1; native_complete_fence(d, sync->fence);
-    LOG("SYNC_FD producer completed sync ID=%u; command resources now safe", sync->id); return VK_SUCCESS;
+    if (native_verbose(d)) LOG("SYNC_FD producer completed sync ID=%u; command resources now safe", sync->id);
+    return VK_SUCCESS;
 }
 static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const uint8_t *w,
         uint32_t bytes, uint8_t *reply, uint32_t *extra, uint32_t *count, VkResult *result) {
@@ -345,7 +352,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     }
     case MB_AHB_RELEASE: {
         struct native_ahb *a = interop_find_ahb(d, id);
-        if (!a || interop_find_image(d, a->image) || interop_find_memory(d, a->memory)) return MB_PROTOCOL_ERROR;
+        if (!a || d->session.held == a->id || d->session.pending == a->id || interop_find_image(d, a->image) || interop_find_memory(d, a->memory)) return MB_PROTOCOL_ERROR;
         AHardwareBuffer_release(a->handle); memset(a, 0, sizeof(*a)); break;
     }
     case MB_SYNC_FENCE_CREATE: {
@@ -370,7 +377,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         NEW_INTEROP(syncs, sync);
         VkFenceGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR, .fence = f->handle, .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
         int fd = -1; *result = v->fence_fd(d->handle, &info, &fd);
-        if (*result == VK_SUCCESS) { o->id = new_id; o->fence = f->id; o->fd = fd; f->exported = 1; }
+        if (*result == VK_SUCCESS) { o->id = new_id; o->fence = f->id; o->fd = fd; f->exported = 1; if (d->session.enabled && fd >= 0) ++d->session.fds_created; }
         else if (fd >= 0) { close(fd); }
         break;
     }
@@ -382,7 +389,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
             *result = interop_wait_sync(d, sync, ms);
         } else {
             if (!sync->completed) return MB_PROTOCOL_ERROR;
-            if (sync->fd >= 0) close(sync->fd);
+            if (sync->fd >= 0) { close(sync->fd); if (d->session.enabled) ++d->session.fds_closed; }
             memset(sync, 0, sizeof(*sync));
         } break;
     }

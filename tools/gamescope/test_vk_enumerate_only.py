@@ -30,7 +30,7 @@ class EnumerationTests(unittest.TestCase):
         shutil.copytree(source, cls.source, ignore=shutil.ignore_patterns(".git", "build", "builddir"))
         cls.patch_output = ""
         for patch in sorted((ROOT / "patches").glob("*.patch")):
-            if patch.name in ("0119-vulkan-blit-input-proof.patch", "0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch", "0115-vulkan-create-device-test.patch", "0116-vulkan-submit-test.patch", "0117-vulkan-memory-ahb-tests.patch", "0118-vulkan-gamescope-renderer-tests.patch"):
+            if patch.name in ("0120-mali-persistent-session.patch", "0119-vulkan-blit-input-proof.patch", "0113-vulkan-enumerate-only.patch", "0114-vulkan-capabilities.patch", "0115-vulkan-create-device-test.patch", "0116-vulkan-submit-test.patch", "0117-vulkan-memory-ahb-tests.patch", "0118-vulkan-gamescope-renderer-tests.patch"):
                 # Validate added source whitespace, excluding the patch's context prefixes.
                 subprocess.run(["git", "apply", "--check", "--whitespace=error", str(patch)],
                                cwd=cls.source, check=True, capture_output=True)
@@ -349,7 +349,7 @@ class EnumerationTests(unittest.TestCase):
         self.assertIn("'vulkan_enumerate_only.cpp'", (self.source / "src/meson.build").read_text())
         reverse = self.directory / "reverse-check"
         shutil.copytree(self.source, reverse)
-        for name in ("0119-vulkan-blit-input-proof.patch", "0118-vulkan-gamescope-renderer-tests.patch", "0117-vulkan-memory-ahb-tests.patch", "0116-vulkan-submit-test.patch", "0115-vulkan-create-device-test.patch", "0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
+        for name in ("0120-mali-persistent-session.patch", "0119-vulkan-blit-input-proof.patch", "0118-vulkan-gamescope-renderer-tests.patch", "0117-vulkan-memory-ahb-tests.patch", "0116-vulkan-submit-test.patch", "0115-vulkan-create-device-test.patch", "0114-vulkan-capabilities.patch", "0113-vulkan-enumerate-only.patch"):
             subprocess.run(["patch", "-p1", "--batch", "--fuzz=0", "--reverse", "-i", str(ROOT / "patches" / name)],
                            cwd=reverse, check=True, capture_output=True)
 

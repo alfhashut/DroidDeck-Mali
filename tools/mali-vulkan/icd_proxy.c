@@ -19,7 +19,8 @@
 #endif
 
 #define EXPORT __attribute__((visibility("default")))
-#define LOG(...) do { fprintf(stderr, "MaliProxyICD: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
+static unsigned session_frames;
+#define LOG(...) do { if (session_frames >= 3) break; fprintf(stderr, "MaliProxyICD: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
 
 struct proxy_device {
     VK_LOADER_DATA loader;
@@ -34,6 +35,7 @@ struct proxy_instance {
     pthread_mutex_t lock;
     uint32_t count;
     uint32_t wire_version;
+    VkResult device_destroy_result;
     struct proxy_logical *logical;
     struct proxy_device devices[MB_MAX_DEVICES];
 };
@@ -43,7 +45,7 @@ _Static_assert(offsetof(struct proxy_device, loader) == 0, "physical-device disp
 /* A connection owns the remote instance; IDs only have meaning on that connection. */
 static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *request,
                     uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
-    int teardown = s->wire_version >= MB_SUBMIT_VERSION && (op == MB_DEVICE_DESTROY || op == MB_DESTROY || op == MB_AHB_PRESENT);
+    int teardown = s->wire_version >= MB_SUBMIT_VERSION && (op == MB_DEVICE_DESTROY || op == MB_DESTROY || op == MB_AHB_PRESENT || op == MB_SESSION_PRESENT || op == MB_SESSION_END);
     /* Await safe GPU teardown or consumer release acknowledgement, even after a finite producer timeout. */
     if (teardown) {
         struct timeval no_timeout = {0};
@@ -64,6 +66,7 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
     }
     *reply_bytes = bytes;
     if (mb_get_u32(reply) == MB_OK && mb_get_u32(reply + 4) == VK_SUCCESS) return VK_SUCCESS;
+    session_frames = 0;
     LOG("broker opcode=%u status=%u VkResult bits=0x%x", op, mb_get_u32(reply), mb_get_u32(reply + 4));
     /* Preserve the native submission result, including statuses and device loss. */
     if (s->wire_version >= MB_SUBMIT_VERSION &&
@@ -85,6 +88,7 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
     if (result == (uint32_t)VK_ERROR_FEATURE_NOT_PRESENT) return VK_ERROR_FEATURE_NOT_PRESENT;
     return VK_ERROR_INITIALIZATION_FAILED;
 broken:
+    session_frames = 0;
     LOG("socket/protocol failure on opcode=%u: %s", op, strerror(errno));
     /* Prevent a partial/bad stream from being reused; disconnect cleans up remotely. */
     shutdown(s->fd, SHUT_RDWR);
@@ -218,6 +222,12 @@ static VkResult cache_devices(struct proxy_instance *s) {
 
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_EnumeratePhysicalDevices(VkInstance instance,
         uint32_t *count, VkPhysicalDevice *devices) {
+    if (instance && ((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {
+        const char *session = getenv("MALI_VULKAN_SESSION_TEST");
+        if (session && !strcmp(session, "1") && ((struct proxy_instance *)instance)->device_destroy_result != VK_SUCCESS)
+            return ((struct proxy_instance *)instance)->device_destroy_result;
+    }
+
     if (!instance || !count) return VK_ERROR_INITIALIZATION_FAILED;
     struct proxy_instance *s = (struct proxy_instance *)instance;
     pthread_mutex_lock(&s->lock);
@@ -337,6 +347,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
 #include "interop_entries.def"
 #undef MB_INTEROP_ENTRY
         if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
+        if (!strcmp(name, "vkDroidDeckSessionTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckSessionTEST;
     }
     if (((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {
 #define MB_RENDERER_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;

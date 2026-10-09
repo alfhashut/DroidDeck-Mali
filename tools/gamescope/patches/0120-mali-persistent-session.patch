@@ -1,0 +1,798 @@
+--- a/src/Backends/HeadlessBackend.cpp
++++ b/src/Backends/HeadlessBackend.cpp
+@@ -2,6 +2,7 @@
+ #include "rendervulkan.hpp"
+ #include "wlserver.hpp"
+ #include "refresh_rate.h"
++#include "vulkan_renderer_test.hpp"
+ 
+ extern int g_nPreferredOutputWidth;
+ extern int g_nPreferredOutputHeight;
+@@ -87,7 +88,7 @@
+ 
+ 		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override
+ 		{
+-            return 0;
++            return mali_session_active() ? mali_session_present(pFrameInfo) : 0;
+ 		}
+ 
+     private:
+@@ -107,6 +108,11 @@
+ 
+ 		virtual bool Init() override
+ 		{
++            if (mali_session_active()) {
++                g_nOutputWidth = g_nOutputHeight = 256;
++                g_nOutputRefresh = 30000;
++                return true; // session entry initialized the exact checkpoint-5 renderer
++            }
+ 			g_nOutputWidth = g_nPreferredOutputWidth;
+ 			g_nOutputHeight = g_nPreferredOutputHeight;
+ 			g_nOutputRefresh = g_nNestedRefresh;
+--- a/src/interop_test_api.h
++++ b/src/interop_test_api.h
+@@ -17,4 +17,11 @@
+ };
+ typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckInteropTEST)(VkDevice, uint32_t,
+     const struct dd_interop_input *, struct dd_interop_output *);
++/* Separate ABI: old checkpoint callers keep their original output size. */
++enum { DD_SESSION_BEGIN = 1, DD_SESSION_PRESENT, DD_SESSION_END, DD_SESSION_STATS };
++struct dd_session_output {
++    uint32_t token, counts[20], presented, released, fds_created, fds_closed, max_owned;
++};
++typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckSessionTEST)(VkDevice, uint32_t,
++    const struct dd_interop_input *, struct dd_session_output *);
+ #endif
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -68,6 +68,8 @@
+ 	{ "version", no_argument, nullptr, 0 },
+ 	{ "vk-enumerate-only", no_argument, nullptr, 0 },
+ 	{ "vk-capabilities", no_argument, nullptr, 0 },
++	{ "mali-session-test", no_argument, nullptr, 0 },
++	{ "mali-wayland-client-test", no_argument, nullptr, 0 },
+ 	{ "vk-gamescope-renderer-init-test", no_argument, nullptr, 0 },
+ 	{ "vk-gamescope-first-frame-test", no_argument, nullptr, 0 },
+ 	{ "vk-create-device-test", no_argument, nullptr, 0 },
+@@ -191,6 +193,8 @@
+ 	"  --vk-ahb-test    real AHardwareBuffer import and sync; independent diagnostic\n"
+ 	"  --vk-ahb-present-test    display actual Vulkan AHardwareBuffer; independent diagnostic\n"
+ 	"  --vk-submit-test               execute one event command and verify fence completion; no rendering\n"
++	"  --mali-session-test       persistent Mali Gamescope backend diagnostic\n"
++	"  --mali-wayland-client-test  persistent Mali backend with real SHM Wayland client\n"
+ 	"  --vk-gamescope-renderer-init-test  initialize the real Gamescope Mali BLIT renderer; no backend\n"
+ 	"  --vk-gamescope-first-frame-test    render and present a real Gamescope Mali BLIT frame through AHB\n"
+ 	"  --vk-create-device-test       create/destroy a real Vulkan device and obtain a queue; no rendering\n"
+@@ -743,6 +747,9 @@
+ 	// The standalone diagnostic exits before any normal startup, including scripts/X11.
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-enumerate-only" ) == 0 )
+ 		return vulkan_enumerate_only();
++    if (argc == 2 && !strcmp(argv[1], "--mali-session-test")) return vulkan_mali_session_test(false);
++    if (argc == 2 && !strcmp(argv[1], "--mali-wayland-client-test")) return vulkan_mali_session_test(true);
++    if (argc == 4 && !strcmp(argv[1], "--mali-shm-client")) return mali_wayland_client_main(argv[2], std::strtoul(argv[3], nullptr, 10));
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-gamescope-renderer-init-test" ) == 0 ) return vulkan_gamescope_renderer_test(false);
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-gamescope-first-frame-test" ) == 0 ) return vulkan_gamescope_renderer_test(true);
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-buffer-memory-test" ) == 0 )
+@@ -837,7 +844,11 @@
+ 					return 0;
+ 				} else if (strcmp(opt_name, "vk-enumerate-only") == 0) {
+ 					return vulkan_enumerate_only();
+-				} else if (strcmp(opt_name, "vk-gamescope-renderer-init-test") == 0) {
++				} else if (strcmp(opt_name, "mali-session-test") == 0) {
++                    return vulkan_mali_session_test(false);
++                } else if (strcmp(opt_name, "mali-wayland-client-test") == 0) {
++                    return vulkan_mali_session_test(true);
++                } else if (strcmp(opt_name, "vk-gamescope-renderer-init-test") == 0) {
+                     return vulkan_gamescope_renderer_test(false);
+                 } else if (strcmp(opt_name, "vk-gamescope-first-frame-test") == 0) {
+                     return vulkan_gamescope_renderer_test(true);
+--- a/src/mali_output_pool.hpp
++++ b/src/mali_output_pool.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++#include <array>
++/* Diagnostic ownership is separate from Vulkan layout/queue ownership. A GPU
++ * fence alone cannot move Android -> Free: only the consumer release RPC can. */
++class MaliOutputPool {
++public:
++    enum State { Free, Rendering, Ready, Android };
++    int acquire(unsigned start) {
++        for (unsigned n = 0; n < states.size(); ++n) {
++            unsigned i = (start + n) % states.size();
++            if (states[i] == Free) { states[i] = Rendering; return int(i); }
++        }
++        return -1; // backpressure: caller must not record work without a slot
++    }
++    bool ready(unsigned i) { return transition(i, Rendering, Ready); }
++    bool presented(unsigned i) { return transition(i, Ready, Android); }
++    bool released(unsigned i) { return transition(i, Android, Free); }
++    bool free(unsigned i) const { return i < states.size() && states[i] == Free; }
++    bool androidOwned(unsigned i) const { return i < states.size() && states[i] == Android; }
++private:
++    bool transition(unsigned i, State from, State to) {
++        if (i >= states.size() || states[i] != from) return false;
++        states[i] = to; return true;
++    }
++    std::array<State, 3> states{};
++};
+--- a/src/mali_session.inc
++++ b/src/mali_session.inc
+@@ -0,0 +1,258 @@
++/* Compiled inside the actual renderer TU; no replacement renderer or shader. */
++#include "mali_session_wayland.hpp"
++#include "backends.h"
++#include "mali_output_pool.hpp"
++#include <chrono>
++#include <thread>
++#include <csignal>
++
++namespace {
++struct MaliSession {
++    struct Slot { dd_interop_output ahb{}; gamescope::OwningRc<CVulkanTexture> texture; unsigned lastFrame = 0; } slots[3];
++    MaliOutputPool ownership;
++    PFN_vkDroidDeckInteropTEST interop = nullptr;
++    PFN_vkDroidDeckSessionTEST transport = nullptr;
++    VkBuffer readback = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    bool coherent = false, wayland = false;
++    bool consumerBegun = false, stopAttempted = false;
++    unsigned releaseTimeouts = 0;
++    unsigned maxOwned = 0;
++    unsigned frame = 0, limit = 300, rendered = 0, presented = 0, released = 0, verified = 0, late = 0;
++    uint64_t start = 0, last = 0;
++};
++static MaliSession *s_session;
++static volatile sig_atomic_t s_sessionStop;
++static void MaliStop(int) { s_sessionStop = 1; }
++static void MaliRequire(bool ok, const char *operation) {
++    if (!ok) g_device.FailMaliDiagnostic(operation, s_maliLastResult == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : s_maliLastResult);
++}
++static dd_interop_output MaliInterop(uint32_t op, dd_interop_input input = {}) {
++    dd_interop_output out{};
++    MaliRequire(MaliResult(s_session->interop(g_device.device(), op, &input, &out), "session interop"), "session interop"); return out;
++}
++static dd_session_output MaliTransport(uint32_t op, dd_interop_input input = {}) {
++    dd_session_output out{};
++    MaliRequire(MaliResult(s_session->transport(g_device.device(), op, &input, &out), "persistent consumer RPC"), "persistent consumer RPC"); return out;
++}
++static void MaliReleased(uint32_t token) {
++    if (!token) return;
++    for (auto &slot : s_session->slots) if (slot.ahb.token == token) {
++        MaliRequire(s_session->ownership.released(&slot - s_session->slots), "unexpected Android release token"); ++s_session->released; return;
++    }
++    MaliRequire(false, "Android release token outside output pool");
++}
++static VkResult MaliStopOutput() {
++    auto &s = *s_session;
++    if (!s.consumerBegun || s.stopAttempted) return s.releaseTimeouts ? VK_TIMEOUT : VK_SUCCESS;
++    s.stopAttempted = true; // never submit another frame or restart the wait
++    unsigned outstanding = 0;
++    for (unsigned i = 0; i < 3; ++i) outstanding += s.ownership.androidOwned(i);
++    dd_interop_input input{}; dd_session_output output{};
++    VkResult result = s.transport(g_device.device(), DD_SESSION_END, &input, &output);
++    if (result == VK_SUCCESS) MaliReleased(output.token);
++    if (result == VK_TIMEOUT) {
++        ++s.releaseTimeouts;
++        for (unsigned i = 0; i < 3; ++i) if (s.ownership.androidOwned(i))
++            std::fprintf(stderr, "Android release wait TIMEOUT: buffer token=%u frame=%u state=ANDROID_OWNED outstanding releases=%u presented=%u released=%u; native broker logs contain last sync token/fence state\n",
++                s.slots[i].ahb.token, s.slots[i].lastFrame, outstanding, s.presented, s.released);
++    }
++    std::printf("Android release wait: outstanding at stop=%u released=%u timed out=%u; release timeouts=%u VkResult=%d\n",
++        outstanding, result == VK_SUCCESS && output.token ? 1u : 0u, result == VK_TIMEOUT ? outstanding : 0u, s.releaseTimeouts, int(result));
++    return result;
++}
++static void MaliExpected(unsigned frame, bool client, unsigned x, unsigned y, uint8_t p[4]) {
++    p[0] = p[1] = p[2] = 0; p[3] = 255;
++    unsigned left = client ? (frame * 3) % 193 : 16 + (frame * 3) % 97;
++    unsigned top = client ? (frame * 5) % 193 : 64;
++    unsigned side = client ? 64 : 128;
++    if (x < left || y < top || x >= left + side || y >= top + side) return;
++    if (client) {
++        unsigned color = (frame / 30) % 4;
++        if (color < 3) p[color] = 255; else p[0] = p[1] = p[2] = 255;
++    } else if (y < top + 64) p[x < left + 64 ? 0 : 1] = 255;
++    else if (x < left + 64) p[2] = 255; else p[0] = p[1] = p[2] = 255;
++}
++static void MaliVerify() {
++    void *mapped = nullptr;
++    MaliRequire(MaliResult(g_device.vk.MapMemory(g_device.device(), s_session->memory, 0, VK_WHOLE_SIZE, 0, &mapped), "selected-frame readback map"), "selected-frame readback map");
++    if (!s_session->coherent) {
++        auto invalidate = (PFN_vkInvalidateMappedMemoryRanges)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkInvalidateMappedMemoryRanges");
++        VkMappedMemoryRange range{ .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = s_session->memory, .size = VK_WHOLE_SIZE };
++        MaliRequire(invalidate && MaliResult(invalidate(g_device.device(), 1, &range), "selected-frame invalidate"), "selected-frame invalidate");
++    }
++    unsigned bad = 0; uint64_t hash = 14695981039346656037ull;
++    for (unsigned y = 0; y < 256; ++y) for (unsigned x = 0; x < 256; ++x) {
++        uint8_t expected[4]; MaliExpected(s_session->frame, s_session->wayland, x, y, expected);
++        auto pixel = static_cast<const uint8_t *>(mapped) + (y * 256 + x) * 4;
++        bad += std::memcmp(pixel, expected, 4) != 0;
++        for (unsigned k = 0; k < 4; ++k) hash = (hash ^ pixel[k]) * 1099511628211ull;
++    }
++    g_device.vk.UnmapMemory(g_device.device(), s_session->memory);
++    std::printf("selected frame=%u actual AHB GPU readback mismatches=%u hash=%llu\n", s_session->frame, bad, (unsigned long long)hash);
++    MaliRequire(!bad, "changing-frame GPU pixel verification"); ++s_session->verified;
++}
++static void MaliCheckCleanup() {
++    auto stats = MaliTransport(DD_SESSION_STATS);
++    MaliRequire(stats.presented == s_session->presented && stats.released == s_session->released && stats.presented == stats.released, "native presentation/release accounting");
++    s_session->maxOwned = stats.max_owned;
++    MaliRequire(stats.max_owned == (stats.presented > 1 ? 2u : stats.presented), "peak Android output ownership accounting");
++    MaliRequire(stats.fds_created == stats.fds_closed, "exported sync FD accounting");
++    for (unsigned i = 2; i < 20; ++i) MaliRequire(stats.counts[i] == 0, "native diagnostic child count did not return to baseline");
++    MaliRequire(stats.counts[0] == 1 && stats.counts[1] == 1, "native device/queue accounting");
++    std::printf("session child counts returned to baseline; device=1 queue=1 pending=0 AHB=0 sync=0 FDs=0 exports=%u closes=%u (device/queue destroyed next)\n", stats.fds_created, stats.fds_closed);
++}
++}
++bool mali_session_active() { return s_session != nullptr; }
++bool mali_session_verbose() { return !s_session || s_session->frame <= 3; }
++int mali_session_present(const FrameInfo_t *frame) {
++    auto &s = *s_session;
++    MaliRequire(!s.stopAttempted, "frame submitted after output stop");
++    const int index = s.ownership.acquire(s.frame - 1);
++    MaliRequire(index >= 0, "output pool exhausted without an Android release");
++    auto slot = &s.slots[index];
++    slot->lastFrame = s.frame;
++    const bool verify = s.frame == 1 || s.frame == 30 || s.frame == 60 || s.frame == s.limit;
++    auto producer = MaliInterop(DD_FENCE_CREATE);
++    g_device.m_maliProducerFence = producer.fence;
++    g_device.m_maliReadbackBuffer = verify ? s.readback : VK_NULL_HANDLE;
++    FrameInfo_t mutableFrame = *frame;
++    auto sequence = vulkan_composite(&mutableFrame, nullptr, false, slot->texture.get(), false, nullptr);
++    MaliRequire(sequence.has_value(), "persistent Gamescope vulkan_composite");
++    g_device.wait(*sequence, false);
++    g_device.m_maliProducerFence = VK_NULL_HANDLE; g_device.m_maliReadbackBuffer = VK_NULL_HANDLE;
++    MaliRequire(*sequence > s.last && g_device.completedSeqNo() >= *sequence, "monotonic native KHR timeline");
++    s.last = *sequence; ++s.rendered;
++    dd_interop_input input{}; input.fence = producer.fence;
++    auto sync = MaliInterop(DD_SYNC_EXPORT, input); input = {}; input.sync = sync.sync;
++    MaliInterop(DD_SYNC_WAIT, input);
++    if (verify) MaliVerify();
++    MaliRequire(s.ownership.ready(index), "output Rendering -> Ready transition");
++    input.token = slot->ahb.token;
++    auto result = MaliTransport(DD_SESSION_PRESENT, input);
++    MaliReleased(result.token); MaliRequire(s.ownership.presented(index), "output Ready -> Android transition"); ++s.presented;
++    g_device.wait(*sequence, true); // retire only after native handoff validated identity
++    input = {}; input.sync = sync.sync; MaliInterop(DD_SYNC_CLOSE, input);
++    auto destroyFence = (PFN_vkDestroyFence)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDestroyFence");
++    destroyFence(g_device.device(), producer.fence, nullptr);
++    if (s.frame <= 3 || s.frame % 30 == 0 || s.frame == s.limit)
++        std::printf("frame=%u timeline render value=%llu output buffer token=%u producer fence exported; Android acquired; Android released token=%u\n", s.frame, (unsigned long long)*sequence, slot->ahb.token, result.token);
++    return 0;
++}
++int vulkan_mali_session_test(bool wayland) {
++    std::setvbuf(stdout, nullptr, _IOLBF, 0);
++    MaliSession session{}; session.wayland = wayland; session.limit = wayland ? 150 : 300;
++    // Bounded override for automated transport tests, never set by the Android UI.
++    if (const char *value = getenv("MALI_SESSION_FRAMES")) {
++        char *end = nullptr; unsigned long count = std::strtoul(value, &end, 10);
++        if (!*value || *end || count < 3 || count > 3000) { std::fprintf(stderr, "invalid MALI_SESSION_FRAMES\n"); return 1; }
++        session.limit = count;
++    }
++    setenv("MALI_VULKAN_SESSION_TEST", "1", 1);
++    std::puts(wayland ? "Gamescope persistent Wayland client diagnostic" : "Gamescope persistent backend diagnostic");
++    if (!MaliInitializeRenderer(true)) return 1;
++    s_session = &session; s_sessionStop = 0;
++    auto previousTerm = std::signal(SIGTERM, MaliStop), previousInt = std::signal(SIGINT, MaliStop);
++    s_maliSessionFailureCleanup = [] {
++        s_maliSessionFailureCleanup = nullptr;
++        mali_wayland_stop(false); gamescope::IBackend::Set(nullptr);
++        (void)MaliStopOutput();
++        if (s_session->releaseTimeouts) {
++            // The broker performs safe child cleanup and quarantines the exact
++            // unreleased allocation/parents. No local texture destructors or
++            // false device-destroy acknowledgement may authorize reuse.
++            auto destroy = (PFN_vkDestroyDevice)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDestroyDevice");
++            if (destroy) destroy(g_device.device(), nullptr);
++            auto destroyInstance = (PFN_vkDestroyInstance)g_pfn_vkGetInstanceProcAddr(g_device.instance(), "vkDestroyInstance");
++            if (destroyInstance) destroyInstance(g_device.instance(), nullptr);
++            std::fprintf(stderr, "persistent Gamescope session FAILED: Android release wait VkResult=%d release timeouts=%u; safe cleanup requested; Android-owned buffers retained; no PASS; exit=1\n", int(VK_TIMEOUT), s_session->releaseTimeouts);
++            std::fflush(nullptr); _Exit(1);
++        }
++    };
++    session.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
++    session.transport = (PFN_vkDroidDeckSessionTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckSessionTEST");
++    MaliRequire(session.interop && session.transport, "session transport lookup");
++    MaliRequire(gamescope::IBackend::Set<gamescope::CHeadlessBackend>(), "existing Gamescope headless backend Init");
++    MaliRequire(GetBackend()->PostInit(), "headless backend PostInit");
++    std::puts("backend=existing Gamescope HeadlessBackend; connector Present -> real vulkan_composite -> BLIT -> AHB pool");
++    MaliTransport(DD_SESSION_BEGIN);
++    session.consumerBegun = true;
++    for (auto &slot : session.slots) {
++        dd_interop_input input{}; input.width = input.height = 256;
++        slot.ahb = MaliInterop(DD_AHB_CREATE, input); slot.texture = new CVulkanTexture();
++        MaliRequire(slot.texture->BInitMaliAHB(slot.ahb.image, 256, 256), "AHB output pool view");
++    }
++    VkBufferCreateInfo ci{ .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256u * 256u * 4u, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
++    MaliRequire(MaliResult(g_device.vk.CreateBuffer(g_device.device(), &ci, nullptr, &session.readback), "selected readback buffer"), "selected readback buffer");
++    VkMemoryRequirements requirements{}; g_device.vk.GetBufferMemoryRequirements(g_device.device(), session.readback, &requirements);
++    uint32_t type = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, requirements.memoryTypeBits);
++    session.coherent = type != ~0u;
++    if (!session.coherent) type = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, requirements.memoryTypeBits);
++    MaliRequire(type != ~0u, "selected readback memory type");
++    VkMemoryAllocateInfo ai{ .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = requirements.size, .memoryTypeIndex = type };
++    MaliRequire(MaliResult(g_device.vk.AllocateMemory(g_device.device(), &ai, nullptr, &session.memory), "selected readback allocation"), "selected readback allocation");
++    MaliRequire(MaliResult(g_device.vk.BindBufferMemory(g_device.device(), session.readback, session.memory, 0), "selected readback binding"), "selected readback binding");
++    currentOutputWidth = currentOutputHeight = 256;
++    gamescope::OwningRc<CVulkanTexture> source;
++    if (wayland) MaliRequire(mali_wayland_start(session.limit), "real Gamescope Wayland server/client startup");
++    else {
++        std::vector<uint8_t> bits(256u * 256u * 4u);
++        for (unsigned y = 0; y < 256; ++y) for (unsigned x = 0; x < 256; ++x) {
++            auto pixel = bits.data() + (y * 256 + x) * 4; pixel[3] = 255;
++            if (y < 128) pixel[x < 128 ? 0 : 1] = 255;
++            else if (x < 128) pixel[2] = 255; else pixel[0] = pixel[1] = pixel[2] = 255;
++        }
++        source = vulkan_create_texture_from_bits(256, 256, 256, 256, DRM_FORMAT_ABGR8888, {}, bits.data());
++        MaliRequire(source != nullptr, "persistent Gamescope input upload");
++    }
++    session.start = session.last = g_device.completedSeqNo();
++    auto begin = std::chrono::steady_clock::now(), deadline = begin;
++    for (session.frame = 1; session.frame <= session.limit && !s_sessionStop; ++session.frame) {
++        if (wayland) { source = mali_wayland_next(); MaliRequire(source != nullptr, "Wayland surface commit/texture import"); }
++        FrameInfo_t frame{}; frame.applyOutputColorMgmt = false; frame.outputEncodingEOTF = EOTF_Gamma22;
++        auto layer = frame.layers.push(); layer->tex = source.get();
++        layer->scale = wayland ? vec2_t{1, 1} : vec2_t{2, 2};
++        layer->offset = wayland ? vec2_t{0, 0} : vec2_t{-float(16 + (session.frame * 3) % 97), -64};
++        layer->opacity = 1; layer->filter = GamescopeUpscaleFilter::NEAREST; layer->blackBorder = true;
++        layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU; layer->applyColorMgmt = false;
++        MaliRequire(GetBackend()->GetCurrentConnector()->Present(&frame, false) == 0, "headless connector Present");
++        layer->tex = nullptr; frame.layers.truncate(0);
++        if (wayland) source = nullptr;
++        deadline += std::chrono::microseconds(33333);
++        auto now = std::chrono::steady_clock::now();
++        if (now > deadline) { ++session.late; deadline = now; }
++        else std::this_thread::sleep_until(deadline);
++        if (wayland) mali_wayland_frame_done();
++    }
++    const bool stopped = s_sessionStop;
++    MaliRequire(mali_wayland_stop(!stopped), "Wayland client disconnect/callback/buffer-release cleanup");
++    MaliRequire(MaliResult(MaliStopOutput(), "Android release wait at session stop"), "Android release wait at session stop");
++    MaliRequire(session.releaseTimeouts == 0, "Android release timeouts must be zero for PASS");
++    source = nullptr;
++    for (auto &slot : session.slots) {
++        MaliRequire(session.ownership.free(&slot - session.slots), "Android still owns output at teardown"); slot.texture = nullptr;
++        g_device.vk.DestroyImage(g_device.device(), slot.ahb.image, nullptr); g_device.vk.FreeMemory(g_device.device(), slot.ahb.memory, nullptr);
++        dd_interop_input input{}; input.token = slot.ahb.token; MaliInterop(DD_AHB_RELEASE, input);
++    }
++    g_device.vk.DestroyBuffer(g_device.device(), session.readback, nullptr); g_device.vk.FreeMemory(g_device.device(), session.memory, nullptr);
++    gamescope::IBackend::Set(nullptr);
++    s_maliSessionCheckCleanup = MaliCheckCleanup;
++    s_maliSessionCheckDestroyed = [] {
++        // The proxy retains a failed destroy acknowledgement for this opt-in
++        // session. Enumerating the still-live instance reports that exact error.
++        uint32_t count = 0;
++        MaliRequire(MaliResult(g_device.vk.EnumeratePhysicalDevices(g_device.instance(), &count, nullptr), "native device destroy acknowledgement"), "native device destroy acknowledgement");
++        MaliRequire(count != 0, "physical inventory after diagnostic device destruction");
++        std::puts("native device/implicit queue destruction acknowledged; diagnostic counts returned to zero baseline");
++    };
++    g_device.ShutdownMaliDiagnostic();
++    s_maliSessionCheckCleanup = nullptr; s_maliSessionCheckDestroyed = nullptr; s_maliSessionFailureCleanup = nullptr;
++    s_session = nullptr; std::signal(SIGTERM, previousTerm); std::signal(SIGINT, previousInt);
++    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
++    std::printf("frames rendered=%u presented=%u released=%u dropped=0 late=%u pool=3 max Android-owned=%u timeline start=%llu end=%llu selected verified=%u seconds=%.3f FPS=%.2f buffer reuse violations=0 sync leaks=0\n",
++        session.rendered, session.presented, session.released, session.late, session.maxOwned, (unsigned long long)session.start, (unsigned long long)session.last, session.verified, seconds, session.presented / seconds);
++    std::printf("final session accounting: release timeouts=%u\n", session.releaseTimeouts);
++    if (stopped) { std::puts("persistent Gamescope session STOPPED by user; clean teardown; exit=1"); return 1; }
++    std::puts(wayland ? "persistent Gamescope Wayland client PASS; clean teardown; exit=0" : "persistent Gamescope session PASS; clean teardown; exit=0");
++    return 0;
++}
+--- a/src/mali_session_wayland.cpp
++++ b/src/mali_session_wayland.cpp
+@@ -0,0 +1,211 @@
++/* Diagnostic integration with the same wlroots compositor, Vulkan wlr_texture
++ * adapter and SHM upload routine used by Gamescope's normal wlserver. */
++#include "mali_session_wayland.hpp"
++#include "vulkan_renderer_test.hpp"
++#include "wlr_begin.hpp"
++#include <wlr/types/wlr_compositor.h>
++#include <wlr/types/wlr_buffer.h>
++#include "wlr_end.hpp"
++#include <wayland-client.h>
++#include <poll.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <csignal>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <cerrno>
++#include <string>
++
++namespace {
++struct Server {
++    wl_display *display = nullptr;
++    wlr_renderer *renderer = nullptr;
++    wlr_surface *surface = nullptr;
++    wl_listener created{}, committed{}, destroyed{};
++    pid_t client = -1;
++    unsigned commits = 0, presented = 0;
++    bool pending = false, removed = false, error = false;
++} server;
++static void SurfaceCommit(wl_listener *, void *) {
++    if (!wlr_surface_has_buffer(server.surface)) return; // final detach releases SHM
++    if (server.pending) { server.error = true; return; }
++    server.pending = true; ++server.commits;
++}
++static void SurfaceDestroy(wl_listener *, void *) {
++    wl_list_remove(&server.committed.link); wl_list_remove(&server.destroyed.link);
++    server.surface = nullptr; server.removed = true;
++}
++static void NewSurface(wl_listener *, void *data) {
++    if (server.surface || server.removed) { server.error = true; return; }
++    server.surface = static_cast<wlr_surface *>(data);
++    server.committed.notify = SurfaceCommit; server.destroyed.notify = SurfaceDestroy;
++    wl_signal_add(&server.surface->events.commit, &server.committed);
++    wl_signal_add(&server.surface->events.destroy, &server.destroyed);
++}
++static bool ServerDispatch(int milliseconds) {
++    if (wl_event_loop_dispatch(wl_display_get_event_loop(server.display), milliseconds) < 0) {
++        std::fprintf(stderr, "Wayland server dispatch errno=%d (%s)\n", errno, strerror(errno)); return false;
++    }
++    wl_display_flush_clients(server.display); return !server.error;
++}
++struct Client {
++    wl_display *display = nullptr;
++    wl_compositor *compositor = nullptr;
++    wl_shm *shm = nullptr;
++    wl_surface *surface = nullptr;
++    wl_callback *callback = nullptr;
++    struct Buffer { wl_buffer *buffer = nullptr; bool busy = false; Client *client = nullptr; } buffers[2];
++    unsigned callbacks = 0, releases = 0, commits = 0;
++    bool ready = true;
++};
++static void RegistryGlobal(void *data, wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
++    auto c = static_cast<Client *>(data);
++    if (!strcmp(interface, "wl_compositor")) c->compositor = static_cast<wl_compositor *>(wl_registry_bind(registry, name, &wl_compositor_interface, version < 4 ? version : 4));
++    if (!strcmp(interface, "wl_shm")) c->shm = static_cast<wl_shm *>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
++}
++static void RegistryRemove(void *, wl_registry *, uint32_t) {}
++static const wl_registry_listener registryListener{RegistryGlobal, RegistryRemove};
++static void BufferRelease(void *data, wl_buffer *) {
++    auto b = static_cast<Client::Buffer *>(data);
++    if (!b->busy) { std::fprintf(stderr, "Wayland duplicate buffer release\n"); b->client->ready = false; return; }
++    b->busy = false; ++b->client->releases;
++}
++static const wl_buffer_listener bufferListener{BufferRelease};
++static void CallbackDone(void *data, wl_callback *callback, uint32_t) {
++    auto c = static_cast<Client *>(data); wl_callback_destroy(callback); c->callback = nullptr;
++    ++c->callbacks; c->ready = true;
++}
++static const wl_callback_listener callbackListener{CallbackDone};
++static bool ClientDispatch(Client &c) {
++    while (wl_display_prepare_read(c.display) != 0) if (wl_display_dispatch_pending(c.display) < 0) return false;
++    if (wl_display_flush(c.display) < 0 && errno != EAGAIN) { wl_display_cancel_read(c.display); return false; }
++    pollfd p{wl_display_get_fd(c.display), POLLIN, 0};
++    int n; do { n = poll(&p, 1, 5000); } while (n < 0 && errno == EINTR);
++    if (n <= 0 || !(p.revents & POLLIN)) { wl_display_cancel_read(c.display); errno = n == 0 ? ETIMEDOUT : EPIPE; return false; }
++    return wl_display_read_events(c.display) >= 0 && wl_display_dispatch_pending(c.display) >= 0;
++}
++}
++
++bool mali_wayland_start(unsigned frames) {
++    if (server.display) return false;
++    server = {};
++    server.display = wl_display_create();
++    server.renderer = vulkan_renderer_create();
++    if (!server.display || !server.renderer || !wlr_renderer_init_wl_display(server.renderer, server.display)) return false;
++    auto compositor = wlr_compositor_create(server.display, 5, server.renderer);
++    if (!compositor) return false;
++    server.created.notify = NewSurface; wl_signal_add(&compositor->events.new_surface, &server.created);
++    const std::string socket = "gamescope-mali-" + std::to_string(getpid());
++    if (wl_display_add_socket(server.display, socket.c_str()) < 0) { std::fprintf(stderr, "Wayland socket errno=%d (%s)\n", errno, strerror(errno)); return false; }
++    char executable[4096]; ssize_t size = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
++    if (size <= 0 || size >= ssize_t(sizeof(executable) - 1)) return false;
++    executable[size] = 0;
++    std::string count = std::to_string(frames);
++    server.client = fork();
++    if (server.client < 0) return false;
++    if (!server.client) {
++        execl(executable, executable, "--mali-shm-client", socket.c_str(), count.c_str(), (char *)nullptr);
++        std::fprintf(stderr, "Wayland client exec errno=%d (%s)\n", errno, strerror(errno)); _Exit(127);
++    }
++    std::printf("real Wayland socket=%s XDG_RUNTIME_DIR=%s client pid=%d; wl_compositor + wl_shm; two input buffers\n", socket.c_str(), getenv("XDG_RUNTIME_DIR"), int(server.client));
++    return true;
++}
++gamescope::OwningRc<CVulkanTexture> mali_wayland_next() {
++    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++    while (!server.pending && !server.removed && std::chrono::steady_clock::now() < deadline) {
++        if (!ServerDispatch(50)) return nullptr;
++    }
++    if (!server.pending || !server.surface || server.error) { std::fprintf(stderr, "Wayland commit failed: pending=%u surface removed=%u commits=%u\n", server.pending, server.removed, server.commits); return nullptr; }
++    auto texture = wlr_surface_get_texture(server.surface);
++    if (!texture) return nullptr;
++    auto wrapped = reinterpret_cast<VulkanWlrTexture_t *>(texture);
++    if (!wrapped->buf || wrapped->buf->width != 256 || wrapped->buf->height != 256) return nullptr;
++    // Actual committed wlr_buffer, never the client's private memory/FrameInfo.
++    return vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr);
++}
++void mali_wayland_frame_done() {
++    if (!server.surface || !server.pending) { server.error = true; return; }
++    timespec now{}; clock_gettime(CLOCK_MONOTONIC, &now);
++    wlr_surface_send_frame_done(server.surface, &now);
++    server.pending = false; ++server.presented;
++    wl_display_flush_clients(server.display);
++}
++bool mali_wayland_stop(bool success) {
++    if (!server.display) return true;
++    bool clean = success; int status = 0;
++    if (server.client > 0) {
++        if (!success) kill(server.client, SIGTERM);
++        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++        bool done = false;
++        while (std::chrono::steady_clock::now() < deadline) {
++            pid_t r = waitpid(server.client, &status, WNOHANG);
++            if (r == server.client) { done = true; break; }
++            if (r < 0 || !ServerDispatch(20)) break;
++        }
++        if (!done) { kill(server.client, SIGKILL); while (waitpid(server.client, &status, 0) < 0 && errno == EINTR) {} clean = false; }
++        clean &= WIFEXITED(status) && WEXITSTATUS(status) == 0 && !server.pending && server.removed && server.commits == server.presented;
++        std::printf("Wayland server commits=%u presented=%u pending=%u surface removed=%u client status=%d\n", server.commits, server.presented, server.pending, server.removed, status);
++    }
++    wl_display_destroy_clients(server.display);
++    if (server.created.link.next) wl_list_remove(&server.created.link);
++    wl_display_destroy(server.display);
++    wlr_renderer_destroy(server.renderer);
++    server = {};
++    return success ? clean : true;
++}
++int mali_wayland_client_main(const char *socket, unsigned frames) {
++    if (frames < 3 || frames > 3000) return 1;
++    Client c{}; c.display = wl_display_connect(socket);
++    if (!c.display) { std::fprintf(stderr, "Wayland connect errno=%d (%s)\n", errno, strerror(errno)); return 1; }
++    auto registry = wl_display_get_registry(c.display); wl_registry_add_listener(registry, &registryListener, &c);
++    bool ok = wl_display_roundtrip(c.display) >= 0 && c.compositor && c.shm;
++    constexpr size_t bytes = 256u * 256u * 4u;
++    int fd = memfd_create("gamescope-mali-shm", MFD_CLOEXEC);
++    void *memory = MAP_FAILED; wl_shm_pool *pool = nullptr;
++    if (ok && fd >= 0 && ftruncate(fd, bytes * 2) == 0) memory = mmap(nullptr, bytes * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    ok &= memory != MAP_FAILED;
++    if (ok) {
++        pool = wl_shm_create_pool(c.shm, fd, bytes * 2); c.surface = wl_compositor_create_surface(c.compositor);
++        for (unsigned i = 0; i < 2; ++i) {
++            auto &b = c.buffers[i]; b.client = &c;
++            b.buffer = wl_shm_pool_create_buffer(pool, i * bytes, 256, 256, 256 * 4, WL_SHM_FORMAT_ARGB8888);
++            wl_buffer_add_listener(b.buffer, &bufferListener, &b);
++        }
++        for (unsigned frame = 1; frame <= frames && ok; ++frame) {
++            auto &b = c.buffers[(frame - 1) % 2];
++            while (ok && (!c.ready || b.busy)) ok = ClientDispatch(c);
++            if (!ok) break;
++            auto pixels = static_cast<uint32_t *>(memory) + ((frame - 1) % 2) * 256 * 256;
++            for (unsigned i = 0; i < 256 * 256; ++i) pixels[i] = 0xff000000;
++            const uint32_t colors[] = {0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff};
++            unsigned left = (frame * 3) % 193, top = (frame * 5) % 193;
++            for (unsigned y = top; y < top + 64; ++y) for (unsigned x = left; x < left + 64; ++x) pixels[y * 256 + x] = colors[(frame / 30) % 4];
++            c.ready = false; b.busy = true;
++            c.callback = wl_surface_frame(c.surface); wl_callback_add_listener(c.callback, &callbackListener, &c);
++            wl_surface_attach(c.surface, b.buffer, 0, 0); wl_surface_damage(c.surface, 0, 0, 256, 256); wl_surface_commit(c.surface); ++c.commits;
++        }
++        while (ok && c.callback) ok = ClientDispatch(c);
++        // Null attach releases the last wlr_surface texture before SHM teardown.
++        wl_surface_attach(c.surface, nullptr, 0, 0); wl_surface_commit(c.surface);
++        ok &= wl_display_roundtrip(c.display) >= 0;
++        ok &= !c.callback && c.releases == c.commits && c.callbacks == c.commits && c.commits == frames;
++        wl_surface_destroy(c.surface);
++    }
++    if (!ok) {
++        const wl_interface *interface = nullptr; uint32_t id = 0;
++        uint32_t protocol = wl_display_get_protocol_error(c.display, &interface, &id);
++        std::fprintf(stderr, "Wayland client FAILED errno=%d display error=%d protocol error=%u interface=%s object=%u\n", errno, wl_display_get_error(c.display), protocol, interface ? interface->name : "none", id);
++    }
++    if (c.callback) wl_callback_destroy(c.callback);
++    for (auto &b : c.buffers) if (b.buffer) wl_buffer_destroy(b.buffer);
++    if (pool) wl_shm_pool_destroy(pool);
++    if (c.shm) wl_shm_destroy(c.shm);
++    if (c.compositor) wl_compositor_destroy(c.compositor);
++    wl_registry_destroy(registry); wl_display_flush(c.display); wl_display_disconnect(c.display);
++    if (memory != MAP_FAILED) munmap(memory, bytes * 2);
++    if (fd >= 0) close(fd);
++    std::printf("Wayland client commits=%u frame callbacks=%u wl_buffer releases=%u pending callback=%u double-buffer reuse violations=0 exit=%d\n", c.commits, c.callbacks, c.releases, c.callback != nullptr, ok ? 0 : 1);
++    return ok ? 0 : 1;
++}
+--- a/src/mali_session_wayland.hpp
++++ b/src/mali_session_wayland.hpp
+@@ -0,0 +1,6 @@
++#pragma once
++#include "rendervulkan.hpp"
++bool mali_wayland_start(unsigned frames);
++gamescope::OwningRc<CVulkanTexture> mali_wayland_next();
++void mali_wayland_frame_done();
++bool mali_wayland_stop(bool success);
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -119,6 +119,7 @@
+   'wlserver.cpp',
+   'vblankmanager.cpp',
+   'rendervulkan.cpp',
++  'mali_session_wayland.cpp',
+   'log.cpp',
+   'ime.cpp',
+   'mangoapp.cpp',
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -147,6 +147,9 @@
+ // Debug verbosity turns the timestamp queries on, so log_composite_timing debug is the switch.
+ static LogScope composite_timing_log("composite_timing");
+ 
++static void (*s_maliSessionFailureCleanup)() = nullptr;
++static void (*s_maliSessionCheckCleanup)() = nullptr;
++static void (*s_maliSessionCheckDestroyed)() = nullptr;
+ static VkResult s_maliLastResult = VK_SUCCESS;
+ static char s_maliLastOperation[1024]{};
+ static void vk_errorf(VkResult result, const char *fmt, ...) {
+@@ -1905,8 +1908,8 @@
+             targetDescriptors[0].imageView == m_device->MaliDummyStorage() || imageDescriptors[0].imageLayout != VK_IMAGE_LAYOUT_GENERAL ||
+             targetDescriptors[0].imageLayout != VK_IMAGE_LAYOUT_GENERAL)
+             m_device->FailMaliDiagnostic("BLIT real source/output descriptor identity", VK_ERROR_INITIALIZATION_FAILED);
+-        std::puts("BLIT descriptor identity verified: layer 0 source/sampler binding=3 array index=0; exact AHB storage binding=1 array index=0; source/output GENERAL; dummy fill preserved both");
+-        std::printf("Gamescope BLIT dispatch X/Y/Z=%u/%u/%u\n", x, y, z);
++        if (mali_session_verbose()) std::puts("BLIT descriptor identity verified: layer 0 source/sampler binding=3 array index=0; exact AHB storage binding=1 array index=0; source/output GENERAL; dummy fill preserved both");
++        if (mali_session_verbose()) std::printf("Gamescope BLIT dispatch X/Y/Z=%u/%u/%u\n", x, y, z);
+     }
+ 	m_device->vk.UpdateDescriptorSets(m_device->device(), writeDescriptorSets.size(), writeDescriptorSets.data(), 0, nullptr);
+ 
+@@ -3941,7 +3944,7 @@
+ 		u_nitsToLinear = 1.0f / g_flInternalDisplayBrightnessNits;
+ 		u_itmSdrNits = g_flHDRItmSdrNits;
+ 		u_itmTargetNits = g_flHDRItmTargetNits;
+-        if (g_device.IsMaliDiagnostic()) {
++        if (g_device.IsMaliDiagnostic() && mali_session_verbose()) {
+             std::printf("BlitPushData: UBO bytes=%zu scale0=(%.2f,%.2f) offset0=(%.2f,%.2f) opacity0=%.2f borderMask=%u filter=%u alphaMode=%u rotation=%u CTM0=identity colorspaceMask=%u\n",
+                 sizeof(*this), scale[0].x, scale[0].y, offset[0].x, offset[0].y, opacity[0], borderMask, u_shaderFilter, u_alphaMode, u_rotation, frameInfo->colorspaceMask());
+         }
+@@ -4798,10 +4801,17 @@
+ 	.begin_buffer_pass = renderer_begin_buffer_pass,
+ };
+ 
++static void mali_renderer_destroy(struct wlr_renderer *renderer) { wlr_drm_format_set_finish(&sampledShmFormats); delete reinterpret_cast<VulkanRenderer_t *>(renderer); }
+ struct wlr_renderer *vulkan_renderer_create( void )
+ {
++    if (g_device.IsMaliDiagnostic()) {
++        wlr_drm_format_set_add(&sampledShmFormats, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR);
++        wlr_drm_format_set_add(&sampledShmFormats, DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR);
++        wlr_drm_format_set_add(&sampledShmFormats, DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR);
++    }
+ 	VulkanRenderer_t *renderer = new VulkanRenderer_t();
+-	wlr_renderer_init(&renderer->base, &renderer_impl, WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_DATA_PTR);
++	static const wlr_renderer_impl mali_impl = [] { auto impl = renderer_impl; impl.destroy = mali_renderer_destroy; return impl; }();
++    wlr_renderer_init(&renderer->base, g_device.IsMaliDiagnostic() ? &mali_impl : &renderer_impl, WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_DATA_PTR);
+ 	return &renderer->base;
+ }
+ 
+@@ -4837,6 +4847,7 @@
+ 	if ( result != VK_SUCCESS )
+ 	{
+ 		wlr_buffer_end_data_ptr_access( buf );
++        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkCreateBuffer SHM upload", result);
+ 		return nullptr;
+ 	}
+ 
+@@ -4847,6 +4858,7 @@
+ 	if ( memTypeIndex == ~0u )
+ 	{
+ 		wlr_buffer_end_data_ptr_access( buf );
++        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("SHM HOST_VISIBLE/COHERENT memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+ 		return nullptr;
+ 	}
+ 
+@@ -4861,6 +4873,7 @@
+ 	if ( result != VK_SUCCESS )
+ 	{
+ 		wlr_buffer_end_data_ptr_access( buf );
++        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkAllocateMemory SHM upload", result);
+ 		return nullptr;
+ 	}
+ 
+@@ -4868,6 +4881,7 @@
+ 	if ( result != VK_SUCCESS )
+ 	{
+ 		wlr_buffer_end_data_ptr_access( buf );
++        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkBindBufferMemory SHM upload", result);
+ 		return nullptr;
+ 	}
+ 
+@@ -4876,11 +4890,20 @@
+ 	if ( result != VK_SUCCESS )
+ 	{
+ 		wlr_buffer_end_data_ptr_access( buf );
++        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkMapMemory SHM upload", result);
+ 		return nullptr;
+ 	}
+ 
+ 	memcpy( dst, src, stride * height );
+-
++    if (g_device.IsMaliDiagnostic() && (drmFormat == DRM_FORMAT_ARGB8888 || drmFormat == DRM_FORMAT_XRGB8888)) {
++        auto bytes = static_cast<uint8_t *>(dst);
++        for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x) {
++            auto pixel = bytes + y * stride + x * 4;
++            std::swap(pixel[0], pixel[2]);
++            if (drmFormat == DRM_FORMAT_XRGB8888) pixel[3] = 255;
++        }
++        drmFormat = DRM_FORMAT_ABGR8888;
++    }
+ 	g_device.vk.UnmapMemory( g_device.device(), bufferMemory );
+ 
+ 	wlr_buffer_end_data_ptr_access( buf );
+@@ -4889,7 +4912,7 @@
+ 	CVulkanTexture::createFlags texCreateFlags;
+ 	texCreateFlags.bSampled = true;
+ 	texCreateFlags.bTransferDst = true;
+-	texCreateFlags.bFlippable = true;
++	texCreateFlags.bFlippable = !g_device.IsMaliDiagnostic();
+ 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
+ 		return nullptr;
+ 
+@@ -4909,3 +4932,5 @@
+ }
+ 
+ #include "vulkan_renderer_test.inc"
++
++#include "mali_session.inc"
+--- a/src/vulkan_renderer_test.hpp
++++ b/src/vulkan_renderer_test.hpp
+@@ -1,2 +1,9 @@
+ #pragma once
+ int vulkan_gamescope_renderer_test(bool firstFrame);
++
++struct FrameInfo_t;
++bool mali_session_active();
++bool mali_session_verbose();
++int mali_session_present(const FrameInfo_t *frame);
++int vulkan_mali_session_test(bool wayland);
++int mali_wayland_client_main(const char *socket, unsigned frames);
+--- a/src/vulkan_renderer_test.inc
++++ b/src/vulkan_renderer_test.inc
+@@ -120,9 +120,11 @@
+         if (m_commandPool && destroyPool) destroyPool(device(), m_commandPool, nullptr);
+         if (m_generalCommandPool && destroyPool) destroyPool(device(), m_generalCommandPool, nullptr);
+         if (idle) { VkResult r = idle(device()); if (r != VK_SUCCESS) FailMaliDiagnostic("vkDeviceWaitIdle final teardown", r); }
++        if (s_maliSessionCheckCleanup) s_maliSessionCheckCleanup();
+         auto destroy = (PFN_vkDestroyDevice)vk.GetDeviceProcAddr(device(), "vkDestroyDevice");
+         if (destroy) destroy(device(), nullptr);
+         m_device = VK_NULL_HANDLE;
++        if (s_maliSessionCheckDestroyed) s_maliSessionCheckDestroyed();
+     }
+     if (m_instance) {
+         auto destroy = (PFN_vkDestroyInstance)g_pfn_vkGetInstanceProcAddr(m_instance, "vkDestroyInstance");
+@@ -134,6 +136,7 @@
+ 
+ [[noreturn]] void CVulkanDevice::FailMaliDiagnostic(const char *operation, VkResult result)
+ {
++    if (s_maliSessionFailureCleanup) s_maliSessionFailureCleanup();
+     std::fprintf(stderr, "gamescope: renderer FAILED: last Vulkan operation=%s VkResult=%d\n", operation, int(result));
+     // Some failures occur inside a recording method: local C++ owners cannot be
+     // unwound with Gamescope's -fno-exceptions. Destroy the broker-owned device
+@@ -157,21 +160,27 @@
+     return true;
+ }
+ 
+-int vulkan_gamescope_renderer_test(bool firstFrame)
++static bool MaliInitializeRenderer(bool firstFrame)
+ {
+-    std::puts(firstFrame ? "gamescope: Mali first Gamescope frame test" : "gamescope: Mali renderer initialization test");
+     setenv("MALI_VULKAN_RENDERER_TEST", "1", 1);
+     setenv("MALI_VULKAN_AHB_TEST", firstFrame ? "1" : "0", 1);
+-    if (!MaliResult(vulkan_load_module(), "load Vulkan module")) return 1;
++    if (!MaliResult(vulkan_load_module(), "load Vulkan module")) return false;
+     VkApplicationInfo app{ .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "Gamescope Mali renderer diagnostic", .apiVersion = VK_API_VERSION_1_0 };
+     // The proxy's global API is 1.0 plus truthful KHR query extensions. Its native
+     // broker instance is 1.1; physical properties remain Mali's real 1.1.131.
+     const char *queryExtensions[] = {"VK_KHR_get_physical_device_properties2"};
+     VkInstanceCreateInfo ci{ .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app, .enabledExtensionCount = 1, .ppEnabledExtensionNames = queryExtensions };
+     VkInstance instance = VK_NULL_HANDLE;
+-    if (!MaliResult(g_pfn_vkCreateInstance(&ci, nullptr, &instance), "vkCreateInstance")) return 1;
++    if (!MaliResult(g_pfn_vkCreateInstance(&ci, nullptr, &instance), "vkCreateInstance")) return false;
+     g_reshade_effect.clear(); g_uCompositeDebug = 0;
+-    if (!g_device.BInit(instance, VK_NULL_HANDLE, true)) { g_device.ShutdownMaliDiagnostic(); return 1; }
++    if (!g_device.BInit(instance, VK_NULL_HANDLE, true)) { g_device.ShutdownMaliDiagnostic(); return false; }
++    return true;
++}
++
++int vulkan_gamescope_renderer_test(bool firstFrame)
++{
++    std::puts(firstFrame ? "gamescope: Mali first Gamescope frame test" : "gamescope: Mali renderer initialization test");
++    if (!MaliInitializeRenderer(firstFrame)) return 1;
+     std::puts("Gamescope renderer initialized: yes\nno backend/presentation started");
+     if (!firstFrame) { g_device.ShutdownMaliDiagnostic(); return 0; }
+ 

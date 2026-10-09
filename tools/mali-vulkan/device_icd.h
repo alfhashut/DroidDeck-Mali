@@ -130,6 +130,8 @@ static VKAPI_ATTR void VKAPI_CALL proxy_DestroyDevice(VkDevice device, const VkA
     mb_put_u32(request, d->id);
     VkResult result = rpc(s, MB_DEVICE_DESTROY, request, sizeof(request), reply, &bytes, sizeof(reply));
     if (result != VK_SUCCESS || bytes != sizeof(reply) || mb_get_u32(reply + 8)) {
+        session_frames = 0;
+        s->device_destroy_result = result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
         LOG("device destroy acknowledgement failed; disconnect for broker cleanup"); shutdown(s->fd, SHUT_RDWR);
     } else LOG("logical device destroyed; broker ID=%u", d->id);
     struct proxy_logical **link = &s->logical;
@@ -163,6 +165,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr(VkDevice
 #include "interop_entries.def"
 #undef MB_INTEROP_ENTRY
         if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
+        if (!strcmp(name, "vkDroidDeckSessionTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckSessionTEST;
     }
     if (((struct proxy_logical *)device)->owner->wire_version == MB_RENDERER_VERSION) {
 #define MB_RENDERER_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;

@@ -155,7 +155,7 @@ class RendererTransportTests(RendererFixture):
             self.fields(c, 61, d, 3, sampler, expected=(3, 0, 0))
 
 
-class GamescopeRendererTests(RendererFixture):
+class GamescopeRendererFixture(RendererFixture):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -199,6 +199,8 @@ class GamescopeRendererTests(RendererFixture):
         cls.legacy_binary = build / "renderer-legacy"
         subprocess.run(compiler + ["-Wl,--gc-sections", str(legacy_obj), objects[1], "-ldl", "-pthread", "-ldrm", "-o", str(cls.legacy_binary)], check=True)
 
+
+class GamescopeRendererTests(GamescopeRendererFixture):
     def run_renderer(self, path, frame=False, legacy=False):
         env = dict(os.environ, MALI_VULKAN_BROKER_SOCKET=path, VK_DRIVER_FILES=str(self.manifest), VK_ICD_FILENAMES=str(self.manifest), VK_LOADER_LAYERS_DISABLE="*", DISPLAY="invalid-for-renderer", WAYLAND_DISPLAY="invalid-for-renderer")
         return subprocess.run([str(self.legacy_binary if legacy else self.binary)] + (["frame"] if frame else []), env=env, capture_output=True, text=True, timeout=40)

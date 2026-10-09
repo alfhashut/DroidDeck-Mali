@@ -218,12 +218,13 @@ object SystemVulkanBroker {
         return "$output\nGamescope Vulkan submit test via Linux/proot exit code=$code$hint"
     }
 
-    /** Four v6 memory tests and two isolated v7 renderer tests in one Gamescope/APK build. */
+    /** Memory, renderer and persistent-session diagnostics in one Gamescope/APK build. */
     @Synchronized
     fun runInteropTest(context: Context, option: String): String {
         val options = setOf("--vk-buffer-memory-test", "--vk-image-memory-test",
             "--vk-ahb-test", "--vk-ahb-present-test",
-            "--vk-gamescope-renderer-init-test", "--vk-gamescope-first-frame-test")
+            "--vk-gamescope-renderer-init-test", "--vk-gamescope-first-frame-test",
+            "--mali-session-test", "--mali-wayland-client-test")
         require(option in options)
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) return "Install the Linux runtime in DroidDeck, then retry."
@@ -236,11 +237,13 @@ object SystemVulkanBroker {
             Os.chmod(file.path, 0x180)
         }
         val manifest = File(directory, "mali_proxy_icd.json")
-        val renderer = option == "--vk-gamescope-renderer-init-test" || option == "--vk-gamescope-first-frame-test"
-        val ahb = option == "--vk-ahb-test" || option == "--vk-ahb-present-test" || option == "--vk-gamescope-first-frame-test"
+        val session = option == "--mali-session-test" || option == "--mali-wayland-client-test"
+        val renderer = session || option == "--vk-gamescope-renderer-init-test" || option == "--vk-gamescope-first-frame-test"
+        val ahb = session || option == "--vk-ahb-test" || option == "--vk-ahb-present-test" || option == "--vk-gamescope-first-frame-test"
         val command = listOf("/usr/bin/env", "VK_DRIVER_FILES=${manifest.path}",
             "VK_ICD_FILENAMES=${manifest.path}", "MALI_VULKAN_BROKER_SOCKET=${path.path}",
             "MALI_VULKAN_RENDERER_TEST=${if (renderer) 1 else 0}",
+            "MALI_VULKAN_SESSION_TEST=${if (session) 1 else 0}",
             "MALI_VULKAN_INTEROP_TEST=1", "MALI_VULKAN_AHB_TEST=${if (ahb) 1 else 0}",
             "VK_LOADER_LAYERS_DISABLE=*", "VK_LOADER_DEBUG=error,warn,driver",
             "/usr/local/bin/gamescope", option)

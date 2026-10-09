@@ -109,6 +109,8 @@ static void mock_destroy_device(VkDevice device, const VkAllocationCallbacks *al
     assert(device && !allocator);
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) assert(!((struct mock_logical *)device)->commands[i]);
     free(device); ++device_destroys;
+    if (mode == 67) for (unsigned i = 0; i < MAX_CLIENTS; ++i)
+        if (clients[i].started && clients[i].fd >= 0) shutdown(clients[i].fd, SHUT_RDWR);
 }
 static void mock_get_queue(VkDevice device, uint32_t family, uint32_t index, VkQueue *out) {
     struct mock_logical *d = (struct mock_logical *)device;
@@ -208,7 +210,30 @@ static void request(uint32_t expected_status, int bad_version) {
     } else assert(mb_get_u32(payload + 8) == 0);
     close(fd);
 }
+static void session_guard_contract(void) {
+    struct native_device *d = calloc(1, sizeof(*d)); assert(d);
+    struct native_command c = {0};
+    d->session.held = 7; d->interop.ahbs[0].id = 7;
+    d->interop.ahbs[0].image = 8; d->interop.ahbs[0].memory = 9;
+    c.renderer_image_count = 1; c.renderer_images[0].id = 8;
+    assert(!native_renderer_can_submit(d, &c));
+    assert(interop_referenced(d, 8, 0) && interop_referenced(d, 9, 1));
+    d->session.held = 0;
+    assert(!interop_referenced(d, 8, 0));
+    d->session.pending = 7;
+    assert(!native_renderer_can_submit(d, &c));
+    assert(interop_referenced(d, 8, 0) && interop_referenced(d, 9, 1));
+    d->session.pending = 0; d->session.release_timeouts = 1;
+    assert(!native_renderer_can_submit(d, &c) && !native_interop_can_submit(d, &c));
+    d->session.release_timeouts = 0;
+    d->submit.commands[0].id = 10; d->submit.commands[0].state = 3;
+    uint32_t counts[20]; native_session_counts(d, counts);
+    assert(counts[3] == 1 && counts[16] == 1 && counts[19] == 1);
+    d->submit.commands[0].state = 4; native_session_counts(d, counts); assert(counts[19] == 0);
+    free(d);
+}
 int main(int argc, char **argv) {
+    session_guard_contract();
     assert(argc >= 3);
     path = argv[2];
     if (!strcmp(argv[1], "--serve")) {
@@ -223,7 +248,17 @@ int main(int argc, char **argv) {
         printf("INTEROP buffers=%d/%d images=%d/%d memories=%d/%d AHB=%d/%d consumers=%d CPU=%d flush=%d invalidate=%d\n", buffers_created, buffers_destroyed, images_created, images_destroyed, memories_created, memories_freed, ahb_created, ahb_freed, consumers, cpu_locks, flushes, invalidates);
         printf("RENDERER objects=%d/%d dispatches=%d shaderBytes=%d\n", renderer_created, renderer_destroyed, dispatches, shader_bytes);
         assert(renderer_created == renderer_destroyed);
-        assert(buffers_created == buffers_destroyed && images_created == images_destroyed && memories_created == memories_freed && ahb_created == ahb_freed);
+        if (mode == 68 || mode == 70) {
+            /* Only the Android-owned image/allocation/AHB and required parents
+             * survive; safe children were destroyed, no release was invented. */
+            assert(quarantined_sessions && quarantined_sessions->logical[0].session.held);
+            assert(quarantined_sessions->logical[0].session.released + 1 == quarantined_sessions->logical[0].session.presented);
+            assert(device_creates == device_destroys + 1 && creates == destroys + 1);
+            int retained = mode == 70 ? 2 : 1;
+            assert(!!quarantined_sessions->logical[0].session.pending == (mode == 70));
+            assert(buffers_created == buffers_destroyed && images_created == images_destroyed + retained && memories_created == memories_freed + retained && ahb_created == ahb_freed + retained);
+            puts("release TIMEOUT safety contract: exact held buffer retained, other children cleaned, no fake release");
+        } else assert(buffers_created == buffers_destroyed && images_created == images_destroyed && memories_created == memories_freed && ahb_created == ahb_freed);
         assert(pools_created == pools_destroyed && commands_allocated == commands_freed && events_created == events_destroyed && fences_created == fences_destroyed);
         return 0;
     }

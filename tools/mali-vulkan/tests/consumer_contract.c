@@ -15,6 +15,7 @@ static int consumer_dlclose(void *);
 #define dlopen consumer_dlopen
 #define dlsym consumer_dlsym
 #define dlclose consumer_dlclose
+#define MB_SESSION_RELEASE_TIMEOUT_MS 200 /* never sleep five seconds in tests */
 #include "../../../app/src/main/cpp/malivulkan/interop_consumer.c"
 #undef dlopen
 #undef dlsym
@@ -27,6 +28,8 @@ struct ASurfaceTransactionStats { int present, release; };
 static atomic_int callbacks, acquisitions, retiring, released, allocations, frees, acquired_fds, drop_surface;
 static int missing_api;
 static AHardwareBuffer *producer;
+static int persistent;
+static int release_scenario;
 static ANativeWindow window;
 int __android_log_print(int priority, const char *tag, const char *format, ...) {
     (void)priority; (void)tag; (void)format; return 0;
@@ -43,12 +46,12 @@ int32_t ANativeWindow_getWidth(ANativeWindow *w) { assert(w == &window); return 
 int32_t ANativeWindow_getHeight(ANativeWindow *w) { assert(w == &window); return 256; }
 static ASurfaceControl *fn_ASurfaceControl_createFromWindow(ANativeWindow *w, const char *name) { assert(w->refs && name); return calloc(1, sizeof(ASurfaceControl)); }
 static void fn_ASurfaceControl_release(ASurfaceControl *c) { assert(c); if (c->current) AHardwareBuffer_release(c->current); free(c); }
-static ASurfaceTransaction *fn_ASurfaceTransaction_create(void) { ASurfaceTransaction *t = calloc(1, sizeof(*t)); assert(t); t->fd = -1; return t; }
+static ASurfaceTransaction *fn_ASurfaceTransaction_create(void) { if (release_scenario == 4) return NULL; ASurfaceTransaction *t = calloc(1, sizeof(*t)); assert(t); t->fd = -1; return t; }
 static void fn_ASurfaceTransaction_delete(ASurfaceTransaction *t) { free(t); }
 static void fn_ASurfaceTransaction_setBuffer(ASurfaceTransaction *t, ASurfaceControl *c, AHardwareBuffer *a, int fd) {
     assert(a && a->refs); t->control = c; t->next = a; t->fd = fd;
-    if (a == producer) { assert(a->refs == 2); ++acquisitions; }
-    else { assert(c->current == producer && producer->refs == 3); ++retiring; }
+    if (a->desc.width == 256) { assert(a->refs == 2); ++acquisitions; }
+    else { assert(c->current && c->current->refs == 3); ++retiring; }
 }
 static void fn_ASurfaceTransaction_setGeometry(ASurfaceTransaction *t, ASurfaceControl *c, const ARect *src, const ARect *dst, int32_t transform) {
     assert(t && c && !transform && src->right == 256 && src->bottom == 256 && dst->right == 256 && dst->bottom == 256);
@@ -66,14 +69,16 @@ static void *callback_worker(void *arg) {
     AHardwareBuffer_acquire(t->next); t->control->current = t->next;
     struct ASurfaceTransactionStats stats = {.present = -1, .release = -1}; int pipe_fds[2];
     assert(pipe(pipe_fds) == 0);
-    if (old) { assert(old == producer); AHardwareBuffer_release(old); stats.release = pipe_fds[0]; }
+    if (old) { assert(persistent || old == producer); AHardwareBuffer_release(old); stats.release = pipe_fds[0]; }
     else stats.present = pipe_fds[0];
     if (!old && drop_surface) Java_com_droiddeck_launcher_gpu_SystemVulkanBroker_nativeSetSurface(NULL, NULL, NULL);
+    if (old && release_scenario == 3) { free(job); return NULL; } /* no OnComplete */
     ++callbacks; t->callback(t->context, &stats);
     /* The completion callback ran but its fence is still unsignaled. Consumer
      * must retain the exact AHB until this thread signals previous release. */
-    usleep(20000);
-    if (old) { assert(producer->refs == 2); ++released; }
+    if (old && release_scenario == 2) { free(job); return NULL; } /* never signal release */
+    usleep(old && release_scenario == 1 ? 70000 : 20000);
+    if (old) { assert(old->refs == 2); ++released; }
     assert(write(pipe_fds[1], "x", 1) == 1); close(pipe_fds[1]);
     free(job); return NULL;
 }
@@ -98,7 +103,48 @@ static void *consumer_dlsym(void *p, const char *name) {
 }
 static int fd_count(void) { DIR *d = opendir("/proc/self/fd"); assert(d); int n = 0; while (readdir(d)) ++n; closedir(d); return n; }
 static void *signal_producer(void *arg) { int fd = *(int *)arg; usleep(50000); assert(!acquisitions); assert(write(fd, "x", 1) == 1); return NULL; }
-int main(void) {
+static int release_wait_contract(const char *name) {
+    int scenario = !strcmp(name, "delayed") ? 1 : !strcmp(name, "missing") || !strcmp(name, "swap") ? 2 : !strcmp(name, "callback") ? 3 : !strcmp(name, "allocation") ? 4 : 0;
+    AHardwareBuffer_Desc desc = {.width=256, .height=256, .layers=1, .format=1};
+    assert(AHardwareBuffer_allocate(&desc, &producer) == 0);
+    AHardwareBuffer *other; assert(AHardwareBuffer_allocate(&desc, &other) == 0);
+    persistent = 1;
+    Java_com_droiddeck_launcher_gpu_SystemVulkanBroker_nativeSetSurface(NULL, NULL, (jobject)1);
+    struct mb_consumer_session *session = mb_consumer_session_open(); assert(session);
+    assert(mb_consumer_session_present(session, producer, &desc, -1) == 0);
+    int released_before = released, acquired_before = acquisitions;
+    release_scenario = scenario;
+    if (!strcmp(name, "swap")) {
+        int64_t begin = session_now_ms();
+        assert(mb_consumer_session_present(session, other, &desc, -1) == 2);
+        assert(session_now_ms() - begin < 1000 && session->release_timeout);
+        assert(mb_consumer_session_owns(session, producer) && mb_consumer_session_owns(session, other));
+        assert(producer->refs >= 2 && other->refs >= 2 && released == released_before);
+        assert(mb_consumer_session_close(session) == 2);
+        assert(mb_consumer_session_present(session, producer, &desc, -1) == -3);
+        puts("swap timeout: both AHBs retained; no release, no reuse; bounded stop");
+        return 0;
+    }
+    int64_t begin = session_now_ms();
+    int result = mb_consumer_session_close(session);
+    assert(session_now_ms() - begin < 1000);
+    if (scenario < 2) {
+        assert(result == 0 && producer->refs == 1 && released == released_before + 1);
+        puts("Android release wait: outstanding at stop=1 released=1 timed out=0");
+    } else {
+        assert(result == 2 && session->release_timeout && session->current == producer);
+        assert(producer->refs >= 2 && released == released_before);
+        assert(mb_consumer_session_present(session, other, &desc, -1) == -3);
+        assert(acquisitions == acquired_before); /* no frame submitted after stop */
+        begin = session_now_ms();
+        assert(mb_consumer_session_close(session) == 2 && session_now_ms() - begin < 50);
+        assert(producer->refs >= 2 && released == released_before);
+        puts("Android release wait TIMEOUT: retained producer, no reuse, no fake release; sticky failure");
+    }
+    return 0; /* test process exit reclaims intentionally retained mock parents */
+}
+int main(int argc, char **argv) {
+    if (argc == 2) return release_wait_contract(argv[1]);
     AHardwareBuffer_Desc desc = {.width = 256, .height = 256, .layers = 1, .format = 1, .usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE};
     assert(AHardwareBuffer_allocate(&desc, &producer) == 0);
     assert(mb_consumer_present(producer, &desc, -1) == -1); /* no consumer window */
@@ -113,6 +159,31 @@ int main(void) {
     drop_surface = 1; assert(mb_consumer_present(producer, &desc, -1) == 0);
     assert(producer->refs == 1 && !window.refs && acquisitions == 4 && released == 4 && callbacks == 8 && retiring == 4 && acquired_fds == 1);
     assert(fd_count() == before && allocations == frees + 1);
+    persistent = 1; drop_surface = 0;
+    Java_com_droiddeck_launcher_gpu_SystemVulkanBroker_nativeSetSurface(NULL, NULL, (jobject)1);
+    AHardwareBuffer *other = NULL; assert(AHardwareBuffer_allocate(&desc, &other) == 0);
+    for (unsigned cycle = 0; cycle < 3; ++cycle) {
+        struct mb_consumer_session *session = mb_consumer_session_open(); assert(session);
+        for (unsigned frame = 0; frame < 12; ++frame) {
+            AHardwareBuffer *next = frame % 2 ? other : producer;
+            assert(mb_consumer_session_present(session, next, &desc, -1) == 0);
+            assert(next->refs == 3);
+            assert(mb_consumer_session_present(session, next, &desc, -1) == -3);
+            assert((frame % 2 ? producer : other)->refs == 1);
+        }
+        assert(mb_consumer_session_close(session) == 0);
+        assert(producer->refs == 1 && other->refs == 1 && window.refs == 1);
+        assert(fd_count() == before);
+    }
+    struct mb_consumer_session *session = mb_consumer_session_open(); assert(session);
+    assert(mb_consumer_session_present(session, producer, &desc, -1) == 0);
+    Java_com_droiddeck_launcher_gpu_SystemVulkanBroker_nativeSetSurface(NULL, NULL, NULL);
+    assert(mb_consumer_session_present(session, other, &desc, -1) == -3);
+    assert(mb_consumer_session_close(session) == 0);
+    assert(producer->refs == 1 && other->refs == 1 && !window.refs);
+    AHardwareBuffer_release(other);
+    assert(fd_count() == before && allocations == frees + 1);
+    puts("persistent consumer: repeated swaps, same-buffer rejection, delayed release, preview loss, repeated stop, FD baseline PASS");
     AHardwareBuffer *owned = producer; producer = NULL; AHardwareBuffer_release(owned);
     assert(allocations == frees);
     puts("consumer: exact buffer, unsignaled producer wait, asynchronous present/release fences, repeated cycles, surface teardown and FD/reference balance PASS");

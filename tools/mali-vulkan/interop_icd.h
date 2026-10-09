@@ -255,3 +255,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckInteropTEST(VkDevice device
     }
     return r;
 }
+
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckSessionTEST(VkDevice device, uint32_t op, const struct dd_interop_input *in, struct dd_session_output *out) {
+    if (!device || !in || !out) return VK_ERROR_INITIALIZATION_FAILED;
+    memset(out, 0, sizeof(*out)); struct proxy_logical *d = (struct proxy_logical *)device;
+    uint8_t args[8], reply[100]; VkResult r;
+    if (op >= DD_SESSION_BEGIN && op <= DD_SESSION_STATS) {
+        const char *enabled = getenv("MALI_VULKAN_SESSION_TEST");
+        if (d->owner->wire_version != MB_RENDERER_VERSION || !enabled || strcmp(enabled, "1")) return VK_ERROR_FEATURE_NOT_PRESENT;
+        uint32_t rpc_op = op == DD_SESSION_BEGIN ? MB_SESSION_BEGIN : op == DD_SESSION_PRESENT ? MB_SESSION_PRESENT : op == DD_SESSION_END ? MB_SESSION_END : MB_SESSION_STATS;
+        mb_put_u32(args, in->token); mb_put_u32(args + 4, in->sync);
+        uint32_t expected = op == DD_SESSION_STATS ? 100 : op == DD_SESSION_BEGIN ? 0 : 4;
+        r = interop_rpc(d, rpc_op, args, op == DD_SESSION_PRESENT ? 8 : 0, reply, expected);
+        if (r == VK_SUCCESS && op == DD_SESSION_BEGIN) session_frames = 0;
+        if (r == VK_SUCCESS && op == DD_SESSION_PRESENT) ++session_frames;
+        if (r == VK_SUCCESS && op == DD_SESSION_STATS) {
+            for (unsigned i = 0; i < 20; ++i) out->counts[i] = mb_get_u32(reply + i * 4);
+            out->presented = mb_get_u32(reply + 80); out->released = mb_get_u32(reply + 84);
+            out->fds_created = mb_get_u32(reply + 88); out->fds_closed = mb_get_u32(reply + 92); out->max_owned = mb_get_u32(reply + 96);
+        } else if (r == VK_SUCCESS && expected) out->token = mb_get_u32(reply);
+        return r;
+    }
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+
+}

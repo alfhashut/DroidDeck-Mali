@@ -26,7 +26,8 @@
 #include "renderer_objects.h"
 #include "interop_consumer.h"
 
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__)
+static _Thread_local int session_quiet;
+#define LOG(...) do { if (!session_quiet) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__); } while (0)
 #define ERROR(...) __android_log_print(ANDROID_LOG_ERROR, "MaliVulkanBroker", __VA_ARGS__)
 #define MAX_CLIENTS 16
 
@@ -41,6 +42,7 @@ static struct client_slot {
 
 /* All Android handles live here, owned by one connection. Wire IDs are indices. */
 struct vk_session {
+    struct vk_session *quarantined_next;
     void *library;
     VkInstance instance;
     PFN_vkDestroyInstance destroy;
@@ -53,6 +55,12 @@ struct vk_session {
     int listed;
     uint32_t wire_version, next_device_id, next_queue_id, next_resource_id;
     struct native_device {
+        struct {
+            struct mb_consumer_session *consumer;
+            uint32_t enabled, held, presented, released, fds_created, fds_closed, max_owned;
+            uint32_t last_sync, last_fence, release_timeouts, cleanup_done;
+            uint32_t pending, pending_frame, pending_sync, pending_fence;
+        } session;
         VkDevice handle;
         PFN_vkDestroyDevice destroy;
         PFN_vkGetDeviceQueue get_queue;
@@ -68,6 +76,9 @@ struct vk_session {
         uint32_t queue_ids[MB_DEVICE_MAX_QUEUES];
     } logical[MB_MAX_LOGICAL_DEVICES];
 };
+/* Only failed diagnostics enter this list. Native parents/callback storage must
+ * survive the guest's exit while Android still owns the producer allocation. */
+static struct vk_session *quarantined_sessions;
 
 static const char *const query_extensions[] = {
     "VK_KHR_get_physical_device_properties2", "VK_KHR_external_memory_capabilities",
@@ -76,15 +87,22 @@ static const char *const query_extensions[] = {
 static VkResult native_global(void *, uint32_t *, uint32_t *, VkExtensionProperties *);
 
 static void native_close_device(struct native_device *d);
+static VkResult native_session_end(struct native_device *d);
+static void native_session_log(struct native_device *d, const char *stage);
+static int native_verbose(struct native_device *d) { return !d->session.enabled || d->session.presented < 3; }
 
-static void close_session(struct vk_session *s) {
+static int close_session(struct vk_session *s) {
+    int retained = 0;
     for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
         if (s->logical[i].handle) {
             native_close_device(&s->logical[i]);
+            retained |= !!s->logical[i].handle;
         }
+    if (retained) return 0;
     if (s->instance) { s->destroy(s->instance, NULL); LOG("destroyed Vulkan instance"); }
     if (s->library) { dlclose(s->library); LOG("closed Android libvulkan"); }
     memset(s, 0, sizeof(*s));
+    return 1;
 }
 
 static uint32_t open_session(struct vk_session *s, uint32_t api, VkResult *result, int capabilities) {
@@ -171,6 +189,7 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 #include "interop_commands.h"
 #include "submit_commands.h"
 #include "renderer_commands.h"
+#include "session_commands.h"
 #include "device_commands.h"
 
 /* Preserve the original version-1 one-shot probe and its six-field reply. */
@@ -283,10 +302,17 @@ static void serve(int fd) {
             uint32_t extra = 0;
             status = native_device_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
+            if (op == MB_DEVICE_DESTROY && result == VK_TIMEOUT) finish = 1;
         } else if (version >= MB_SUBMIT_VERSION && op >= MB_POOL_CREATE && op <= MB_QUEUE_SUBMIT && s->instance && s->listed) {
             uint32_t extra = 0;
             status = native_submit_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
+        } else if (version == MB_RENDERER_VERSION && op >= MB_SESSION_BEGIN && op <= MB_SESSION_STATS && s->instance && s->listed) {
+            uint32_t extra = 0;
+            status = native_session_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (status == MB_OK) bytes += extra;
+            /* A failed release wait ends production on this connection. */
+            if (op == MB_SESSION_END && result == VK_TIMEOUT) finish = 1;
         } else if (version >= MB_INTEROP_VERSION && op >= MB_BUFFER_CREATE && op <= MB_AHB_PRESENT && s->instance && s->listed) {
             uint32_t extra = 0;
             status = native_interop_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
@@ -296,7 +322,8 @@ static void serve(int fd) {
             status = native_renderer_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
         } else if (op == MB_DESTROY && !request_bytes && s->instance) {
-            close_session(s); status = MB_OK; finish = 1;
+            if (!close_session(s)) result = VK_TIMEOUT;
+            status = MB_OK; finish = 1;
         } else {
             finish = 1;
         }
@@ -305,14 +332,22 @@ static void serve(int fd) {
         if (version == MB_VERSION) mb_header(header, bytes);
         else mb_session_header(header, op, bytes);
         mb_put_u32(header + 4, version);
-        LOG("query RPC opcode=%u status=%u VkResult=%d count=%u", op, status, (int)result, count);
+        if (status != MB_OK || result != VK_SUCCESS) session_quiet = 0;
+        int verbose = 1;
+        for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i) if (s->logical[i].session.enabled && !native_verbose(&s->logical[i])) verbose = 0;
+        if (verbose || status != MB_OK || result != VK_SUCCESS) LOG("query RPC opcode=%u status=%u VkResult=%d count=%u", op, status, (int)result, count);
         if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes)) {
             ERROR("write response: %s", strerror(errno)); break;
         }
         if (finish) break;
     }
-    close_session(s);
-    free(request); free(s);
+    if (close_session(s)) free(s);
+    else {
+        pthread_mutex_lock(&lock); s->quarantined_next = quarantined_sessions;
+        quarantined_sessions = s; pthread_mutex_unlock(&lock);
+        ERROR("failed session quarantined: Android-owned allocations and native parents retained; no PASS");
+    }
+    free(request);
 }
 
 static void *client_main(void *arg) {

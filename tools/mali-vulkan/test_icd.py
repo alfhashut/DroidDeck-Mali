@@ -70,6 +70,7 @@ class IcdTests(unittest.TestCase):
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, text=True)
             try:
                 self.assertEqual(process.stdout.readline().strip(), "READY")
+                self.broker_process = process
                 yield str(path)
             finally:
                 try:

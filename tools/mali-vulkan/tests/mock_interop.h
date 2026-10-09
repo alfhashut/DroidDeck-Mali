@@ -142,3 +142,25 @@ static VkResult mock_GetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR *i
 }
 
 int mb_consumer_present_renderer(AHardwareBuffer *a, const AHardwareBuffer_Desc *desc, int fd) { return mb_consumer_present(a, desc, fd); }
+
+struct mb_consumer_session { AHardwareBuffer *held, *previous; };
+struct mb_consumer_session *mb_consumer_session_open(void) {
+    return calloc(1, sizeof(struct mb_consumer_session));
+}
+int mb_consumer_session_owns(struct mb_consumer_session *s, AHardwareBuffer *a) { return s && (s->held == a || s->previous == a); }
+int mb_consumer_session_present(struct mb_consumer_session *s, AHardwareBuffer *a, const AHardwareBuffer_Desc *d, int fd) {
+    assert(s && a && d && s->held != a);
+    if (mode == 56 || (mode == 63 && consumers >= 5)) return -3;
+    if (mode == 64 && consumers >= 5) return 2;
+    if (mode == 65 && consumers >= 5) return -4;
+    if (mode == 70 && consumers >= 5) { s->previous = s->held; AHardwareBuffer_acquire(a); s->held = a; return 2; }
+    if (fd >= 0) { struct pollfd p = {.fd=fd, .events=POLLIN}; assert(poll(&p, 1, 0) == 1); }
+    if (s->held) AHardwareBuffer_release(s->held);
+    AHardwareBuffer_acquire(a); s->held = a; ++consumers;
+    return 0;
+}
+int mb_consumer_session_close(struct mb_consumer_session *s) {
+    if ((mode == 68 || mode == 70) && s && s->held) return 2; /* permanent release loss */
+    if (s) { if (s->held) AHardwareBuffer_release(s->held); free(s); }
+    return 0;
+}

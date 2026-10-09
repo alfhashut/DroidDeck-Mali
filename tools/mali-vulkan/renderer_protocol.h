@@ -29,6 +29,15 @@
 #define MB_RENDERER_COPY 80u /* device,command,image,buffer,layout,direction,u64 offset,width,height,depth */
 #define MB_RENDERER_CLEAR 81u /* device,command,image,layout,4 binary32 */
 #define MB_RENDERER_IDLE 82u /* device */
+/* Explicit opt-in sub-protocol on v7; legacy renderer requests are unchanged. */
+#define MB_SESSION_BEGIN 83u /* device -> no payload */
+#define MB_SESSION_PRESENT 84u /* device,AHB,sync -> previous released AHB ID */
+#define MB_SESSION_END 85u /* device -> last released AHB ID */
+#define MB_SESSION_STATS 86u /* device -> 20 live counts + presented/released/FD totals */
+#define MB_SESSION_COUNTS 20u
+/* devices,queues,command pools,commands,semaphores,fences,buffers,memory,
+ * images,views,samplers,descriptor pools,sets,shaders,pipelines,layouts,
+ * AHB tokens,sync tokens,open exported FDs,pending commands. */
 enum mb_renderer_kind { MB_R_SEMAPHORE=1, MB_R_VIEW, MB_R_SAMPLER, MB_R_SET_LAYOUT,
  MB_R_PIPELINE_LAYOUT, MB_R_POOL, MB_R_SET, MB_R_SHADER, MB_R_PIPELINE };
 #endif

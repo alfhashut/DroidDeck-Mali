@@ -130,7 +130,9 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         if (s->logical[i].handle && s->logical[i].id == id) { d = &s->logical[i]; break; }
     if (!d) { ERROR("invalid logical device ID=%u", id); return MB_PROTOCOL_ERROR; }
     if (op == MB_DEVICE_DESTROY) {
-        native_close_device(d); return MB_OK;
+        native_close_device(d);
+        if (d->handle) *result = VK_TIMEOUT;
+        return MB_OK;
     }
     uint32_t family = mb_get_u32(wire + 4), index = mb_get_u32(wire + 8);
     if (family != d->family || index >= d->count) return MB_PROTOCOL_ERROR;

@@ -31,7 +31,9 @@ class SystemVulkanBrokerActivity : Activity() {
             "Run Vulkan AHardwareBuffer test" to "--vk-ahb-test",
             "Run Vulkan AHB presentation test" to "--vk-ahb-present-test",
             "Run Gamescope renderer init test" to "--vk-gamescope-renderer-init-test",
-            "Run Gamescope first frame test" to "--vk-gamescope-first-frame-test"
+            "Run Gamescope first frame test" to "--vk-gamescope-first-frame-test",
+            "Run Gamescope persistent session test" to "--mali-session-test",
+            "Run Gamescope Wayland client test" to "--mali-wayland-client-test"
         ).map { (label, option) ->
             Button(this).apply { text = label; isEnabled = false } to option
         }
