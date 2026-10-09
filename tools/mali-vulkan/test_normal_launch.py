@@ -107,6 +107,19 @@ class NormalLaunchTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 65)
                 self.assertNotIn("ARGV=", result.stdout)
 
+    def test_broker_connects_before_timeout_and_inventory_handshake(self):
+        # Scope to the broker connection: the earlier Wayland socket probe
+        # must not accidentally satisfy this regression check.
+        broker = (ROOT / "app/src/main/java/com/droiddeck/launcher/gpu/MaliNormalBroker.kt").read_text()
+        handshake = broker.split("val socket = SystemVulkanBroker.startNormal(context)", 1)[1].split("val directory = File", 1)[0]
+        created = handshake.index("LocalSocket().use { connection ->")
+        connected = handshake.index("connection.connect(LocalSocketAddress(socket, LocalSocketAddress.Namespace.FILESYSTEM))")
+        timeout = handshake.index("connection.soTimeout = 3000")
+        inventory = handshake.index("connection.outputStream.write(request)")
+        self.assertLess(created, connected)
+        self.assertLess(connected, timeout, "LocalSocket must connect/create its FD before SO_TIMEOUT")
+        self.assertLess(timeout, inventory)
+
     def test_service_readiness_order_and_stop_start_race_guards(self):
         # Source contracts supplement the executable native/shell tests. They
         # do not claim to execute an Android Activity/Service lifecycle on host.

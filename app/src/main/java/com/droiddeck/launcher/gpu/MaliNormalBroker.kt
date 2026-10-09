@@ -37,8 +37,9 @@ object MaliNormalBroker {
         try {
             // A socket file is not readiness: execute the existing native inventory request.
             LocalSocket().use { connection ->
-                connection.soTimeout = 3000
                 connection.connect(LocalSocketAddress(socket, LocalSocketAddress.Namespace.FILESYSTEM))
+                // connect creates the underlying FD before Android accepts socket options.
+                connection.soTimeout = 3000
                 val request = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
                     .putInt(0x564d4444).putInt(1).putInt(1).putInt(0).array()
                 connection.outputStream.write(request)
