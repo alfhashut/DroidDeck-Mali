@@ -44,13 +44,19 @@ class BulkMemoryTests(unittest.TestCase):
     def test_all_coherent_uploads_acknowledged_before_each_submit(self):
         self.run_case('ordering')
 
+    def test_bulk_reads_exact_bytes_minimum_chunks_and_reply_reuse(self):
+        self.run_case('read_bulk')
+
+    def test_failed_partial_malformed_reads_and_allocation_failure(self):
+        self.run_case('read_errors')
+
     def test_upload_errors_bad_ack_and_allocation_failure_prevent_submit(self):
         self.run_case('errors')
 
     def test_native_and_proxy_length_offset_mapping_and_overflow_bounds(self):
         self.run_case('bounds')
 
-    def test_v6_writes_and_v7_reads_keep_4k_behavior(self):
+    def test_v6_reads_writes_keep_4k_and_old_v7_requests_remain_valid(self):
         self.run_case('legacy')
 
 

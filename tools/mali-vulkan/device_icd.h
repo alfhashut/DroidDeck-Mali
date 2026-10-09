@@ -15,6 +15,8 @@ struct proxy_logical {
     struct proxy_resource *resources;
     uint8_t *write_request; /* connection-lock protected, reused by mapped uploads */
     uint32_t write_capacity;
+    uint8_t *read_reply; /* connection-lock protected, reused by mapped reads */
+    uint32_t read_capacity;
     atomic_int submit_failed;
     VkPhysicalDeviceMemoryProperties memory_properties;
     size_t map_alignment;

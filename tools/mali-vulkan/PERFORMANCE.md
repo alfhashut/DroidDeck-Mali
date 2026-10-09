@@ -15,8 +15,15 @@ the ~6 FPS baseline. The compositor reported 215 GPU/zero-copy frames in ten
 seconds (21.5 FPS, ~1.11 ms scene average) and another 200 in ten seconds
 (20 FPS, ~1.35 ms), with no pool drops. This confirms the write optimization;
 it does not identify the distribution or RTT cost of the remaining 106 calls.
-The next change adds opcode/category reports only, without further batching
-or changes to synchronization or presentation. Source audit:
+The opcode/category profiler is subsequently phone-validated too: about 102
+in-frame calls plus outside-frame traffic (~106 total calls/frame). In-frame
+categories are mapped transfer 62, command recording 14, resource management
+12, synchronization 8, descriptor/resource updates 3, submits 2 and presentation
+1. **Opcode 40 (`MB_MEMORY_READ`) is exactly 57/frame**, including 1824/32
+frames at 211.565 ms total RTT (~0.116 ms/call). Mapped transfer consumes about
+35–41% of client RTT; command recording consumes only ~8–9%. Timeline opcode
+63 is a secondary latency concern (four calls/frame, often ~2 ms each), but
+this change leaves all waits and synchronization untouched. Source audit:
 
 - Every renderer/command-recording RPC waits synchronously for a broker reply,
   including void Vulkan commands. Commands have not been batched or made async.
@@ -70,7 +77,7 @@ length bytes`. Writes use up to **512 KiB data/message** (524308-byte request),
 within the existing 524544-byte broker request buffer. This bounds messages,
 not allocations or mapped ranges. A range larger than 512 KiB is split into
 `ceil(length/524288)` acknowledged writes, including its final partial chunk.
-Reads and wire-v6 writes retain the existing 4 KiB bound. Old v7 4 KiB writes
+Wire-v6 reads/writes retain the existing 4 KiB bound. Old v7 4 KiB writes
 remain valid, including Checkpoint 6 callers. Use matching proxy/broker assets;
 an older broker will reject larger writes, rather than submit incomplete data.
 
@@ -80,7 +87,8 @@ all sends and acknowledgment checks for the range. The buffer is bounded to
 512 KiB + 20 bytes and freed by both existing device/instance cleanup paths.
 There is no per-chunk allocation, large stack allocation or fire-and-forget
 operation. All coherent ranges are still uploaded in full, including unchanged
-bytes; dirty tracking and readback transport are outside this optimization.
+bytes; dirty tracking is outside this optimization. Bulk reads are described
+separately below.
 
 The native handler checks host visibility, pending GPU use, AHB exclusion,
 allocation bounds, mapped bounds, nonzero length, the version-specific maximum,
@@ -103,6 +111,76 @@ Other mapped writes also collapse: the phone-proven actual total is **106**.
 Upload bytes remain unchanged for the same workload. Existing CP7P counters
 still observe opcode 41 through the same measured `rpc()` wrapper and retain
 write calls/frame, bytes/frame, service/CPU and FPS.
+
+## Bulk mapped-memory reads
+
+The normal interactive SHM client in patch 0121 creates two 320×180 ARGB8888
+buffers with 1280-byte rows: **230400 bytes per source image**. The normal loop
+imports a fresh source each frame through `vulkan_create_texture_from_wlr_buffer`.
+The SHM upload path creates/maps host-visible coherent staging memory, then
+copies `stride * height` bytes into it and unmaps it (patch 0120). This is input
+staging memory, not an output AHB or a diagnostic pixel verification.
+
+`proxy_MapMemory()` first creates the mirror and sends opcode 38, then downloads
+the coherent requested mapped range through `interop_copy_mapping(upload=0)`.
+An invalidate downloads its requested range after opcode 43 succeeds as well.
+Previously the loop called `interop_rpc()` with at most 4096 bytes per opcode
+40 request; that helper and the native memory handler also capped each read
+at 4096. A 230400-byte range uses 56 full chunks plus a 1024-byte tail: **57
+synchronous reads/frame**, matching the phone result. Persistent upload-buffer
+mapping occurs at initialization and is excluded from frame counts.
+
+The exact bytes transferred remain the requested range
+`[map_offset, map_offset + map_size)` for coherent mapping, or the caller's
+validated subrange for invalidation. `VK_WHOLE_SIZE` resolves to the allocation
+remainder, including any driver allocation padding; this change does not trim
+the transfer to the image's byte count. The supplied aggregate phone counts do
+not encode the actual allocation padding or memory IDs. If the 57 reads are
+one range, its size is between 229377 and 233472 bytes; all those sizes take
+two new reads. The known logical image size is exactly 230400 bytes.
+
+Wire v7 keeps opcode **40**, the **20-byte** request
+`device:u32, memory:u32, offset:u64, length:u32`, and the existing reply
+`status:u32, VkResult:u32, count:u32, length bytes` (`count=1` on success).
+The per-read maximum is **131060 data bytes**, exactly the existing 128 KiB
+broker reply buffer minus its 12-byte prefix. A compile-time check ties the
+limit to that real buffer. No broker buffer or allocation limit is increased.
+A contiguous range uses `ceil(length/131060)` synchronous reads; larger mapped
+ranges are supported without an arbitrary allocation cap. Wire v6 continues
+using 4096-byte reads/writes. Old small v7 read requests remain valid; deploy
+matching new proxy/broker assets because old brokers reject bulk reads.
+
+The proxy reuses a per-device heap reply buffer, grown only when needed to at
+most 128 KiB and freed by existing device/instance cleanup. Its connection lock
+spans the entire transfer. Every complete reply is staged, checked for exact
+payload size and count, then copied into precisely the requested mirror bytes.
+The transport rejects replies exceeding the requested chunk's capacity and
+disconnects on a truncated stream; helper-level malformed replies disconnect
+too. Error replies must have only the prefix with count zero. OOM, native
+failure or malformed replies return failure; no failed chunk is copied from
+stale scratch contents. Earlier successful chunks may already be visible after
+a later failure, as previously, but the operation never reports success.
+Failed initial mapping keeps the output pointer null and follows the existing
+unmap/free cleanup; invalidation propagates failure to its Vulkan caller.
+
+Native memory lookup, host visibility, pending GPU use, AHB exclusion, nonzero
+length, exact request size, mapped-range/allocation bounds and overflow-safe
+subtraction checks remain enforced before any copy. Only the version-specific
+maximum read length changes. Mapping, invalidate, coherent uploads and queue
+submission order are preserved. No asynchronous reads, shortened transfers,
+new opcodes, wait changes or AHB/presentation changes are introduced.
+
+| Measured workload | Before | Expected after bulk reads |
+| --- | --- | --- |
+| MB_MEMORY_READ/frame | 57 | 2 |
+| In-frame mapped-transfer calls/frame | 62 | 7 |
+| Total in-frame calls/frame | 102 | 47 |
+
+These predictions assume the same ranges/workload. Outside-frame calls are
+still accounted separately. Existing opcode/category reports expose read
+calls/frame and mapped/total client RTT; existing frame and broker reports
+retain FPS, service/CPU and opcode 63 wait RTT. Phone A/B must establish the
+actual counts, timings and FPS; no FPS result is promised by this change.
 
 ## Reports and interpretation
 
@@ -199,12 +277,11 @@ management. Semaphore/fence/event creation is also management, rather than a
 wait. AHB creation/release belongs to AHB/presentation. These are accounting
 labels, with no change to wire definitions or Vulkan behavior.
 
-Command recording still uses synchronous per-call replies. It is **not yet
-established as the next bottleneck**. Coherent `MapMemory`/invalidate also read
-back mapped ranges through opcode 40 in 4 KiB chunks; the write optimization
-did not change that. Inspect the next steady phone reports for actual opcode
-counts and category RTT before choosing another optimization. No exact
-decomposition of the 106 calls can be inferred from submit totals alone.
+Command recording still uses synchronous per-call replies. Phone opcode
+profiling establishes it is **not the primary bottleneck** at 14 calls/frame
+and ~8–9% of RTT. Bulk reads address the measured 57 opcode 40 calls/frame;
+the next phone run must confirm their reduction and mapped-transfer/total RTT
+before selecting any further optimization. Opcode 63 waits remain unchanged.
 
 `app.log` / the `MaliVulkanBroker` logcat tag has matching native summaries:
 
@@ -238,11 +315,11 @@ the screen visible and compare several steady windows after warm-up, including
 input, Stop and restart. Capture both session and app logs with Share logs.
 Check balanced FD/resources, no release timeout and no output read/idle/AHB
 creation in steady windows before interpreting performance.
-For the new profiling, verify opcode/category counts and RTT sums, in-frame
-calls still near 106/frame, and separate outside-frame STATS. Compare leaders
-and command-recording RTT share across several steady windows; retain broker
-service/CPU and FPS alongside them. This report-format change still requires
-CI/phone validation; it has not been measured on the phone locally.
+For bulk reads, verify opcode/category counts and RTT sums, opcode 40 near
+two calls/frame, in-frame calls near 47/frame, and separate outside-frame STATS.
+Compare mapped/total client RTT per frame, opcode 63 RTT, broker service/CPU
+and FPS across several steady windows. The profiler is phone-validated; this
+bulk-read change still requires CI/phone A/B validation.
 
 For an instrumented baseline using the original pacing/upload ordering, add
 this line to the existing `/sdcard/Download/droiddeck-env` settings file:
@@ -277,3 +354,9 @@ queue-submit, cleanup and metric helpers with in-memory stubs. It checks exact
 bytes, request reuse, multiple coherent ranges/submissions, partial chunks,
 upload/error ordering, malformed acknowledgments, offsets/overflow, allocation
 failure, native host-visible/pending/AHB guards and legacy read/write bounds.
+Bulk-read cases additionally check exact offset/subrange bytes, one-byte and
+maximum chunks, the 230400-byte two-read case, multi-chunk ranges, reply buffer
+reuse/cleanup, OOM preserving old storage, native errors and partial failures,
+missing/short/oversized/count-invalid replies, no stale-copy success, v6 read
+compatibility and old small v7 read requests. Only extracted small helpers
+are compiled, with in-memory native/transport stubs.

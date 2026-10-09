@@ -35,7 +35,7 @@ struct proxy_resource {
     uint32_t id, pool; enum proxy_resource_kind kind; int live;
     uint8_t *mirror; uint64_t allocation, map_offset, map_size;
 };
-struct proxy_logical { struct proxy_instance *owner; uint32_t id; struct proxy_resource *resources; uint8_t *write_request; uint32_t write_capacity; atomic_int submit_failed; } device;
+struct proxy_logical { struct proxy_instance *owner; uint32_t id; struct proxy_resource *resources; uint8_t *write_request, *read_reply; uint32_t write_capacity, read_capacity; atomic_int submit_failed; } device;
 struct proxy_queue { uint32_t id; struct proxy_logical *owner; } queue;
 struct native_memory { uint32_t id, ahb, type; uint64_t size, map_offset, map_size; void *map, *handle; } memories[2];
 struct native_interop {
@@ -47,8 +47,8 @@ struct native_interop {
     VkResult (*InvalidateMappedMemoryRanges)(void *, unsigned, const VkMappedMemoryRange *);
 };
 struct native_device { void *handle; struct native_interop interop; } native;
-static int pending, fail_write, bad_ack, fail_alloc, disconnects;
-static unsigned writes, submits, allocations;
+static int pending, fail_write, fail_read, bad_ack, bad_read, fail_alloc, disconnects;
+static unsigned writes, reads, submits, allocations;
 static struct proxy_resource command, semaphore;
 static struct native_memory *interop_find_memory(struct native_device *d, uint32_t id) {
     (void)d; for (unsigned i = 0; i < 2; ++i) if (memories[i].id == id && id) return &memories[i]; return NULL;
@@ -79,6 +79,11 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
     }
     assert(op == MB_MEMORY_WRITE || op == MB_MEMORY_READ);
     if (op == MB_MEMORY_WRITE && ++writes == (unsigned)fail_write) return VK_ERROR_DEVICE_LOST;
+    if (op == MB_MEMORY_READ) {
+        assert(bytes == 20 && capacity == MB_PREFIX_BYTES + mb_get_u32(request + 16));
+        assert(capacity <= MB_CAP_MAX_PAYLOAD);
+        if (++reads == (unsigned)fail_read) return VK_ERROR_DEVICE_LOST;
+    }
     uint32_t extra = 0, count = 0; VkResult result = VK_SUCCESS;
     uint32_t status = native_transfer(s->wire_version, op, request, bytes, reply + MB_PREFIX_BYTES, &extra, &count, &result);
     assert(MB_PREFIX_BYTES + extra <= capacity);
@@ -89,19 +94,19 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
         if (bad_ack == 2) *reply_bytes = 8;
         if (bad_ack == 3) mb_put_u32(reply + 8, 1);
     }
+    if (op == MB_MEMORY_READ && bad_read) {
+        if (bad_read == 1) *reply_bytes = 0;
+        if (bad_read == 2) *reply_bytes = 8;
+        if (bad_read == 3) mb_put_u32(reply + 8, 0);
+        if (bad_read == 4) --*reply_bytes;
+        if (bad_read == 5) ++*reply_bytes;
+        if (bad_read == 6) return VK_ERROR_DEVICE_LOST; // Unexpected data on error.
+    }
     return status == MB_OK ? result : VK_ERROR_INITIALIZATION_FAILED;
 }
 #include "metric.inc"
 static int fake_shutdown(int fd, int how) { (void)fd; (void)how; ++disconnects; return 0; }
 static void *test_realloc(void *ptr, size_t size) { ++allocations; return fail_alloc ? NULL : realloc(ptr, size); }
-static VkResult interop_rpc(struct proxy_logical *d, uint32_t op, const uint8_t *args, uint32_t n, uint8_t *out, uint32_t expected) {
-    uint8_t request[MB_INTEROP_CHUNK + 20], reply[MB_PREFIX_BYTES + MB_INTEROP_CHUNK]; uint32_t bytes = 0;
-    assert(op == MB_MEMORY_READ && n == 16 && expected <= MB_INTEROP_CHUNK);
-    mb_put_u32(request, d->id); memcpy(request + 4, args, n); pthread_mutex_lock(&d->owner->lock);
-    VkResult r = rpc(d->owner, op, request, n + 4, reply, &bytes, sizeof(reply));
-    if (r == VK_SUCCESS) { assert(bytes == MB_PREFIX_BYTES + expected); memcpy(out, reply + MB_PREFIX_BYTES, expected); }
-    pthread_mutex_unlock(&d->owner->lock); return r;
-}
 #define realloc test_realloc
 #define shutdown fake_shutdown
 #include "upload.inc"
@@ -140,6 +145,8 @@ static VkResult submit(void) {
 }
 static void finish(void) {
     proxy_free_resources(&device); assert(!device.resources && !device.write_request && !device.write_capacity);
+    assert(!device.read_reply && !device.read_capacity);
+    proxy_free_resources(&device); // Repeated cleanup also leaves no scratch buffer.
     for (unsigned i = 0; i < 2; ++i) free(memories[i].map);
     assert(!pthread_mutex_destroy(&connection.lock));
 }
@@ -165,6 +172,57 @@ static void ordering(void) {
     mapping(1, MB_INTEROP_WRITE_MAX + 1u, 128);
     assert(submit() == VK_SUCCESS && submits == 3 && writes == 5); finish();
 }
+static void read_bulk(void) {
+    setup(7); struct proxy_resource *m = mapping(0, MB_INTEROP_READ_MAX * 4u + 19u, 257);
+    for (uint64_t n = 0; n < m->map_size; ++n) ((uint8_t *)memories[0].map)[n] = (uint8_t)(n * 17 + 3);
+    assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_SUCCESS);
+    assert(reads == 5 && !writes && !memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
+    assert(connection.perf.op[MB_MEMORY_READ].count == 5 && connection.perf.download_bytes == m->map_size);
+    assert(allocations == 1 && device.read_capacity == MB_PREFIX_BYTES + MB_INTEROP_READ_MAX);
+    uint8_t *reply = device.read_reply;
+    memset(m->mirror, 0, (size_t)m->map_size);
+    assert(interop_copy_mapping(m, m->map_offset + 7, MB_INTEROP_READ_MAX, 0) == VK_SUCCESS);
+    assert(reads == 6 && allocations == 1 && device.read_reply == reply);
+    assert(!memcmp(m->mirror + 7, (uint8_t *)memories[0].map + 7, MB_INTEROP_READ_MAX));
+    assert(!m->mirror[6] && !m->mirror[7 + MB_INTEROP_READ_MAX]);
+    // Normal SHM client: 320 * 180 * 4 = 230400 bytes -> 57 old, 2 bulk reads.
+    assert((230400u + MB_INTEROP_CHUNK - 1) / MB_INTEROP_CHUNK == 57);
+    assert(interop_copy_mapping(m, m->map_offset, 230400, 0) == VK_SUCCESS && reads == 8);
+    assert(!memcmp(m->mirror, memories[0].map, 230400));
+    assert(interop_copy_mapping(m, m->map_offset + 3, 1, 0) == VK_SUCCESS && reads == 9);
+    assert(!memcmp(m->mirror + 3, (uint8_t *)memories[0].map + 3, 1));
+    assert(allocations == 1 && device.read_reply == reply);
+    finish();
+}
+static void read_errors(void) {
+    setup(7); struct proxy_resource *m = mapping(0, MB_INTEROP_READ_MAX + 1u, 64);
+    memset(memories[0].map, 0xa7, (size_t)m->map_size);
+    uint8_t before = m->mirror[0], last = m->mirror[m->map_size - 1];
+    fail_alloc = 1;
+    assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_ERROR_OUT_OF_HOST_MEMORY);
+    assert(!reads && !device.read_reply && !device.read_capacity && m->mirror[0] == before);
+    fail_alloc = 0; assert(interop_copy_mapping(m, m->map_offset, 1, 0) == VK_SUCCESS);
+    uint8_t *old_reply = device.read_reply; uint32_t old_capacity = device.read_capacity;
+    fail_alloc = 1;
+    assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_ERROR_OUT_OF_HOST_MEMORY);
+    assert(reads == 1 && device.read_reply == old_reply && device.read_capacity == old_capacity);
+    fail_alloc = 0; reads = 0; memset(&connection.perf, 0, sizeof(connection.perf));
+    fail_read = 2;
+    assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_ERROR_DEVICE_LOST);
+    assert(reads == 2 && connection.perf.op[MB_MEMORY_READ].count == 2);
+    assert(connection.perf.download_bytes == MB_INTEROP_READ_MAX);
+    assert(m->mirror[MB_INTEROP_READ_MAX - 1] == 0xa7 && m->mirror[m->map_size - 1] == last);
+    fail_read = 0; memset(m->mirror, 0x3c, (size_t)m->map_size);
+    for (bad_read = 1; bad_read <= 6; ++bad_read) {
+        assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_ERROR_INITIALIZATION_FAILED);
+        for (uint64_t n = 0; n < m->map_size; ++n) assert(m->mirror[n] == 0x3c);
+    }
+    assert(disconnects == 6); bad_read = 0;
+    pending = 1; assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_ERROR_INITIALIZATION_FAILED);
+    assert(m->mirror[0] == 0x3c); pending = 0;
+    assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_SUCCESS);
+    assert(!memcmp(m->mirror, memories[0].map, (size_t)m->map_size)); finish();
+}
 static void errors(void) {
     setup(7); struct proxy_resource *m = mapping(0, MB_INTEROP_WRITE_MAX + 1u, 0);
     m->mirror[m->map_size - 1] = 0xa7;
@@ -186,8 +244,11 @@ static void bounds(void) {
     setup(7); struct proxy_resource *m = mapping(0, MB_INTEROP_WRITE_MAX + 1u, 128);
     const uint64_t offsets[] = {127, 128, 128 + m->map_size, UINT64_MAX - 3, 129};
     const uint64_t sizes[] = {1, 0, 1, 8, m->map_size};
-    for (unsigned i = 0; i < 5; ++i) assert(interop_copy_mapping(m, offsets[i], sizes[i], 1) == VK_ERROR_INITIALIZATION_FAILED);
-    assert(!writes && !allocations);
+    for (unsigned i = 0; i < 5; ++i) {
+        assert(interop_copy_mapping(m, offsets[i], sizes[i], 1) == VK_ERROR_INITIALIZATION_FAILED);
+        assert(interop_copy_mapping(m, offsets[i], sizes[i], 0) == VK_ERROR_INITIALIZATION_FAILED);
+    }
+    assert(!writes && !reads && !allocations);
     assert(!mb_interop_mapped_range(UINT64_MAX, UINT64_MAX - 3, 8, UINT64_MAX - 3, 1));
     assert(mb_interop_mapped_range(UINT64_MAX, UINT64_MAX - 3, 3, UINT64_MAX - 2, 2));
     assert(mb_interop_mapped_range(64u * 1024u * 1024u, 0, 64u * 1024u * 1024u, 0, 64u * 1024u * 1024u));
@@ -208,7 +269,22 @@ static void bounds(void) {
     native.interop.properties.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     void *map = memories[0].map; memories[0].map = NULL; REJECT(MB_MEMORY_WRITE, 21); memories[0].map = map;
     mb_put_u32(w + 4, 99); REJECT(MB_MEMORY_WRITE, 21); mb_put_u32(w + 4, m->id);
-    mb_put_u32(w + 16, MB_INTEROP_CHUNK + 1u); REJECT(MB_MEMORY_READ, 20);
+    mb_put_u32(w + 16, MB_INTEROP_READ_MAX + 1u); REJECT(MB_MEMORY_READ, 20);
+    mb_put_u32(w + 16, UINT32_MAX); REJECT(MB_MEMORY_READ, 20);
+    mb_put_u32(w + 16, 0); REJECT(MB_MEMORY_READ, 20);
+    mb_put_u32(w + 16, 1); REJECT(MB_MEMORY_READ, 19); REJECT(MB_MEMORY_READ, 21);
+    mb_put_u64(w + 8, UINT64_MAX - 3); mb_put_u32(w + 16, 8); REJECT(MB_MEMORY_READ, 20);
+    mb_put_u64(w + 8, 127); mb_put_u32(w + 16, 1); REJECT(MB_MEMORY_READ, 20);
+    mb_put_u64(w + 8, m->map_offset + m->map_size); REJECT(MB_MEMORY_READ, 20);
+    mb_put_u64(w + 8, 128); pending = 1; REJECT(MB_MEMORY_READ, 20); pending = 0;
+    memories[0].ahb = 1; REJECT(MB_MEMORY_READ, 20); memories[0].ahb = 0;
+    native.interop.properties.memoryTypes[0].propertyFlags = 0; REJECT(MB_MEMORY_READ, 20);
+    native.interop.properties.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    memories[0].map = NULL; REJECT(MB_MEMORY_READ, 20); memories[0].map = map;
+    mb_put_u32(w + 4, 99); REJECT(MB_MEMORY_READ, 20); mb_put_u32(w + 4, m->id);
+    // Allocation and mapped-range checks are independent.
+    uint64_t allocation = memories[0].size; memories[0].size = 128; REJECT(MB_MEMORY_READ, 20);
+    memories[0].size = allocation;
 #undef REJECT
     free(w); finish();
 }
@@ -216,18 +292,29 @@ static void legacy(void) {
     setup(6); struct proxy_resource *m = mapping(0, MB_INTEROP_WRITE_MAX, 64);
     assert(interop_copy_mapping(m, m->map_offset, m->map_size, 1) == VK_SUCCESS && writes == 128);
     assert(!memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
-    connection.wire_version = 7;
     memset(m->mirror, 0, (size_t)m->map_size);
     assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_SUCCESS);
     assert(connection.perf.op[MB_MEMORY_READ].count == 128 && !memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
+    connection.wire_version = 7; memset(&connection.perf, 0, sizeof(connection.perf));
+    memset(m->mirror, 0, (size_t)m->map_size);
+    assert(interop_copy_mapping(m, m->map_offset, m->map_size, 0) == VK_SUCCESS);
+    assert(connection.perf.op[MB_MEMORY_READ].count == 5 && !memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
     uint8_t w[20] = {0}, reply[1]; uint32_t extra = 0, count = 0; VkResult result = VK_SUCCESS;
     mb_put_u32(w, device.id); mb_put_u32(w + 4, m->id); mb_put_u64(w + 8, 64); mb_put_u32(w + 16, MB_INTEROP_CHUNK + 1u);
     assert(native_transfer(6, MB_MEMORY_WRITE, w, 20u + MB_INTEROP_CHUNK + 1u, reply, &extra, &count, &result) == MB_PROTOCOL_ERROR);
+    assert(native_transfer(6, MB_MEMORY_READ, w, 20, reply, &extra, &count, &result) == MB_PROTOCOL_ERROR);
+    // Old v7 small read requests remain valid too (no oversized response).
+    mb_put_u32(w + 16, 1);
+    assert(native_transfer(7, MB_MEMORY_READ, w, 20, reply, &extra, &count, &result) == MB_OK && extra == 1 && count == 1);
+    connection.wire_version = 5;
+    assert(interop_copy_mapping(m, m->map_offset, 1, 0) == VK_ERROR_FEATURE_NOT_PRESENT);
     assert(!mb_interop_write_size(7, UINT32_MAX, UINT32_MAX - 20u)); finish();
 }
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strcmp(argv[1], "bulk")) bulk();
+    else if (!strcmp(argv[1], "read_bulk")) read_bulk();
+    else if (!strcmp(argv[1], "read_errors")) read_errors();
     else if (!strcmp(argv[1], "ordering")) ordering();
     else if (!strcmp(argv[1], "errors")) errors();
     else if (!strcmp(argv[1], "bounds")) bounds();

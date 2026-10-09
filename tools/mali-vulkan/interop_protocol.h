@@ -8,11 +8,14 @@
 #include <stdint.h>
 #define MB_INTEROP_VERSION 6u
 #define MB_INTEROP_MAX_MEMORY (1024u * 1024u)
-#define MB_INTEROP_CHUNK 4096u /* reads and legacy v6 writes */
+#define MB_INTEROP_CHUNK 4096u /* legacy v6 reads/writes */
 #define MB_INTEROP_BULK_VERSION 7u
 /* Per-message bound, not an allocation/mapped-range limit. Fits the existing
  * renderer request buffer (512 KiB + 256); larger ranges use multiple writes. */
 #define MB_INTEROP_WRITE_MAX (512u * 1024u)
+/* Existing broker reply bound, minus its 12-byte status/result/count prefix.
+ * This is a message limit; larger mapped ranges use multiple bulk reads. */
+#define MB_INTEROP_READ_MAX (128u * 1024u - 12u)
 #define MB_MEMORY_WRITE_HEADER 20u
 #define MB_INTEROP_MAX_REFS 16u
 #define MB_BUFFER_CREATE 32u /* device,u64 size,u32 usage -> ID */
@@ -23,7 +26,7 @@
 #define MB_BUFFER_BIND 37u /* device,buffer,memory,u64 offset */
 #define MB_MEMORY_MAP 38u /* device,memory,u64 offset,u64 size */
 #define MB_MEMORY_UNMAP 39u /* device,memory */
-#define MB_MEMORY_READ 40u /* device,memory,u64 absolute offset,u32 length -> bytes */
+#define MB_MEMORY_READ 40u /* device,memory,u64 absolute offset,u32 length -> bytes; v7 bulk */
 #define MB_MEMORY_WRITE 41u /* same header, then length bytes; v7 bulk writes allowed */
 #define MB_MEMORY_FLUSH 42u /* device,memory,u64 offset,u64 size */
 #define MB_MEMORY_INVALIDATE 43u /* same; native range, atom alignment enforced */
@@ -47,6 +50,9 @@
 #define MB_AHB_PRESENT 59u /* device,AHB,sync -> completed consumer handoff; no pixel copying */
 static inline uint32_t mb_interop_write_limit(uint32_t version) {
     return version >= MB_INTEROP_BULK_VERSION ? MB_INTEROP_WRITE_MAX : MB_INTEROP_CHUNK;
+}
+static inline uint32_t mb_interop_read_limit(uint32_t version) {
+    return version >= MB_INTEROP_BULK_VERSION ? MB_INTEROP_READ_MAX : MB_INTEROP_CHUNK;
 }
 /* Subtraction-based checks never evaluate offset+length or map_offset+map_size. */
 static inline int mb_interop_mapped_range(uint64_t allocation, uint64_t map_offset,
