@@ -21,6 +21,15 @@ static VkResult mock_instance_extensions(const char *layer, uint32_t *count, VkE
 }
 static VkResult mock_device_extensions(VkPhysicalDevice d, const char *layer, uint32_t *count, VkExtensionProperties *p) {
     assert(d == (VkPhysicalDevice)(uintptr_t)0x42 && !layer);
+    if (mode >= 43) {
+        const char *names[12]; unsigned n = 0;
+        for (unsigned i = 0; i < 11; ++i) {
+            if (i == 7 || (mode == 44 && i == 4) || (mode == 45 && i == 5)) continue;
+            names[n++] = device_names[i];
+        }
+        names[n++] = "VK_KHR_image_format_list";
+        return mock_extension_list(names, n, count, p);
+    }
     return mock_extension_list(device_names, mode == 6 ? 0 : mode >= 29 && mode != 33 ? 11 : 9, count, p);
 }
 static void mock_features(VkPhysicalDevice d, VkPhysicalDeviceFeatures *p) {
@@ -32,9 +41,9 @@ static void mock_features2(VkPhysicalDevice d, VkPhysicalDeviceFeatures2 *p) {
     for (VkBaseOutStructure *v = p->pNext; v; v = v->pNext) {
         switch (v->sType) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
-            ((VkPhysicalDeviceTimelineSemaphoreFeatures *)v)->timelineSemaphore = VK_TRUE; break;
+            ((VkPhysicalDeviceTimelineSemaphoreFeatures *)v)->timelineSemaphore = mode == 47 ? VK_FALSE : VK_TRUE; break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES:
-            ((VkPhysicalDeviceScalarBlockLayoutFeatures *)v)->scalarBlockLayout = VK_FALSE; break;
+            ((VkPhysicalDeviceScalarBlockLayoutFeatures *)v)->scalarBlockLayout = mode >= 43 && mode != 46 ? VK_TRUE : VK_FALSE; break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
             ((VkPhysicalDeviceSamplerYcbcrConversionFeatures *)v)->samplerYcbcrConversion = VK_TRUE; break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES:

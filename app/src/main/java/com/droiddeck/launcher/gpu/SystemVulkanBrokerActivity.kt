@@ -29,7 +29,9 @@ class SystemVulkanBrokerActivity : Activity() {
             "Run Vulkan buffer memory test" to "--vk-buffer-memory-test",
             "Run Vulkan image memory test" to "--vk-image-memory-test",
             "Run Vulkan AHardwareBuffer test" to "--vk-ahb-test",
-            "Run Vulkan AHB presentation test" to "--vk-ahb-present-test"
+            "Run Vulkan AHB presentation test" to "--vk-ahb-present-test",
+            "Run Gamescope renderer init test" to "--vk-gamescope-renderer-init-test",
+            "Run Gamescope first frame test" to "--vk-gamescope-first-frame-test"
         ).map { (label, option) ->
             Button(this).apply { text = label; isEnabled = false } to option
         }

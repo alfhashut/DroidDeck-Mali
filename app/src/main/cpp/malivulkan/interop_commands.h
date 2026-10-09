@@ -1,4 +1,7 @@
 /* Real Android Vulkan calls for the deliberately small v6 diagnostic subset. */
+static void native_renderer_complete(struct native_device *, struct native_command *);
+static int native_renderer_can_submit(struct native_device *, struct native_command *);
+static int native_renderer_image_referenced(struct native_device *, uint32_t);
 static void native_complete_fence(struct native_device *, uint32_t);
 static void native_drain_device(struct native_device *);
 static int native_interop_init(struct native_device *d, int ahb) {
@@ -43,11 +46,13 @@ static struct native_command *interop_recording(struct native_device *d, uint32_
     return NULL;
 }
 static void native_interop_complete(struct native_device *d, struct native_command *c) {
+    if (c->renderer) { native_renderer_complete(d, c); return; }
     struct native_image *image = interop_find_image(d, c->image_id);
     if (image) { image->layout = c->final_layout; image->foreign = c->image_foreign; }
 }
 static int native_interop_can_submit(struct native_device *d, struct native_command *c) {
     if (!d->interop.enabled) return 1;
+    if (c->renderer) return native_renderer_can_submit(d, c);
     struct native_image *image = interop_find_image(d, c->image_id);
     if (c->image_id && (!image || image->foreign != c->initial_foreign || image->layout != c->initial_layout)) return 0;
     for (unsigned i = 0; i < c->ref_count; ++i) {
@@ -122,7 +127,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     switch (op) {
     case MB_BUFFER_CREATE: {
         uint64_t size = mb_get_u64(w + 4); uint32_t usage = mb_get_u32(w + 12);
-        if (!size || size > MB_INTEROP_MAX_MEMORY || !usage || (usage & ~(VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT))) return MB_PROTOCOL_ERROR;
+        if (!size || size > MB_INTEROP_MAX_MEMORY || !usage || (usage & ~(VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (d->renderer.enabled ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : 0)))) return MB_PROTOCOL_ERROR;
         NEW_INTEROP(buffers, buffer);
         VkBufferCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         *result = v->CreateBuffer(d->handle, &ci, NULL, &o->handle);
@@ -137,7 +142,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
             .extent = {width, height, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
         *result = v->CreateImage(d->handle, &ci, NULL, &o->handle);
-        if (*result == VK_SUCCESS) { o->id = new_id; o->width = width; o->height = height; o->usage = usage; v->GetImageMemoryRequirements(d->handle, o->handle, &o->req); }
+        if (*result == VK_SUCCESS) { o->id = new_id; o->width = width; o->height = height; o->type = VK_IMAGE_TYPE_2D; o->depth = 1; o->usage = usage; v->GetImageMemoryRequirements(d->handle, o->handle, &o->req); }
         break;
     }
     case MB_BUFFER_REQUIREMENTS: case MB_IMAGE_REQUIREMENTS: {
@@ -148,7 +153,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
     }
     case MB_BUFFER_DESTROY: case MB_IMAGE_DESTROY: {
         struct native_buffer *b = interop_find_buffer(d, id); struct native_image *im = interop_find_image(d, id);
-        if ((op == MB_BUFFER_DESTROY && !b) || (op == MB_IMAGE_DESTROY && !im) || interop_referenced(d, id, 0)) return MB_PROTOCOL_ERROR;
+        if ((op == MB_BUFFER_DESTROY && !b) || (op == MB_IMAGE_DESTROY && !im) || interop_referenced(d, id, 0) || (im && native_renderer_image_referenced(d, id))) return MB_PROTOCOL_ERROR;
         struct native_memory *m = interop_find_memory(d, op == MB_BUFFER_DESTROY ? b->memory : im->memory);
         if (m) m->bound = 0;
         if (op == MB_BUFFER_DESTROY) { v->DestroyBuffer(d->handle, b->handle, NULL); memset(b, 0, sizeof(*b)); }
@@ -281,7 +286,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
             if (!a && !v->ahbs[i].id) a = &v->ahbs[i];
         }
         if (!im || !m || !a) FAIL_NATIVE(VK_ERROR_TOO_MANY_OBJECTS);
-        const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (d->renderer.enabled ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
         VkPhysicalDeviceExternalImageFormatInfo external = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
         VkPhysicalDeviceImageFormatInfo2 query = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &external,
             .format = VK_FORMAT_R8G8B8A8_UNORM, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage};
@@ -305,7 +310,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         VkAndroidHardwareBufferFormatPropertiesANDROID format = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
         VkAndroidHardwareBufferPropertiesANDROID ap = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, .pNext = &format};
         *result = v->ahb_properties(d->handle, ahb, &ap);
-        if (*result == VK_SUCCESS && (format.format != VK_FORMAT_R8G8B8A8_UNORM || desc.width != width || desc.height != height || desc.layers != 1 || desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM || !ap.allocationSize || !(format.formatFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || !(format.formatFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))) *result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if (*result == VK_SUCCESS && (format.format != VK_FORMAT_R8G8B8A8_UNORM || desc.width != width || desc.height != height || desc.layers != 1 || desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM || !ap.allocationSize || !(format.formatFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || !(format.formatFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) || (d->renderer.enabled && !(format.formatFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)))) *result = VK_ERROR_FORMAT_NOT_SUPPORTED;
         uint32_t type = UINT32_MAX;
         for (unsigned pass = 0; pass < 2 && type == UINT32_MAX; ++pass)
             for (uint32_t i = 0; i < v->properties.memoryTypeCount; ++i)
@@ -330,7 +335,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         /* AHB image requirements can only be queried AFTER binding (VUID 04004). */
         v->GetImageMemoryRequirements(d->handle, image, &im->req);
         im->id = ++s->next_resource_id; m->id = ++s->next_resource_id; a->id = ++s->next_resource_id;
-        im->handle = image; im->memory = m->id; im->ahb = a->id; im->foreign = 1; im->width = width; im->height = height; im->usage = usage;
+        im->handle = image; im->memory = m->id; im->ahb = a->id; im->foreign = 1; im->type = VK_IMAGE_TYPE_2D; im->depth = 1; im->width = width; im->height = height; im->usage = usage;
         m->handle = memory; m->size = ap.allocationSize; m->type = type; m->bound = im->id; m->ahb = a->id;
         a->handle = ahb; a->desc = desc; a->image = im->id; a->memory = m->id;
         mb_put_u32(reply, im->id); mb_put_u32(reply + 4, m->id); mb_put_u32(reply + 8, a->id);
@@ -394,11 +399,11 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         if (*result != VK_SUCCESS) goto finished;
         if (!im->foreign || im->layout != VK_IMAGE_LAYOUT_GENERAL) return MB_PROTOCOL_ERROR;
         if (op == MB_AHB_PRESENT) {
-            int cr = mb_consumer_present(a->handle, &a->desc, sync->fd);
+            int cr = d->renderer.enabled ? mb_consumer_present_renderer(a->handle, &a->desc, sync->fd) : mb_consumer_present(a->handle, &a->desc, sync->fd);
             LOG("AHB presentation consumer result=%d (0 means completion and previous-buffer release observed)", cr);
             if (cr) FAIL_NATIVE(VK_ERROR_INITIALIZATION_FAILED);
         } else {
-            uint32_t pattern = mb_get_u32(w + 12); if (pattern > 1) return MB_PROTOCOL_ERROR;
+            uint32_t pattern = mb_get_u32(w + 12); if (pattern > (d->renderer.enabled ? 2u : 1u)) return MB_PROTOCOL_ERROR;
             uint32_t checked = 0;
             if (a->desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) {
                 void *ptr = NULL; int ar = AHardwareBuffer_lock(a->handle, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, NULL, &ptr);
@@ -409,6 +414,14 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
                     if (y < a->desc.height / 2) q[x < a->desc.width / 2 ? 0 : 1] = 255;
                     else if (x < a->desc.width / 2) q[2] = 255; else q[0] = q[1] = q[2] = 255;
                     const uint8_t *p = (const uint8_t *)ptr + ((uint64_t)y * a->desc.stride + x) * 4;
+                    if (pattern == 2) {
+                        q[0] = q[1] = q[2] = 0;
+                        if (x >= 64 && x < 192 && y >= 64 && y < 192) {
+                            if (y < 128) q[x < 128 ? 0 : 1] = 255;
+                            else if (x < 128) q[2] = 255; else q[0] = q[1] = q[2] = 255;
+                        }
+                        if ((x == 96 || x == 160) && (y == 96 || y == 160)) LOG("actual final AHB CPU pixel(%u,%u) RGBA=(%u,%u,%u,%u)", x, y, p[0], p[1], p[2], p[3]);
+                    }
                     if (memcmp(p, pattern ? q : clear, 4)) ++bad;
                 }
                 int release = -1; ar = AHardwareBuffer_unlock(a->handle, &release);

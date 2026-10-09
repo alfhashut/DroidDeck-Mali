@@ -1,4 +1,5 @@
 /* Narrow synchronous recording RPCs, never a general command stream. */
+static void native_renderer_close(struct native_device *);
 static int native_submit_init(struct native_device *d) {
 #define MB_SUBMIT_ENTRY(n) d->submit.n = (PFN_vk##n)d->gdpa(d->handle, "vk" #n); \
     if (!d->submit.n) return -1;
@@ -76,6 +77,7 @@ static void native_close_device(struct native_device *d) {
         struct native_pool *p = &d->submit.pools[i];
         if (p->id) { d->submit.DestroyCommandPool(d->handle, p->handle, NULL); LOG("command pool destroyed device ID=%u pool ID=%u (cleanup)", d->id, p->id); }
     }
+    native_renderer_close(d);
     native_interop_close(d);
     d->destroy(d->handle, NULL); LOG("vkDestroyDevice id=%u", d->id);
     memset(d, 0, sizeof(*d));
@@ -110,9 +112,10 @@ static uint32_t native_submit_command(struct vk_session *s, uint32_t op, const u
     if (!o) { *result = VK_ERROR_TOO_MANY_OBJECTS; return MB_VULKAN_ERROR; }
     switch (op) {
     case MB_POOL_CREATE: {
-        if (id != d->family || mb_get_u32(wire + 8)) return MB_PROTOCOL_ERROR;
+        uint32_t flags = mb_get_u32(wire + 8);
+        if (id != d->family || (flags && (!d->renderer.enabled || flags != VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT))) return MB_PROTOCOL_ERROR;
         NEW_SLOT(pools, pool)
-        VkCommandPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = id};
+        VkCommandPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = id, .flags = flags};
         *result = v->CreateCommandPool(d->handle, &ci, NULL, &o->handle);
         if (*result == VK_SUCCESS) { o->id = new_id; o->family = id; LOG("command pool created device ID=%u pool ID=%u family=%u", device, new_id, id); }
         break;
@@ -145,8 +148,9 @@ static uint32_t native_submit_command(struct vk_session *s, uint32_t op, const u
         struct native_command *c = native_find_command(d, id);
         if (!c) return MB_PROTOCOL_ERROR;
         if (op == MB_COMMAND_BEGIN) {
-            if (c->state || mb_get_u32(wire + 8)) return MB_PROTOCOL_ERROR;
-            VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            uint32_t flags = mb_get_u32(wire + 8);
+            if (c->state || (flags && (!d->renderer.enabled || flags != VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT))) return MB_PROTOCOL_ERROR;
+            VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = flags};
             *result = v->BeginCommandBuffer(c->handle, &bi);
             c->state = *result == VK_SUCCESS ? 1 : 5;
             LOG("vkBeginCommandBuffer device ID=%u command ID=%u result=%d", device, id, (int)*result);

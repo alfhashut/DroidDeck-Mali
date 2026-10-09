@@ -5,6 +5,7 @@ struct mock_object {
     struct mock_logical *device;
     unsigned kind, state, pending;
     struct mock_object *pool, *event, *fence;
+    struct mock_render *pipeline, *descriptor, *timeline; uint64_t signal_value;
     unsigned op_count; struct mock_op ops[64];
     int exportable, exported, writer;
 };
@@ -19,10 +20,11 @@ static void mock_execute(struct mock_object *c) {
     if (c->fence) { c->fence->state = 1; c->fence->pending = 0;
         if (c->fence->writer >= 0) { assert(write(c->fence->writer, "x", 1) == 1); close(c->fence->writer); c->fence->writer = -1; }
     }
+    mock_timeline_signal(c);
     c->pending = 0; ++executions;
 }
 static VkResult mock_CreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkCommandPool *out) {
-    assert(!a && !ci->pNext && !ci->flags && ci->queueFamilyIndex == ((struct mock_logical *)device)->family);
+    assert(!a && !ci->pNext && (!ci->flags || (mode >= 43 && ci->flags == VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)) && ci->queueFamilyIndex == ((struct mock_logical *)device)->family);
     if (mode == 15) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     *out = (VkCommandPool)mock_object_new(device, 1); ++pools_created; return VK_SUCCESS;
 }
@@ -46,7 +48,7 @@ static void mock_FreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_
     free(c); ++commands_freed;
 }
 static VkResult mock_BeginCommandBuffer(VkCommandBuffer buffer, const VkCommandBufferBeginInfo *bi) {
-    struct mock_object *c = (struct mock_object *)buffer; assert(c->kind == 2 && !c->state && !bi->flags && !bi->pNext && !bi->pInheritanceInfo);
+    struct mock_object *c = (struct mock_object *)buffer; assert(c->kind == 2 && !c->state && (!bi->flags || (mode >= 43 && bi->flags == VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)) && !bi->pNext && !bi->pInheritanceInfo);
     if (mode == 18) return VK_ERROR_OUT_OF_HOST_MEMORY;
     c->state = 1; return VK_SUCCESS;
 }
@@ -100,16 +102,23 @@ static VkResult mock_WaitForFences(VkDevice device, uint32_t count, const VkFenc
     return f->state ? VK_SUCCESS : VK_TIMEOUT;
 }
 static VkResult mock_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *si, VkFence fence) {
+    if (mode == 54) return VK_ERROR_DEVICE_LOST;
     struct mock_logical *d = (struct mock_logical *)queue;
-    assert(count == 1 && !si->pNext && !si->waitSemaphoreCount && !si->signalSemaphoreCount && si->commandBufferCount == 1);
+    assert(count == 1 && !si->waitSemaphoreCount && si->commandBufferCount == 1 && ((mode >= 43 && si->pNext && si->signalSemaphoreCount == 1) || (!si->pNext && !si->signalSemaphoreCount)));
     struct mock_object *c = (struct mock_object *)si->pCommandBuffers[0], *f = (struct mock_object *)fence;
     assert(c->device == d && c->state == 2 && !c->pending && (c->event || c->op_count));
     if (mode == 21) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (mode == 23) { d->lost = 1; return VK_ERROR_DEVICE_LOST; }
     if (f) { mock_child((VkDevice)d, f, 4); assert(!f->state && !f->pending); f->pending = 1; }
+    if (si->pNext) {
+        const VkTimelineSemaphoreSubmitInfoKHR *t = si->pNext;
+        assert(t->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR && !t->pNext && !t->waitSemaphoreValueCount && t->signalSemaphoreValueCount == 1);
+        c->timeline = (void *)si->pSignalSemaphores[0]; c->signal_value = t->pSignalSemaphoreValues[0];
+    }
     c->fence = f; c->pending = 1; if (c->event) c->event->pending = 1; ++submits; return VK_SUCCESS;
 }
 static VkResult mock_DeviceWaitIdle(VkDevice device) {
+    if (mode == 58) return VK_ERROR_DEVICE_LOST;
     struct mock_logical *d = (struct mock_logical *)device;
     if (mode == 27 && !d->idle_retries++) { ++idle_calls; return VK_ERROR_OUT_OF_HOST_MEMORY; }
     ++idle_calls;

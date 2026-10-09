@@ -74,7 +74,7 @@ static void apply_wait(struct consumer_api *api, ASurfaceTransaction *t, struct 
     while (!c->done) pthread_cond_wait(&c->cond, &c->mutex);
     pthread_mutex_unlock(&c->mutex);
 }
-int mb_consumer_present(AHardwareBuffer *ahb, const AHardwareBuffer_Desc *desc, int producer_fd) {
+static int consumer_present(AHardwareBuffer *ahb, const AHardwareBuffer_Desc *desc, int producer_fd, unsigned preview_us) {
     /* Gate before acquisition even when the caller has not performed SYNC_WAIT. */
     if (wait_fd(producer_fd, 5000)) { CLOG("consumer blocked: producer sync not signaled"); return -1; }
     pthread_mutex_lock(&window_lock); ANativeWindow *window = debug_window;
@@ -128,7 +128,7 @@ int mb_consumer_present(AHardwareBuffer *ahb, const AHardwareBuffer_Desc *desc, 
     if (c.present < 0) CLOG("hardware present fence unavailable; SurfaceControl OnComplete confirms consumer completion");
     if (c.present >= 0) close(c.present);
     if (c.release >= 0) { (void)wait_fd(c.release, -1); close(c.release); }
-    usleep(1000000); /* Visible quadrants; not a normal compositor/session. */
+    usleep(preview_us); /* Diagnostic preview, retained until real Android release. */
     t = api.ASurfaceTransaction_create();
     /* A transaction allocation failure cannot authorize releasing an active buffer. */
     while (!t) { usleep(10000); t = api.ASurfaceTransaction_create(); }
@@ -150,4 +150,11 @@ library_out:
     dlclose(library);
 window_out:
     ANativeWindow_release(window); return result;
+}
+
+int mb_consumer_present(AHardwareBuffer *ahb, const AHardwareBuffer_Desc *desc, int producer_fd) {
+    return consumer_present(ahb, desc, producer_fd, 1000000);
+}
+int mb_consumer_present_renderer(AHardwareBuffer *ahb, const AHardwareBuffer_Desc *desc, int producer_fd) {
+    return consumer_present(ahb, desc, producer_fd, 3000000);
 }

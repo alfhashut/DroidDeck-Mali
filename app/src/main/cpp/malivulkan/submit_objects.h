@@ -7,6 +7,10 @@ struct native_submit {
     int lost;
     struct native_pool { uint32_t id, family; VkCommandPool handle; } pools[MB_SUBMIT_MAX_OBJECTS];
     struct native_command {
+        uint32_t renderer, semaphore, pipeline, descriptor_set; uint64_t signal_value;
+        uint64_t descriptor_revision;
+        uint32_t renderer_image_count;
+        struct { uint32_t id, initial_foreign, foreign; VkImageLayout initial, final; } renderer_images[16];
         uint32_t id, pool, family, event, fence;
         /* 0 initial, 1 recording, 2 executable, 3 pending, 4 completed, 5 invalid. */
         unsigned state;

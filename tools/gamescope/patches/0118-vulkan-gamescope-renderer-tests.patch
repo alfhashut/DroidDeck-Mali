@@ -1,0 +1,782 @@
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -30,6 +30,7 @@
+ #include "vulkan_device_test.hpp"
+ #include "vulkan_submit_test.hpp"
+ #include "vulkan_interop_test.hpp"
++#include "vulkan_renderer_test.hpp"
+ #include "wlserver.hpp"
+ #include "convar.h"
+ #include "gpuvis_trace_utils.h"
+@@ -67,6 +68,8 @@
+ 	{ "version", no_argument, nullptr, 0 },
+ 	{ "vk-enumerate-only", no_argument, nullptr, 0 },
+ 	{ "vk-capabilities", no_argument, nullptr, 0 },
++	{ "vk-gamescope-renderer-init-test", no_argument, nullptr, 0 },
++	{ "vk-gamescope-first-frame-test", no_argument, nullptr, 0 },
+ 	{ "vk-create-device-test", no_argument, nullptr, 0 },
+ 	{ "vk-submit-test", no_argument, nullptr, 0 },
+ 	{ "vk-buffer-memory-test", no_argument, nullptr, 0 },
+@@ -188,6 +191,8 @@
+ 	"  --vk-ahb-test    real AHardwareBuffer import and sync; independent diagnostic\n"
+ 	"  --vk-ahb-present-test    display actual Vulkan AHardwareBuffer; independent diagnostic\n"
+ 	"  --vk-submit-test               execute one event command and verify fence completion; no rendering\n"
++	"  --vk-gamescope-renderer-init-test  initialize the real Gamescope Mali BLIT renderer; no backend\n"
++	"  --vk-gamescope-first-frame-test    render and present a real Gamescope Mali BLIT frame through AHB\n"
+ 	"  --vk-create-device-test       create/destroy a real Vulkan device and obtain a queue; no rendering\n"
+ 	"  --vk-capabilities              print Vulkan capabilities without initializing a renderer/backend\n"
+ 	"  -W, --output-width             output width\n"
+@@ -738,6 +743,8 @@
+ 	// The standalone diagnostic exits before any normal startup, including scripts/X11.
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-enumerate-only" ) == 0 )
+ 		return vulkan_enumerate_only();
++	if ( argc == 2 && strcmp( argv[1], "--vk-gamescope-renderer-init-test" ) == 0 ) return vulkan_gamescope_renderer_test(false);
++	if ( argc == 2 && strcmp( argv[1], "--vk-gamescope-first-frame-test" ) == 0 ) return vulkan_gamescope_renderer_test(true);
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-buffer-memory-test" ) == 0 )
+ 		return vulkan_buffer_memory_test();
+ 	if ( argc == 2 && strcmp( argv[1], "--vk-image-memory-test" ) == 0 )
+@@ -830,7 +837,11 @@
+ 					return 0;
+ 				} else if (strcmp(opt_name, "vk-enumerate-only") == 0) {
+ 					return vulkan_enumerate_only();
+-				} else if (strcmp(opt_name, "vk-buffer-memory-test") == 0) {
++				} else if (strcmp(opt_name, "vk-gamescope-renderer-init-test") == 0) {
++                    return vulkan_gamescope_renderer_test(false);
++                } else if (strcmp(opt_name, "vk-gamescope-first-frame-test") == 0) {
++                    return vulkan_gamescope_renderer_test(true);
++                } else if (strcmp(opt_name, "vk-buffer-memory-test") == 0) {
+ 					return vulkan_buffer_memory_test();
+ 				} else if (strcmp(opt_name, "vk-image-memory-test") == 0) {
+ 					return vulkan_image_memory_test();
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1,6 +1,7 @@
+ // Initialize Vulkan and composite stuff with a compute queue
+ 
+ #include <cassert>
++#include <cstring>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <stdio.h>
+@@ -56,6 +57,8 @@
+ #include "shaders/ffx_fsr1.h"
+ 
+ #include "reshade_effect_manager.hpp"
++#include "vulkan_renderer_test.hpp"
++#include "interop_test_api.h"
+ 
+ extern bool g_bWasPartialComposite;
+ extern bool g_bAllowDeferredBackend;
+@@ -144,6 +147,8 @@
+ // Debug verbosity turns the timestamp queries on, so log_composite_timing debug is the switch.
+ static LogScope composite_timing_log("composite_timing");
+ 
++static VkResult s_maliLastResult = VK_SUCCESS;
++static char s_maliLastOperation[1024]{};
+ static void vk_errorf(VkResult result, const char *fmt, ...) {
+ 	static char buf[1024];
+ 	va_list args;
+@@ -152,6 +157,10 @@
+ 	va_end(args);
+ 
+ 	vk_log.errorf("%s (VkResult: %d)", buf, result);
++    if (g_device.IsMaliDiagnostic()) {
++        s_maliLastResult = result; std::snprintf(s_maliLastOperation, sizeof(s_maliLastOperation), "%s", buf);
++        std::fprintf(stderr, "gamescope: last Vulkan operation: %s; VkResult=%d\n", buf, int(result));
++    }
+ }
+ 
+ // For when device is up and it would be totally fatal to fail
+@@ -162,6 +171,7 @@
+ 		if ( ( check_res = ( x ) ) != VK_SUCCESS ) \
+ 		{ \
+ 			vk_errorf( check_res, #x " failed!" ); \
++			if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic(#x, check_res); \
+ 			abort(); \
+ 		} \
+ 	} while ( 0 )
+@@ -294,7 +304,7 @@
+ 	return false;
+ }
+ 
+-bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
++bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface, bool maliDiagnostic)
+ {
+ 	assert(instance);
+ 	assert(!m_bInitialized);
+@@ -302,6 +312,7 @@
+ 	g_output.surface = surface;
+ 
+ 	m_instance = instance;
++    m_maliDiagnostic = maliDiagnostic;
+ 	#define VK_FUNC(x) vk.x = (PFN_vk##x) g_pfn_vkGetInstanceProcAddr(instance, "vk"#x);
+ 	VULKAN_INSTANCE_FUNCTIONS
+ 	#undef VK_FUNC
+@@ -321,6 +332,12 @@
+ 
+ 	m_bInitialized = true;
+ 
++    if (m_maliDiagnostic) {
++        if (!CreateMaliDiagnosticDummies()) return false;
++        if (!pipeline(SHADER_TYPE_BLIT, 1, 0, 0, GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB, EOTF_Count)) return false;
++        std::puts("descriptor infrastructure created; shader modules created; compositor pipeline created");
++        return true;
++    }
+ 	m_pipelineThread = std::jthread([this](std::stop_token st){compileAllPipelines(st);});
+ 
+ 	g_reshadeManager.init(this);
+@@ -353,7 +370,7 @@
+ 		VkPhysicalDeviceProperties deviceProperties;
+ 		vk.GetPhysicalDeviceProperties(cphysDev, &deviceProperties);
+ 
+-		if (deviceProperties.apiVersion < VK_API_VERSION_1_2)
++		if (m_maliDiagnostic ? (deviceProperties.vendorID != 0x13b5 || deviceProperties.deviceID != 0x74021000 || deviceProperties.apiVersion < VK_API_VERSION_1_1) : deviceProperties.apiVersion < VK_API_VERSION_1_2)
+ 			continue;
+ 
+ 		uint32_t queueFamilyCount = 0;
+@@ -421,6 +438,7 @@
+ 
+ 	if (!m_physDev)
+ 	{
++		if (m_maliDiagnostic) vk_errorf(VK_ERROR_FEATURE_NOT_PRESENT, "required Mali-G52 Vulkan 1.1 compute queue");
+ 		vk_log.errorf("failed to find physical device");
+ 		return false;
+ 	}
+@@ -434,6 +452,7 @@
+ 
+ bool CVulkanDevice::createDevice()
+ {
++    if (m_maliDiagnostic) return CreateMaliDiagnosticDevice();
+ 	uint32_t supportedExtensionCount;
+ 	vk.EnumerateDeviceExtensionProperties( physDev(), NULL, &supportedExtensionCount, NULL );
+ 
+@@ -762,6 +781,10 @@
+ 
+ bool CVulkanDevice::createLayouts()
+ {
++    if (m_maliDiagnostic) {
++        m_ycbcrSampler = sampler(SamplerState{});
++        if (!m_ycbcrSampler) return false;
++    } else {
+ 	VkFormatProperties nv12Properties;
+ 	vk.GetPhysicalDeviceFormatProperties(physDev(), VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &nv12Properties);
+ 	bool cosited = nv12Properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
+@@ -798,6 +821,7 @@
+ 	
+ 	vk.CreateSampler( device(), &ycbcrSamplerInfo, nullptr, &m_ycbcrSampler );
+ 
++    }
+ 	// Create an array of our ycbcrSampler to fill up
+ 	std::array<VkSampler, VKR_SAMPLER_SLOTS> ycbcrSamplers;
+ 	for (auto& sampler : ycbcrSamplers)
+@@ -924,7 +948,8 @@
+ 		.pNext = &ycbcrProps,
+ 	};
+ 
+-	res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
++	if (m_maliDiagnostic) ycbcrProps.combinedImageSamplerDescriptorCount = 1;
++    else res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
+ 
+ 	VkDescriptorPoolSize poolSizes[3] {
+ 		{
+@@ -995,7 +1020,7 @@
+ 	SHADER(SGSR, cs_sgsr);
+ #undef SHADER
+ 
+-	for (uint32_t i = 0; i < shaderInfos.size(); i++)
++	for (uint32_t i = 0; i < (m_maliDiagnostic ? 1u : shaderInfos.size()); i++)
+ 	{
+ 		VkShaderModuleCreateInfo shaderCreateInfo = {
+ 			.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+@@ -1036,7 +1061,7 @@
+ 	
+ 	VkBufferCreateInfo bufferCreateInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+-		.size = upload_buffer_size,
++		.size = m_maliDiagnostic ? 512u * 1024u : upload_buffer_size,
+ 		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+ 	};
+ 
+@@ -1050,9 +1075,10 @@
+ 	VkMemoryRequirements memRequirements;
+ 	vk.GetBufferMemoryRequirements(device(), m_uploadBuffer, &memRequirements);
+ 	
+-	uint32_t memTypeIndex =  findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
++	uint32_t memTypeIndex = findMemoryType((m_maliDiagnostic ? 0u : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
+ 	if ( memTypeIndex == ~0u )
+ 	{
++		if (m_maliDiagnostic) vk_errorf(VK_ERROR_FEATURE_NOT_PRESENT, "required HOST_VISIBLE|HOST_COHERENT upload memory");
+ 		vk_log.errorf( "findMemoryType failed" );
+ 		return false;
+ 	}
+@@ -1063,9 +1089,11 @@
+ 		.memoryTypeIndex = memTypeIndex,
+ 	};
+ 	
+-	vk.AllocateMemory( device(), &allocInfo, nullptr, &m_uploadBufferMemory);
++    res = vk.AllocateMemory( device(), &allocInfo, nullptr, &m_uploadBufferMemory);
++    if (m_maliDiagnostic && res != VK_SUCCESS) { vk_errorf(res, "vkAllocateMemory upload buffer"); return false; }
+ 	
+-	vk.BindBufferMemory( device(), m_uploadBuffer, m_uploadBufferMemory, 0 );
++    res = vk.BindBufferMemory( device(), m_uploadBuffer, m_uploadBufferMemory, 0 );
++    if (m_maliDiagnostic && res != VK_SUCCESS) { vk_errorf(res, "vkBindBufferMemory upload buffer"); return false; }
+ 
+ 	res = vk.MapMemory( device(), m_uploadBufferMemory, 0, VK_WHOLE_SIZE, 0, (void**)&m_uploadBufferData );
+ 	if ( res != VK_SUCCESS )
+@@ -1112,7 +1140,8 @@
+ 		.unnormalizedCoordinates = key.bUnnormalized,
+ 	};
+ 
+-	vk.CreateSampler( device(), &samplerCreateInfo, nullptr, &ret );
++    VkResult samplerResult = vk.CreateSampler( device(), &samplerCreateInfo, nullptr, &ret );
++    if (m_maliDiagnostic && samplerResult != VK_SUCCESS) FailMaliDiagnostic("vkCreateSampler", samplerResult);
+ 
+ 	m_samplerCache[key] = ret;
+ 
+@@ -1381,7 +1410,7 @@
+ 		.pSignalSemaphores = pSignalSemaphores.data(),
+ 	};
+ 
+-	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, VK_NULL_HANDLE ) );
++	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, m_maliDiagnostic ? m_maliProducerFence : VK_NULL_HANDLE ) );
+ 
+ 	return nextSeqNo;
+ }
+@@ -1400,7 +1429,7 @@
+ 			.pSemaphores = &m_scratchTimelineSemaphore,
+ 			.pValues = &ulSeqNo,
+ 		};
+-		vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
++		vk_check( vk.WaitSemaphores( device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
+ 	}
+ 
+ 	pCmdBuffer->AddDescriptorSet( uIndex );
+@@ -1569,7 +1598,7 @@
+ 		.pValues = &sequence,
+ 	} ;
+ 
+-	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
++	vk_check( vk.WaitSemaphores( device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
+ 
+ 	if (reset)
+ 		resetCmdBuffers(sequence);
+@@ -1632,6 +1661,15 @@
+ 
+ void CVulkanCmdBuffer::end()
+ {
++    if (m_device->IsMaliDiagnostic() && m_target && m_target->externalImage() && m_device->m_maliReadbackBuffer) {
++        insertBarrier();
++        auto copy = (PFN_vkCmdCopyImageToBuffer)m_device->vk.GetDeviceProcAddr(m_device->device(), "vkCmdCopyImageToBuffer");
++        if (!copy) m_device->FailMaliDiagnostic("vkCmdCopyImageToBuffer lookup", VK_ERROR_INITIALIZATION_FAILED);
++        VkBufferImageCopy region{ .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {m_target->width(), m_target->height(), 1} };
++        copy(m_cmdBuffer, m_target->vkImage(), VK_IMAGE_LAYOUT_GENERAL, m_device->m_maliReadbackBuffer, 1, &region);
++        VkBufferMemoryBarrier barrier{ .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = m_device->m_maliReadbackBuffer, .size = VK_WHOLE_SIZE };
++        m_device->vk.CmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
++    }
+ 	insertBarrier(true);
+ 	vk_check( m_device->vk.EndCommandBuffer(m_cmdBuffer) );
+ }
+@@ -1695,6 +1733,7 @@
+ 
+ 	auto [ptr, offset] = m_device->uploadBufferData(sizeof(data));
+ 	m_renderBufferOffset = offset;
++    m_renderBufferSize = sizeof(data);
+ 	memcpy(ptr, &data, sizeof(data));
+ }
+ 
+@@ -1796,7 +1835,7 @@
+ 
+ 	scratchDescriptor.buffer = m_device->m_uploadBuffer;
+ 	scratchDescriptor.offset = m_renderBufferOffset;
+-	scratchDescriptor.range = VK_WHOLE_SIZE;
++	scratchDescriptor.range = m_device->IsMaliDiagnostic() ? m_renderBufferSize : VK_WHOLE_SIZE;
+ 
+ 	for (uint32_t i = 0; i < VKR_SAMPLER_SLOTS; i++)
+ 	{
+@@ -1848,6 +1887,18 @@
+ 		targetDescriptors[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+ 	}
+ 
++    if (m_device->IsMaliDiagnostic()) {
++        for (uint32_t i = 0; i < VKR_SAMPLER_SLOTS; ++i) {
++            if (!imageDescriptors[i].imageView) imageDescriptors[i].imageView = m_device->MaliDummy2D();
++            if (!ycbcrImageDescriptors[i].imageView) ycbcrImageDescriptors[i].imageView = m_device->MaliDummy2D();
++        }
++        for (uint32_t i = 0; i < VKR_LUT3D_COUNT; ++i) {
++            if (!shaperLutDescriptor[i].imageView) shaperLutDescriptor[i].imageView = m_device->MaliDummy1D();
++            if (!lut3DDescriptor[i].imageView) lut3DDescriptor[i].imageView = m_device->MaliDummy3D();
++            shaperLutDescriptor[i].imageLayout = lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++        }
++        if (!targetDescriptors[1].imageView) { targetDescriptors[1].imageView = m_device->MaliDummyStorage(); targetDescriptors[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL; }
++    }
+ 	m_device->vk.UpdateDescriptorSets(m_device->device(), writeDescriptorSets.size(), writeDescriptorSets.data(), 0, nullptr);
+ 
+ 	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
+@@ -1932,6 +1983,7 @@
+ 	if (!result.second)
+ 		return;
+ 	result.first->second.discarded = true;
++    if (m_device->IsMaliDiagnostic() && image->externalImage()) result.first->second.needsImport = true;
+ 	result.first->second.needsExport = image->externalImage();
+ 	result.first->second.needsPresentLayout = image->outputImage();
+ }
+@@ -1956,7 +2008,7 @@
+ {
+ 	std::vector<VkImageMemoryBarrier> barriers;
+ 
+-	uint32_t externalQueue = m_device->supportsModifiers() ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL_KHR;
++	uint32_t externalQueue = (m_device->IsMaliDiagnostic() || m_device->supportsModifiers()) ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL_KHR;
+ 
+ 	VkImageSubresourceRange subResRange =
+ 	{
+@@ -1986,8 +2038,8 @@
+ 		VkImageMemoryBarrier memoryBarrier =
+ 		{
+ 			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-			.srcAccessMask = state.dirty ? write_bits : 0u,
+-			.dstAccessMask = flush ? 0u : read_bits | write_bits,
++			.srcAccessMask = m_device->IsMaliDiagnostic() && isExport ? read_bits | write_bits : state.dirty ? write_bits : 0u,
++			.dstAccessMask = flush ? 0u : (m_device->IsMaliDiagnostic() && !image->MaliStorageImage() ? read_bits | VK_ACCESS_TRANSFER_WRITE_BIT : read_bits | write_bits),
+ 			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+ 			.newLayout = isPresent ? GetBackend()->GetPresentLayout() : VK_IMAGE_LAYOUT_GENERAL,
+ 			.srcQueueFamilyIndex = isExport ? image->queueFamily : state.needsImport ? externalQueue : image->queueFamily,
+@@ -2091,6 +2143,7 @@
+ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+ {
+ 	m_pBackendFb = std::move( pBackendFb );
++    m_maliStorageImage = flags.bStorage;
+ 	m_drmFormat = drmFormat;
+ 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
+ 
+@@ -2227,7 +2280,7 @@
+ 
+ 	std::vector<uint64_t> modifiers = {};
+ 	// TODO(JoshA): Move this code to backend for making flippable image.
+-	if ( GetBackend()->UsesModifiers() && flags.bFlippable && g_device.supportsModifiers() && !pDMA )
++	if ( !g_device.IsMaliDiagnostic() && GetBackend()->UsesModifiers() && flags.bFlippable && g_device.supportsModifiers() && !pDMA )
+ 	{
+ 		assert( drmFormat != DRM_FORMAT_INVALID );
+ 
+@@ -4279,7 +4332,7 @@
+ 	// Returns the slot whose end timestamp the caller writes before submit.
+ 	std::optional<uint32_t> CompositeTimingBegin( CVulkanCmdBuffer *pCmdBuffer )
+ 	{
+-		if ( !composite_timing_log.Enabled( LOG_DEBUG ) || !CompositeTimingInit() )
++		if ( g_device.IsMaliDiagnostic() || !composite_timing_log.Enabled( LOG_DEBUG ) || !CompositeTimingInit() )
+ 			return std::nullopt;
+ 
+ 		CompositeTiming_t &t = g_CompositeTiming;
+@@ -4317,6 +4370,9 @@
+ 
+ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
+ {
++    if (g_device.IsMaliDiagnostic() && (!pOutputOverride || !g_reshade_effect.empty() || pPipewireTexture || frameInfo->useFSRLayer0 || frameInfo->useNISLayer0 || frameInfo->useSGSRLayer0 || frameInfo->blurLayer0 != BLUR_MODE_OFF || frameInfo->applyOutputColorMgmt || frameInfo->layers.count() != 1 || frameInfo->ycbcrMask())) {
++        vk_log.errorf("Mali diagnostic only supports one RGB BLIT layer, no effects/color management/backend"); return std::nullopt;
++    }
+ 	EOTF outputTF = frameInfo->outputEncodingEOTF;
+ 	if (!frameInfo->applyOutputColorMgmt)
+ 		outputTF = EOTF_Count; //Disable blending stuff.
+@@ -4348,7 +4404,7 @@
+ 	}
+ 	else
+ 	{
+-		g_reshadeManager.clear();
++		if (!g_device.IsMaliDiagnostic()) g_reshadeManager.clear();
+ 	}
+ 
+ 	if ( !pOutputOverride && !vulkan_ensure_output_images() )
+@@ -4583,7 +4639,7 @@
+ 	if ( oTimingSlot )
+ 		g_CompositeTiming.pending.back().ulSeqNo = sequence;
+ 
+-	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
++	if ( !g_device.IsMaliDiagnostic() && !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
+ 	{
+ 		g_output.nOutImage = ( g_output.nOutImage + 1 ) % 3;
+ 	}
+@@ -4838,3 +4894,5 @@
+ 
+ 	return pTex;
+ }
++
++#include "vulkan_renderer_test.inc"
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -162,6 +162,7 @@
+ 	};
+ 
+ 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
++	bool BInitMaliAHB(VkImage image, uint32_t width, uint32_t height);
+ 	bool BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format );
+ 
+ 	uint32_t IncRef();
+@@ -187,6 +188,7 @@
+ 	inline VkImage vkImage() { return m_vkImage; }
+ 	inline bool outputImage() { return m_bOutputImage; }
+ 	inline bool externalImage() { return m_bExternal; }
++    bool MaliStorageImage() const { return m_maliStorageImage; }
+ 	inline VkDeviceSize totalSize() const { return m_size; }
+ 	inline uint32_t drmFormat() const { return m_drmFormat; }
+ 
+@@ -213,6 +215,7 @@
+ private:
+ 	bool m_bInitialized = false;
+ 	bool m_bExternal = false;
++    bool m_maliStorageImage = false;
+ 	bool m_bOutputImage = false;
+ 
+ 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;
+@@ -830,7 +833,18 @@
+ class CVulkanDevice
+ {
+ public:
+-	bool BInit(VkInstance instance, VkSurfaceKHR surface);
++	bool BInit(VkInstance instance, VkSurfaceKHR surface, bool maliDiagnostic = false);
++    bool IsMaliDiagnostic() const { return m_maliDiagnostic; }
++    bool CreateMaliDiagnosticDevice();
++    bool CreateMaliDiagnosticDummies();
++    void ShutdownMaliDiagnostic();
++    [[noreturn]] void FailMaliDiagnostic(const char *operation, VkResult result);
++    VkImageView MaliDummy2D() const { return m_maliDummies[0]->srgbView(); }
++    VkImageView MaliDummy1D() const { return m_maliDummies[1]->srgbView(); }
++    VkImageView MaliDummy3D() const { return m_maliDummies[2]->srgbView(); }
++    VkImageView MaliDummyStorage() const { return m_maliDummies[3]->srgbView(); }
++    VkFence m_maliProducerFence = VK_NULL_HANDLE;
++    VkBuffer m_maliReadbackBuffer = VK_NULL_HANDLE;
+ 
+ 	VkSampler sampler(SamplerState key);
+ 	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false);
+@@ -871,8 +885,8 @@
+ 	{
+ 		assert(size <= upload_buffer_size);
+ 
+-		m_uploadBufferOffset = align(m_uploadBufferOffset, 16);
+-		if (m_uploadBufferOffset + size > upload_buffer_size)
++		m_uploadBufferOffset = align(m_uploadBufferOffset, m_maliDiagnostic ? m_maliUniformAlignment : 16u);
++		if (m_uploadBufferOffset + size > (m_maliDiagnostic ? 512u * 1024u : upload_buffer_size))
+ 		{
+ 			fprintf(stderr, "Exceeded uploadBufferData\n");
+ 			waitIdle(false);
+@@ -931,12 +945,15 @@
+ 	bool m_bHasDrmPrimaryDevId = false;
+ 	bool m_bSupportsModifiers = false;
+ 	bool m_bInitialized = false;
++    bool m_maliDiagnostic = false;
++    uint32_t m_maliUniformAlignment = 16;
++    std::array<gamescope::OwningRc<CVulkanTexture>, 4> m_maliDummies;
+ 
+ 
+ 	VkPhysicalDeviceMemoryProperties m_memoryProperties;
+ 
+ 	std::unordered_map< SamplerState, VkSampler > m_samplerCache;
+-	std::array<VkShaderModule, SHADER_TYPE_COUNT> m_shaderModules;
++	std::array<VkShaderModule, SHADER_TYPE_COUNT> m_shaderModules{};
+ 	std::unordered_map<PipelineInfo_t, VkPipeline> m_pipelineMap;
+ 	std::mutex m_pipelineMutex;
+ 
+@@ -947,12 +964,12 @@
+ 	std::array<uint64_t, k_uMaxConcurrentSubmits * 3> m_descriptorSetSeqNos{};
+ 	uint32_t m_currentDescriptorSet = 0;
+ 
+-	VkBuffer m_uploadBuffer;
+-	VkDeviceMemory m_uploadBufferMemory;
+-	void *m_uploadBufferData;
++	VkBuffer m_uploadBuffer = VK_NULL_HANDLE;
++	VkDeviceMemory m_uploadBufferMemory = VK_NULL_HANDLE;
++	void *m_uploadBufferData = nullptr;
+ 	uint32_t m_uploadBufferOffset = 0;
+ 
+-	VkSemaphore m_scratchTimelineSemaphore;
++	VkSemaphore m_scratchTimelineSemaphore = VK_NULL_HANDLE;
+ 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
+ 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
+ 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
+@@ -1053,6 +1070,7 @@
+ 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
+ 
+ 	uint32_t m_renderBufferOffset = 0;
++    uint32_t m_renderBufferSize = 0;
+ };
+ 
+ uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride = std::nullopt );
+diff --git a/src/vulkan_renderer_test.hpp b/src/vulkan_renderer_test.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/vulkan_renderer_test.hpp
+@@ -0,0 +1,2 @@
++#pragma once
++int vulkan_gamescope_renderer_test(bool firstFrame);
+diff --git a/src/vulkan_renderer_test.inc b/src/vulkan_renderer_test.inc
+new file mode 100644
+--- /dev/null
++++ b/src/vulkan_renderer_test.inc
+@@ -0,0 +1,266 @@
++// Included in rendervulkan.cpp: exercises its real classes, constants and compositor.
++bool CVulkanDevice::CreateMaliDiagnosticDevice()
++{
++    uint32_t n = 0;
++    VkResult r = vk.EnumerateDeviceExtensionProperties(physDev(), nullptr, &n, nullptr);
++    if (r != VK_SUCCESS) { vk_errorf(r, "vkEnumerateDeviceExtensionProperties count"); return false; }
++    m_supportedExts.resize(n);
++    r = vk.EnumerateDeviceExtensionProperties(physDev(), nullptr, &n, m_supportedExts.data());
++    if (r != VK_SUCCESS) { vk_errorf(r, "vkEnumerateDeviceExtensionProperties list"); return false; }
++    const char *extensions[] = {"VK_KHR_timeline_semaphore", "VK_EXT_scalar_block_layout", "VK_KHR_image_format_list"};
++    for (const char *required : extensions) {
++        bool found = false;
++        for (const auto &available : m_supportedExts) found |= !std::strcmp(required, available.extensionName);
++        if (!found) { vk_errorf(VK_ERROR_EXTENSION_NOT_PRESENT, "required capability %s", required); return false; }
++    }
++    VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalar = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT };
++    VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR, .pNext = &scalar };
++    VkPhysicalDeviceFeatures2 query = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &timeline };
++    vk.GetPhysicalDeviceFeatures2(physDev(), &query);
++    if (!timeline.timelineSemaphore || !scalar.scalarBlockLayout) { vk_errorf(VK_ERROR_FEATURE_NOT_PRESENT, "required timelineSemaphore/scalarBlockLayout"); return false; }
++    VkPhysicalDeviceProperties props{}; vk.GetPhysicalDeviceProperties(physDev(), &props);
++#define MALI_LIMIT(field, required) do { if (props.limits.field < (required)) { vk_errorf(VK_ERROR_FEATURE_NOT_PRESENT, "required limit " #field " native=%llu required=%llu", (unsigned long long)props.limits.field, (unsigned long long)(required)); return false; } } while (0)
++    MALI_LIMIT(maxBoundDescriptorSets, 1u);
++    MALI_LIMIT(maxPerStageDescriptorSamplers, 36u); MALI_LIMIT(maxPerStageDescriptorSampledImages, 36u);
++    MALI_LIMIT(maxDescriptorSetSamplers, 36u); MALI_LIMIT(maxDescriptorSetSampledImages, 36u);
++    MALI_LIMIT(maxPerStageDescriptorStorageImages, 2u); MALI_LIMIT(maxDescriptorSetStorageImages, 2u);
++    MALI_LIMIT(maxPerStageDescriptorUniformBuffers, 1u); MALI_LIMIT(maxDescriptorSetUniformBuffers, 1u);
++    MALI_LIMIT(maxPerStageResources, 39u); MALI_LIMIT(maxUniformBufferRange, sizeof(BlitPushData_t));
++    MALI_LIMIT(maxImageDimension1D, 1u); MALI_LIMIT(maxImageDimension2D, 256u); MALI_LIMIT(maxImageDimension3D, 1u);
++    MALI_LIMIT(maxComputeWorkGroupInvocations, 64u);
++    MALI_LIMIT(maxComputeWorkGroupSize[0], 8u); MALI_LIMIT(maxComputeWorkGroupSize[1], 8u); MALI_LIMIT(maxComputeWorkGroupSize[2], 1u);
++    MALI_LIMIT(maxComputeWorkGroupCount[0], 32u); MALI_LIMIT(maxComputeWorkGroupCount[1], 32u); MALI_LIMIT(maxComputeWorkGroupCount[2], 1u);
++#undef MALI_LIMIT
++    std::printf("native descriptor limits verified: per-stage samplers=%u sampled images=%u; require 36 each, 2 storage images, 1 UBO; compute 8x8 supported\n", props.limits.maxPerStageDescriptorSamplers, props.limits.maxPerStageDescriptorSampledImages);
++    m_uVendorID = props.vendorID;
++    m_maliUniformAlignment = std::max<uint32_t>(16u, props.limits.minUniformBufferOffsetAlignment);
++    if (!m_maliUniformAlignment || (m_maliUniformAlignment & (m_maliUniformAlignment - 1)) || m_maliUniformAlignment > 512u * 1024u) { vk_errorf(VK_ERROR_INITIALIZATION_FAILED, "invalid uniform-buffer alignment"); return false; }
++    vk.GetPhysicalDeviceMemoryProperties(physDev(), &m_memoryProperties);
++    m_bSupportsFp16 = false; m_bSupportsModifiers = false;
++    m_generalQueueFamily = m_queueFamily;
++    float priority = 1.0f;
++    VkDeviceQueueCreateInfo queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = m_queueFamily, .queueCount = 1, .pQueuePriorities = &priority };
++    VkDeviceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &timeline, .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue, .enabledExtensionCount = 3, .ppEnabledExtensionNames = extensions };
++    r = vk.CreateDevice(physDev(), &ci, nullptr, &m_device);
++    if (r != VK_SUCCESS) { vk_errorf(r, "vkCreateDevice Mali extension feature chain"); return false; }
++#define VK_FUNC(x) vk.x = (PFN_vk##x)vk.GetDeviceProcAddr(device(), "vk"#x);
++    VULKAN_DEVICE_FUNCTIONS
++#undef VK_FUNC
++    vk.WaitSemaphores = (PFN_vkWaitSemaphores)vk.GetDeviceProcAddr(device(), "vkWaitSemaphoresKHR");
++    vk.GetSemaphoreCounterValue = (PFN_vkGetSemaphoreCounterValue)vk.GetDeviceProcAddr(device(), "vkGetSemaphoreCounterValueKHR");
++    vk.GetDeviceQueue(device(), m_queueFamily, 0, &m_queue); m_generalQueue = m_queue;
++    if (!m_queue || !vk.WaitSemaphores || !vk.GetSemaphoreCounterValue) { vk_errorf(VK_ERROR_INITIALIZATION_FAILED, "real queue/KHR timeline entrypoints"); return false; }
++    std::printf("physical device: %s\nphysical API: %u.%u.%u\n", props.deviceName, VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion));
++    std::puts("Mali compatibility renderer path enabled\nVulkan 1.1 compatibility mode: enabled");
++    std::printf("physical API remains %u.%u.%u; no Vulkan-version spoofing\n", VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion));
++    std::puts("timeline semaphore: VK_KHR_timeline_semaphore supported=yes enabled=yes\nscalar block layout: VK_EXT_scalar_block_layout supported=yes enabled=yes\nshader FP16: deliberately disabled; existing FP32 BLIT shader");
++    bool robustnessPresent = false;
++    for (const auto &ext : m_supportedExts) robustnessPresent |= !std::strcmp(ext.extensionName, "VK_EXT_robustness2");
++    std::printf("VK_EXT_robustness2: %s; not enabled; robustness2 not advertised by fallback\n", robustnessPresent ? "native inventory PRESENT" : "absent");
++    return true;
++}
++
++bool CVulkanDevice::CreateMaliDiagnosticDummies()
++{
++    const VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_2D};
++    for (uint32_t i = 0; i < 4; ++i) {
++        CVulkanTexture::createFlags flags; flags.imageType = types[i]; flags.bSampled = i < 3; flags.bStorage = i == 3; flags.bTransferDst = true;
++        m_maliDummies[i] = new CVulkanTexture();
++        if (!m_maliDummies[i]->BInit(1, 1, 1, DRM_FORMAT_ABGR8888, flags)) return false;
++    }
++    auto command = commandBuffer(); if (!command) return false;
++    const VkClearColorValue zero{};
++    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    for (auto &texture : m_maliDummies) {
++        command->discardImage(texture.get()); command->insertBarrier();
++        vk.CmdClearColorImage(command->rawBuffer(), texture->vkImage(), VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
++        command->markDirty(texture.get());
++    }
++    submit(std::move(command)); waitIdle();
++    std::puts("null descriptors replaced with valid dummy resources: transparent sampled 2D/1D/3D and separate zero storage 2D, initialized on GPU, GENERAL layout");
++    return true;
++}
++
++bool CVulkanTexture::BInitMaliAHB(VkImage image, uint32_t width, uint32_t height)
++{
++    if (!g_device.IsMaliDiagnostic() || !image) return false;
++    m_vkImage = image; // private AHB helper owns the image and imported allocation
++    m_width = m_contentWidth = width; m_height = m_contentHeight = height; m_depth = 1;
++    m_drmFormat = DRM_FORMAT_ABGR8888; m_format = VK_FORMAT_R8G8B8A8_UNORM;
++    m_bExternal = true; m_maliStorageImage = true; m_bOutputImage = false;
++    VkImageViewCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = m_format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1} };
++    VkResult r = g_device.vk.CreateImageView(g_device.device(), &ci, nullptr, &m_srgbView);
++    if (r != VK_SUCCESS) { vk_errorf(r, "vkCreateImageView AHB storage target"); return false; }
++    m_bInitialized = true; return true;
++}
++
++void CVulkanDevice::ShutdownMaliDiagnostic()
++{
++    if (!m_maliDiagnostic) return;
++    if (m_device) {
++        auto idle = (PFN_vkDeviceWaitIdle)vk.GetDeviceProcAddr(device(), "vkDeviceWaitIdle");
++        if (idle) { VkResult r = idle(device()); if (r != VK_SUCCESS) FailMaliDiagnostic("vkDeviceWaitIdle cleanup", r); }
++        m_pendingCmdBufs.clear(); m_unusedCmdBufs.clear();
++        for (auto &texture : m_maliDummies) texture = nullptr;
++        for (auto &[key, pipeline] : m_pipelineMap) if (pipeline) vk.DestroyPipeline(device(), pipeline, nullptr);
++        m_pipelineMap.clear();
++        auto destroyShader = (PFN_vkDestroyShaderModule)vk.GetDeviceProcAddr(device(), "vkDestroyShaderModule");
++        for (auto &shader : m_shaderModules) if (shader && destroyShader) { destroyShader(device(), shader, nullptr); shader = VK_NULL_HANDLE; }
++        if (m_descriptorPool) vk.DestroyDescriptorPool(device(), m_descriptorPool, nullptr);
++        if (m_pipelineLayout) vk.DestroyPipelineLayout(device(), m_pipelineLayout, nullptr);
++        if (m_descriptorSetLayout) vk.DestroyDescriptorSetLayout(device(), m_descriptorSetLayout, nullptr);
++        for (auto &[key, samplerHandle] : m_samplerCache) if (samplerHandle) vk.DestroySampler(device(), samplerHandle, nullptr);
++        m_samplerCache.clear();
++        if (m_scratchTimelineSemaphore) vk.DestroySemaphore(device(), m_scratchTimelineSemaphore, nullptr);
++        if (m_uploadBufferData) vk.UnmapMemory(device(), m_uploadBufferMemory);
++        m_uploadBufferData = nullptr;
++        if (m_uploadBuffer) vk.DestroyBuffer(device(), m_uploadBuffer, nullptr);
++        if (m_uploadBufferMemory) vk.FreeMemory(device(), m_uploadBufferMemory, nullptr);
++        auto destroyPool = (PFN_vkDestroyCommandPool)vk.GetDeviceProcAddr(device(), "vkDestroyCommandPool");
++        if (m_commandPool && destroyPool) destroyPool(device(), m_commandPool, nullptr);
++        if (m_generalCommandPool && destroyPool) destroyPool(device(), m_generalCommandPool, nullptr);
++        if (idle) { VkResult r = idle(device()); if (r != VK_SUCCESS) FailMaliDiagnostic("vkDeviceWaitIdle final teardown", r); }
++        auto destroy = (PFN_vkDestroyDevice)vk.GetDeviceProcAddr(device(), "vkDestroyDevice");
++        if (destroy) destroy(device(), nullptr);
++        m_device = VK_NULL_HANDLE;
++    }
++    if (m_instance) {
++        auto destroy = (PFN_vkDestroyInstance)g_pfn_vkGetInstanceProcAddr(m_instance, "vkDestroyInstance");
++        if (destroy) destroy(m_instance, nullptr);
++        m_instance = VK_NULL_HANDLE;
++    }
++    std::puts("clean renderer teardown");
++}
++
++[[noreturn]] void CVulkanDevice::FailMaliDiagnostic(const char *operation, VkResult result)
++{
++    std::fprintf(stderr, "gamescope: renderer FAILED: last Vulkan operation=%s VkResult=%d\n", operation, int(result));
++    // Some failures occur inside a recording method: local C++ owners cannot be
++    // unwound with Gamescope's -fno-exceptions. Destroy the broker-owned device
++    // synchronously; it drains pending work and destroys every native child safely.
++    if (m_device) {
++        auto destroy = (PFN_vkDestroyDevice)vk.GetDeviceProcAddr(device(), "vkDestroyDevice");
++        if (destroy) destroy(device(), nullptr);
++    }
++    if (m_instance) {
++        auto destroy = (PFN_vkDestroyInstance)g_pfn_vkGetInstanceProcAddr(m_instance, "vkDestroyInstance");
++        if (destroy) destroy(m_instance, nullptr);
++    }
++    std::puts("failure cleanup: native device/children drained and destroyed; no PASS");
++    std::fflush(nullptr); _Exit(1);
++}
++
++static bool MaliResult(VkResult result, const char *operation)
++{
++    s_maliLastResult = result; s_maliLastOperation[0] = 0;
++    if (result != VK_SUCCESS) { vk_errorf(result, "%s", operation); return false; }
++    return true;
++}
++
++int vulkan_gamescope_renderer_test(bool firstFrame)
++{
++    std::puts(firstFrame ? "gamescope: Mali first Gamescope frame test" : "gamescope: Mali renderer initialization test");
++    setenv("MALI_VULKAN_RENDERER_TEST", "1", 1);
++    setenv("MALI_VULKAN_AHB_TEST", firstFrame ? "1" : "0", 1);
++    if (!MaliResult(vulkan_load_module(), "load Vulkan module")) return 1;
++    VkApplicationInfo app{ .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "Gamescope Mali renderer diagnostic", .apiVersion = VK_API_VERSION_1_0 };
++    // The proxy's global API is 1.0 plus truthful KHR query extensions. Its native
++    // broker instance is 1.1; physical properties remain Mali's real 1.1.131.
++    const char *queryExtensions[] = {"VK_KHR_get_physical_device_properties2"};
++    VkInstanceCreateInfo ci{ .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app, .enabledExtensionCount = 1, .ppEnabledExtensionNames = queryExtensions };
++    VkInstance instance = VK_NULL_HANDLE;
++    if (!MaliResult(g_pfn_vkCreateInstance(&ci, nullptr, &instance), "vkCreateInstance")) return 1;
++    g_reshade_effect.clear(); g_uCompositeDebug = 0;
++    if (!g_device.BInit(instance, VK_NULL_HANDLE, true)) { g_device.ShutdownMaliDiagnostic(); return 1; }
++    std::puts("Gamescope renderer initialized: yes\nno backend/presentation started");
++    if (!firstFrame) { g_device.ShutdownMaliDiagnostic(); return 0; }
++
++    auto interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
++    if (!interop) { vk_errorf(VK_ERROR_INITIALIZATION_FAILED, "vkDroidDeckInteropTEST lookup"); g_device.ShutdownMaliDiagnostic(); return 1; }
++    const auto call = [&](uint32_t op, const dd_interop_input &input, dd_interop_output &output, const char *name) {
++        return MaliResult(interop(g_device.device(), op, &input, &output), name);
++    };
++    dd_interop_input input{}; dd_interop_output ahb{}, producer{}, output{};
++    input.width = input.height = 256;
++    if (!call(DD_AHB_CREATE, input, ahb, "AHB storage-capable allocation/import")) { g_device.ShutdownMaliDiagnostic(); return 1; }
++    // On later failures use broker-owned cleanup, which retains pending AHB work.
++    const auto require = [&](bool ok, const char *stage) { if (!ok) g_device.FailMaliDiagnostic(s_maliLastOperation[0] ? s_maliLastOperation : stage, s_maliLastResult == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : s_maliLastResult); };
++    input = {}; require(call(DD_FENCE_CREATE, input, producer, "SYNC_FD producer fence"), "SYNC_FD producer fence");
++    VkBuffer readback = VK_NULL_HANDLE; VkDeviceMemory readbackMemory = VK_NULL_HANDLE;
++    VkBufferCreateInfo bufferInfo{ .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256u * 256u * 4u, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
++    require(MaliResult(g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &readback), "vkCreateBuffer pixel readback"), "readback buffer");
++    VkMemoryRequirements requirements{}; g_device.vk.GetBufferMemoryRequirements(g_device.device(), readback, &requirements);
++    uint32_t memoryType = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, requirements.memoryTypeBits);
++    bool coherent = memoryType != ~0u;
++    if (!coherent) memoryType = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, requirements.memoryTypeBits);
++    require(memoryType != ~0u, "HOST_VISIBLE readback memory type");
++    VkMemoryAllocateInfo allocate{ .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = requirements.size, .memoryTypeIndex = memoryType };
++    require(MaliResult(g_device.vk.AllocateMemory(g_device.device(), &allocate, nullptr, &readbackMemory), "vkAllocateMemory readback"), "readback allocation");
++    require(MaliResult(g_device.vk.BindBufferMemory(g_device.device(), readback, readbackMemory, 0), "vkBindBufferMemory readback"), "readback bind");
++    std::vector<uint8_t> bits(256u * 256u * 4u);
++    for (unsigned y = 0; y < 256; ++y) for (unsigned x = 0; x < 256; ++x) {
++        uint8_t *p = bits.data() + (y * 256 + x) * 4; p[3] = 255;
++        if (y < 128) p[x < 128 ? 0 : 1] = 255;
++        else if (x < 128) p[2] = 255; else p[0] = p[1] = p[2] = 255;
++    }
++    auto source = vulkan_create_texture_from_bits(256, 256, 256, 256, DRM_FORMAT_ABGR8888, {}, bits.data());
++    require(source != nullptr, "Gamescope input texture upload");
++    gamescope::OwningRc<CVulkanTexture> target = new CVulkanTexture();
++    require(target->BInitMaliAHB(ahb.image, 256, 256), "Gamescope AHB texture wrapper");
++    currentOutputWidth = currentOutputHeight = 256;
++    FrameInfo_t frame{}; frame.applyOutputColorMgmt = false; frame.outputEncodingEOTF = EOTF_Gamma22;
++    auto layer = frame.layers.push(); layer->tex = source.get(); layer->scale = {2.0f, 2.0f}; layer->offset = {-64.0f, -64.0f}; layer->opacity = 1.0f;
++    layer->filter = GamescopeUpscaleFilter::NEAREST; layer->blackBorder = true; layer->applyColorMgmt = false; layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
++    std::puts("Expected first Gamescope frame: 64-pixel BLACK border, centered 128x128 RED GREEN / BLUE WHITE; source covers full 256x256");
++    g_device.m_maliProducerFence = producer.fence; g_device.m_maliReadbackBuffer = readback;
++    std::puts("real renderer path: vulkan_composite -> BLIT -> CVulkanCmdBuffer::dispatch -> native Mali compute dispatch");
++    std::fflush(stdout);
++    auto sequence = vulkan_composite(&frame, nullptr, false, target.get(), false, nullptr);
++    require(sequence.has_value(), "vulkan_composite");
++    g_device.wait(*sequence, false); // retain producer command identity through exact-AHB inspection/presentation
++    std::printf("Gamescope internal timeline completed sequence=%llu counter=%llu (real KHR operations)\n", (unsigned long long)*sequence, (unsigned long long)g_device.completedSeqNo());
++    g_device.m_maliProducerFence = VK_NULL_HANDLE; g_device.m_maliReadbackBuffer = VK_NULL_HANDLE;
++    input = {}; input.fence = producer.fence;
++    require(call(DD_SYNC_EXPORT, input, output, "vkGetFenceFdKHR real SYNC_FD export"), "producer export");
++    uint32_t sync = output.sync;
++    input = {}; input.sync = sync; require(call(DD_SYNC_WAIT, input, output, "SYNC_FD producer completion"), "producer completion");
++    void *mapped = nullptr;
++    require(MaliResult(g_device.vk.MapMemory(g_device.device(), readbackMemory, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory actual final-image readback"), "map readback");
++    if (!coherent) {
++        auto invalidate = (PFN_vkInvalidateMappedMemoryRanges)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkInvalidateMappedMemoryRanges");
++        require(invalidate != nullptr, "invalidate lookup");
++        VkMappedMemoryRange range{ .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = readbackMemory, .size = VK_WHOLE_SIZE };
++        require(MaliResult(invalidate(g_device.device(), 1, &range), "vkInvalidateMappedMemoryRanges actual bytes"), "invalidate readback");
++    }
++    uint32_t bad = 0, different = 0;
++    for (unsigned y = 0; y < 256; ++y) for (unsigned x = 0; x < 256; ++x) {
++        uint8_t expected[4] = {0, 0, 0, 255};
++        if (x >= 64 && x < 192 && y >= 64 && y < 192) {
++            if (y < 128) expected[x < 128 ? 0 : 1] = 255;
++            else if (x < 128) expected[2] = 255; else expected[0] = expected[1] = expected[2] = 255;
++        }
++        const uint8_t *pixel = (const uint8_t *)mapped + (y * 256 + x) * 4;
++        bad += std::memcmp(pixel, expected, 4) != 0;
++        different += std::memcmp(pixel, bits.data() + (y * 256 + x) * 4, 4) != 0;
++    }
++    const unsigned points[][2] = {{96,96}, {160,96}, {96,160}, {160,160}, {128,128}, {16,16}};
++    for (const auto &point : points) { const uint8_t *p = (const uint8_t *)mapped + (point[1] * 256 + point[0]) * 4; std::printf("final AHB GPU readback pixel(%u,%u) RGBA=(%u,%u,%u,%u)\n", point[0], point[1], p[0], p[1], p[2], p[3]); }
++    g_device.vk.UnmapMemory(g_device.device(), readbackMemory);
++    std::printf("actual final AHB readback: mismatches=%u source-vs-final differing pixels=%u\n", bad, different);
++    require(!bad && different == 49152, "Gamescope transformed pixel verification");
++    input = {}; input.token = ahb.token; input.sync = sync; input.pattern = 2;
++    require(call(DD_AHB_INSPECT, input, output, "exact final AHB CPU inspection (when lockable)"), "AHB actual bytes");
++    std::printf("AHB CPU inspection checked=%u; actual same-image GPU readback checked=1\n", output.cpu_checked);
++    std::fflush(stdout);
++    require(call(DD_AHB_PRESENT, input, output, "Android consumed exact Gamescope-written AHB and released it"), "Android consumer release");
++    g_device.wait(*sequence, true); // now references and producer command identity can be retired
++    layer->tex = nullptr; frame.layers.truncate(0); source = nullptr; target = nullptr;
++    g_device.vk.DestroyBuffer(g_device.device(), readback, nullptr); g_device.vk.FreeMemory(g_device.device(), readbackMemory, nullptr);
++    g_device.vk.DestroyImage(g_device.device(), ahb.image, nullptr); g_device.vk.FreeMemory(g_device.device(), ahb.memory, nullptr);
++    require(call(DD_AHB_RELEASE, input, output, "AHB release"), "AHB release");
++    input = {}; input.sync = sync; require(call(DD_SYNC_CLOSE, input, output, "SYNC_FD close"), "sync close");
++    auto destroyFence = (PFN_vkDestroyFence)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDestroyFence"); destroyFence(g_device.device(), producer.fence, nullptr);
++    g_device.ShutdownMaliDiagnostic();
++    std::puts("Gamescope first frame PASS: actual BLIT compute output, exact AHB, native timeline + SYNC_FD, Android release, zero mismatches");
++    return 0;
++}

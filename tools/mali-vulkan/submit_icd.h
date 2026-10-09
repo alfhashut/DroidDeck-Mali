@@ -1,5 +1,5 @@
 /* Local opaque resources and a loader-dispatchable primary command buffer. */
-enum proxy_resource_kind { PROXY_POOL, PROXY_COMMAND, PROXY_EVENT, PROXY_FENCE, PROXY_BUFFER, PROXY_MEMORY, PROXY_IMAGE, PROXY_AHB, PROXY_SYNC };
+enum proxy_resource_kind { PROXY_POOL, PROXY_COMMAND, PROXY_EVENT, PROXY_FENCE, PROXY_BUFFER, PROXY_MEMORY, PROXY_IMAGE, PROXY_AHB, PROXY_SYNC, PROXY_SEMAPHORE, PROXY_VIEW, PROXY_SAMPLER, PROXY_SET_LAYOUT, PROXY_PIPELINE_LAYOUT, PROXY_DESCRIPTOR_POOL, PROXY_DESCRIPTOR_SET, PROXY_SHADER, PROXY_PIPELINE };
 struct proxy_resource {
     VK_LOADER_DATA loader;
     struct proxy_logical *owner;
@@ -57,13 +57,13 @@ static VkResult submit_new(struct proxy_logical *d, uint32_t op, enum proxy_reso
     return VK_SUCCESS;
 }
 static void submit_void_error(struct proxy_logical *d, const char *name, VkResult r) {
-    if (r != VK_SUCCESS) { LOG("%s rejected/result=%d; no successful recording assumed", name, (int)r); d->submit_failed = 1; }
+    if (r != VK_SUCCESS) { LOG("%s rejected/result=%d; no successful recording assumed", name, (int)r); int expected = 0; atomic_compare_exchange_strong(&d->submit_failed, &expected, d->owner->wire_version == MB_RENDERER_VERSION ? (int)r : 1); }
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *ci,
         const VkAllocationCallbacks *a, VkCommandPool *out) {
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
     *out = VK_NULL_HANDLE;
-    if (!device || !ci || a || ci->sType != VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO || ci->pNext || ci->flags)
+    if (!device || !ci || a || ci->sType != VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO || ci->pNext || (ci->flags && (((struct proxy_logical *)device)->owner->wire_version != MB_RENDERER_VERSION || ci->flags != VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)))
         return VK_ERROR_FEATURE_NOT_PRESENT;
     struct proxy_logical *d = (struct proxy_logical *)device;
     if (ci->queueFamilyIndex != d->family) return VK_ERROR_INITIALIZATION_FAILED;
@@ -114,14 +114,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_BeginCommandBuffer(VkCommandBuffer c
     if (!command) return VK_ERROR_INITIALIZATION_FAILED;
     struct proxy_resource *c = (struct proxy_resource *)command;
     if (!c->live || c->kind != PROXY_COMMAND) return VK_ERROR_INITIALIZATION_FAILED;
-    if (!bi || bi->sType != VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO || bi->pNext || bi->pInheritanceInfo || bi->flags)
+    if (!bi || bi->sType != VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO || bi->pNext || bi->pInheritanceInfo || (bi->flags && (c->owner->owner->wire_version != MB_RENDERER_VERSION || bi->flags != VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
         return VK_ERROR_FEATURE_NOT_PRESENT;
     uint32_t args[] = {c->id, bi->flags}; return submit_rpc(c->owner, MB_COMMAND_BEGIN, args, 2, 0, NULL);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_EndCommandBuffer(VkCommandBuffer command) {
     if (!command) return VK_ERROR_INITIALIZATION_FAILED;
     struct proxy_resource *c = (struct proxy_resource *)command;
-    if (!c->live || c->kind != PROXY_COMMAND || c->owner->submit_failed) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!c->live || c->kind != PROXY_COMMAND) return VK_ERROR_INITIALIZATION_FAILED;
+    if (c->owner->submit_failed) return c->owner->owner->wire_version == MB_RENDERER_VERSION ? (VkResult)atomic_load(&c->owner->submit_failed) : VK_ERROR_INITIALIZATION_FAILED;
     uint32_t args[] = {c->id}; return submit_rpc(c->owner, MB_COMMAND_END, args, 1, 0, NULL);
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_CmdSetEvent(VkCommandBuffer command, VkEvent event, VkPipelineStageFlags stage) {
@@ -176,6 +177,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_WaitForFences(VkDevice device, uint3
     uint32_t args[] = {f->id, all}; return submit_rpc(d, MB_FENCE_WAIT, args, 2, timeout, NULL);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *si, VkFence fence) {
+    if (queue && ((struct proxy_queue *)queue)->owner->owner->wire_version == MB_RENDERER_VERSION) return renderer_QueueSubmit(queue, count, si, fence);
     if (!queue || count != 1 || !si || si->sType != VK_STRUCTURE_TYPE_SUBMIT_INFO || si->pNext ||
         si->waitSemaphoreCount || si->signalSemaphoreCount || si->commandBufferCount != 1 || !si->pCommandBuffers)
         return VK_ERROR_FEATURE_NOT_PRESENT;

@@ -22,6 +22,8 @@
 #include "submit_objects.h"
 #include "interop_protocol.h"
 #include "interop_objects.h"
+#include "renderer_protocol.h"
+#include "renderer_objects.h"
 #include "interop_consumer.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__)
@@ -57,6 +59,7 @@ struct vk_session {
         PFN_vkGetDeviceProcAddr gdpa;
         struct native_submit submit;
         struct native_interop interop;
+        struct native_renderer renderer;
         VkPhysicalDevice physical;
         PFN_vkGetPhysicalDeviceImageFormatProperties2 image_properties;
         PFN_vkGetPhysicalDeviceExternalFenceProperties fence_properties;
@@ -167,20 +170,25 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 #include "capability_queries.h"
 #include "interop_commands.h"
 #include "submit_commands.h"
+#include "renderer_commands.h"
 #include "device_commands.h"
 
 /* Preserve the original version-1 one-shot probe and its six-field reply. */
 static uint32_t query_devices(uint8_t *payload) {
-    struct vk_session s = {0};
+    struct vk_session *s = calloc(1, sizeof(*s));
+    if (!s) {
+        mb_put_u32(payload, MB_INTERNAL_ERROR); mb_put_u32(payload + 4, (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY); mb_put_u32(payload + 8, 0);
+        return MB_PREFIX_BYTES;
+    }
     VkResult result = VK_SUCCESS;
-    uint32_t status = open_session(&s, VK_API_VERSION_1_0, &result, 0), count = 0;
-    if (status == MB_OK) status = list_devices(&s, &result);
-    if (status == MB_OK && !s.count) status = MB_NO_DEVICES;
+    uint32_t status = open_session(s, VK_API_VERSION_1_0, &result, 0), count = 0;
+    if (status == MB_OK) status = list_devices(s, &result);
+    if (status == MB_OK && !s->count) status = MB_NO_DEVICES;
     if (status == MB_OK) {
-        count = s.count;
+        count = s->count;
         for (uint32_t i = 0; i < count; ++i) {
             VkPhysicalDeviceProperties p;
-            get_properties(&s, i, &p);
+            get_properties(s, i, &p);
             uint8_t *record = payload + MB_PREFIX_BYTES + i * MB_RECORD_BYTES;
             memcpy(record, p.deviceName, strnlen(p.deviceName, MB_NAME_BYTES - 1));
             uint8_t *v = record + MB_NAME_BYTES;
@@ -189,35 +197,37 @@ static uint32_t query_devices(uint8_t *payload) {
             mb_put_u32(v + 16, (uint32_t)p.deviceType);
         }
     }
-    close_session(&s);
+    close_session(s); free(s);
     if (status != MB_OK) ERROR("query failed: status=%u VkResult=%d", status, (int)result);
     mb_put_u32(payload, status); mb_put_u32(payload + 4, (uint32_t)result); mb_put_u32(payload + 8, count);
     return MB_PREFIX_BYTES + count * MB_RECORD_BYTES;
 }
 
 static void serve(int fd) {
-    struct vk_session s = {0};
+    struct vk_session *s = calloc(1, sizeof(*s));
+    uint8_t *request = malloc(MB_RENDERER_MAX_REQUEST);
+    if (!s || !request) { free(s); free(request); ERROR("client allocation failed"); return; }
     for (;;) {
-        uint8_t header[MB_HEADER_BYTES], request[MB_DEVICE_MAX_REQUEST + 4], payload[MB_CAP_MAX_PAYLOAD] = {0};
+        uint8_t header[MB_HEADER_BYTES], payload[MB_CAP_MAX_PAYLOAD] = {0};
         if (mb_read(fd, header, sizeof(header))) break;
         uint32_t version = mb_get_u32(header + 4), op = mb_get_u32(header + 8);
         uint32_t request_bytes = mb_get_u32(header + 12), bytes = MB_PREFIX_BYTES;
         uint32_t status = MB_PROTOCOL_ERROR, count = 0;
         VkResult result = VK_SUCCESS;
         int finish = 0;
-        if (mb_get_u32(header) != MB_MAGIC || request_bytes > sizeof(request)) {
+        if (mb_get_u32(header) != MB_MAGIC || request_bytes > MB_RENDERER_MAX_REQUEST) {
             finish = 1;
-        } else if (version == MB_VERSION && op == MB_ENUMERATE && !request_bytes && !s.library) {
+        } else if (version == MB_VERSION && op == MB_ENUMERATE && !request_bytes && !s->library) {
             bytes = query_devices(payload);
             mb_header(header, bytes);
             if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes))
                 ERROR("write probe response: %s", strerror(errno));
             break;
-        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION && version != MB_SUBMIT_VERSION && version != MB_INTEROP_VERSION) ||
-                   (s.wire_version && version != s.wire_version) ||
+        } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION && version != MB_SUBMIT_VERSION && version != MB_INTEROP_VERSION && version != MB_RENDERER_VERSION) ||
+                   (s->wire_version && version != s->wire_version) ||
                    (request_bytes && mb_read(fd, request, request_bytes))) {
             finish = 1;
-        } else if (version >= MB_CAP_VERSION && op == MB_GLOBAL && !request_bytes && !s.library) {
+        } else if (version >= MB_CAP_VERSION && op == MB_GLOBAL && !request_bytes && !s->library) {
             void *library = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
             uint32_t api = 0;
             VkExtensionProperties extensions[MB_MAX_EXTENSIONS];
@@ -235,57 +245,62 @@ static void serve(int fd) {
                 dlclose(library);
             } else ERROR("Android global inventory load failed: %s", dlerror());
             finish = 1;
-        } else if (op == MB_CREATE && request_bytes == 4 && !s.library) {
-            status = open_session(&s, mb_get_u32(request), &result, version >= MB_CAP_VERSION);
-            s.wire_version = version;
+        } else if (op == MB_CREATE && request_bytes == 4 && !s->library) {
+            status = open_session(s, mb_get_u32(request), &result, version >= MB_CAP_VERSION);
+            s->wire_version = version;
             finish = status != MB_OK;
-            /* Live instances may idle. Stop shuts down every connection to wake reads. */
+            /* Live instances may idle. Stop shuts down every connection to wake reads-> */
             struct timeval no_timeout = {0};
             if (!finish && setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout))) {
                 status = MB_INTERNAL_ERROR; finish = 1;
             }
-        } else if (op == MB_LIST && !request_bytes && s.instance) {
-            status = list_devices(&s, &result);
+        } else if (op == MB_LIST && !request_bytes && s->instance) {
+            status = list_devices(s, &result);
             if (status == MB_OK) {
-                count = s.count; bytes += count * 4;
+                count = s->count; bytes += count * 4;
                 for (uint32_t i = 0; i < count; ++i) mb_put_u32(payload + MB_PREFIX_BYTES + i * 4, i + 1);
             }
-        } else if (op == MB_PROPERTIES && request_bytes == 4 && s.instance && s.listed) {
+        } else if (op == MB_PROPERTIES && request_bytes == 4 && s->instance && s->listed) {
             uint32_t id = mb_get_u32(request);
-            if (id && id <= s.count) {
+            if (id && id <= s->count) {
                 VkPhysicalDeviceProperties p;
-                get_properties(&s, id - 1, &p);
+                get_properties(s, id - 1, &p);
                 mb_encode_properties(payload + MB_PREFIX_BYTES, &p);
                 status = MB_OK; count = 1; bytes += MB_PROPERTIES_BYTES;
             } else finish = 1;
-        } else if (version >= MB_CAP_VERSION && op == MB_CAPS && request_bytes == 4 && s.instance && s.listed) {
+        } else if (version >= MB_CAP_VERSION && op == MB_CAPS && request_bytes == 4 && s->instance && s->listed) {
             uint32_t id = mb_get_u32(request);
-            if (id && id <= s.count) {
-                status = native_snapshot(&s, id, payload + MB_PREFIX_BYTES, &result);
+            if (id && id <= s->count) {
+                status = native_snapshot(s, id, payload + MB_PREFIX_BYTES, &result);
                 if (status == MB_OK) { count = 1; bytes += MB_PROPERTIES_BYTES + MB_CAPS_BYTES; }
             } else finish = 1;
-        } else if (version >= MB_CAP_VERSION && op >= MB_FORMAT && op <= MB_SPARSE && s.instance && s.listed) {
+        } else if (version >= MB_CAP_VERSION && op >= MB_FORMAT && op <= MB_SPARSE && s->instance && s->listed) {
             uint32_t extra = 0;
-            status = native_extra(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            status = native_extra(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
             else { count = 0; if (status == MB_UNSUPPORTED) result = VK_ERROR_FEATURE_NOT_PRESENT; }
-        } else if (version >= MB_DEVICE_VERSION && op >= MB_DEVICE_CREATE && op <= MB_DEVICE_DESTROY && s.instance && s.listed) {
+        } else if (version >= MB_DEVICE_VERSION && op >= MB_DEVICE_CREATE && op <= MB_DEVICE_DESTROY && s->instance && s->listed) {
             uint32_t extra = 0;
-            status = native_device_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            status = native_device_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
-        } else if (version >= MB_SUBMIT_VERSION && op >= MB_POOL_CREATE && op <= MB_QUEUE_SUBMIT && s.instance && s.listed) {
+        } else if (version >= MB_SUBMIT_VERSION && op >= MB_POOL_CREATE && op <= MB_QUEUE_SUBMIT && s->instance && s->listed) {
             uint32_t extra = 0;
-            status = native_submit_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            status = native_submit_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
-        } else if (version == MB_INTEROP_VERSION && op >= MB_BUFFER_CREATE && op <= MB_AHB_PRESENT && s.instance && s.listed) {
+        } else if (version >= MB_INTEROP_VERSION && op >= MB_BUFFER_CREATE && op <= MB_AHB_PRESENT && s->instance && s->listed) {
             uint32_t extra = 0;
-            status = native_interop_command(&s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            status = native_interop_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
-        } else if (op == MB_DESTROY && !request_bytes && s.instance) {
-            close_session(&s); status = MB_OK; finish = 1;
+        } else if (version == MB_RENDERER_VERSION && op >= MB_RENDERER_SEMAPHORE_CREATE && op <= MB_RENDERER_IDLE && s->instance && s->listed) {
+            uint32_t extra = 0;
+            status = native_renderer_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (status == MB_OK) bytes += extra;
+        } else if (op == MB_DESTROY && !request_bytes && s->instance) {
+            close_session(s); status = MB_OK; finish = 1;
         } else {
             finish = 1;
         }
+        if (version == MB_RENDERER_VERSION && status == MB_PROTOCOL_ERROR) finish = 1;
         mb_put_u32(payload, status); mb_put_u32(payload + 4, (uint32_t)result); mb_put_u32(payload + 8, count);
         if (version == MB_VERSION) mb_header(header, bytes);
         else mb_session_header(header, op, bytes);
@@ -296,7 +311,8 @@ static void serve(int fd) {
         }
         if (finish) break;
     }
-    close_session(&s);
+    close_session(s);
+    free(request); free(s);
 }
 
 static void *client_main(void *arg) {

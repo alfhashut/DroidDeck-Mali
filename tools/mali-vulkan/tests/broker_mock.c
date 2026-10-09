@@ -61,6 +61,17 @@ static void mock_properties(VkPhysicalDevice device, VkPhysicalDeviceProperties 
     if (mode == 13) { p->vendorID = 0xffff; p->deviceID = 0xffff; }
     p->driverVersion = 109051904; p->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     p->limits.maxImageDimension2D = 8192;
+    if (mode >= 43) {
+        p->limits.maxImageDimension1D = p->limits.maxImageDimension3D = 256;
+        p->limits.maxBoundDescriptorSets = 4;
+        p->limits.maxPerStageDescriptorSamplers = mode == 59 ? 32 : 64;
+        p->limits.maxPerStageDescriptorSampledImages = p->limits.maxDescriptorSetSamplers = p->limits.maxDescriptorSetSampledImages = 64;
+        p->limits.maxPerStageDescriptorStorageImages = p->limits.maxDescriptorSetStorageImages = 8;
+        p->limits.maxPerStageDescriptorUniformBuffers = p->limits.maxDescriptorSetUniformBuffers = 12;
+        p->limits.maxPerStageResources = 128; p->limits.maxComputeWorkGroupInvocations = mode == 60 ? 32 : 128;
+        for (unsigned i = 0; i < 3; ++i) { p->limits.maxComputeWorkGroupSize[i] = 128; p->limits.maxComputeWorkGroupCount[i] = 65535; }
+    }
+    p->limits.minUniformBufferOffsetAlignment = 256; p->limits.maxUniformBufferRange = 65536;
     p->limits.bufferImageGranularity = UINT64_C(0x123456789);
     p->limits.minMemoryMapAlignment = 4096; p->limits.nonCoherentAtomSize = 256;
     p->limits.minTexelOffset = -8;
@@ -75,13 +86,20 @@ struct mock_logical { uint32_t family, count; int lost, idle_retries; struct moc
 #include "mock_interop_types.h"
 #include "mock_submit.h"
 #include "mock_interop.h"
+#include "mock_renderer.h"
+static void mock_timeline_signal(struct mock_object *c) { if (c->timeline) { assert(c->signal_value > c->timeline->value); c->timeline->value = c->signal_value; } }
 static VkResult mock_create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo *info,
         const VkAllocationCallbacks *allocator, VkDevice *out) {
     assert(physical == (VkPhysicalDevice)(uintptr_t)0x42 && !allocator);
-    assert(!info->pNext && !info->flags && !info->enabledLayerCount && info->queueCreateInfoCount == 1);
+    assert((!info->pNext || mode >= 43) && !info->flags && !info->enabledLayerCount && info->queueCreateInfoCount == 1);
     const VkDeviceQueueCreateInfo *q = info->pQueueCreateInfos;
     assert(!q->pNext && !q->flags && q->queueCount && q->queueCount <= 2 && q->queueFamilyIndex < 2);
     assert(info->pEnabledFeatures && !info->pEnabledFeatures->textureCompressionBC);
+    if (info->pNext) {
+        const VkPhysicalDeviceTimelineSemaphoreFeaturesKHR *t = info->pNext; assert(t->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR && t->timelineSemaphore == 1);
+        const VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *scalar = t->pNext; assert(scalar && scalar->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT && scalar->scalarBlockLayout == 1 && !scalar->pNext);
+        for (unsigned i = 0; i < info->enabledExtensionCount; ++i) assert(strcmp(info->ppEnabledExtensionNames[i], "VK_EXT_robustness2"));
+    }
     if (mode == 9) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     struct mock_logical *d = calloc(1, sizeof(*d)); assert(d);
     d->family = q->queueFamilyIndex; d->count = q->queueCount;
@@ -108,6 +126,9 @@ static PFN_vkVoidFunction mock_gdpa(VkDevice device, const char *name) {
 #define MB_INTEROP_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)mock_##n;
 #include "interop_entries.def"
 #undef MB_INTEROP_ENTRY
+#define MB_RENDERER_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)mock_##n;
+#include "renderer_entries.def"
+#undef MB_RENDERER_ENTRY
     if (!strcmp(name, "vkGetAndroidHardwareBufferPropertiesANDROID")) return (PFN_vkVoidFunction)mock_GetAndroidHardwareBufferPropertiesANDROID;
     if (!strcmp(name, "vkGetFenceFdKHR")) return (PFN_vkVoidFunction)mock_GetFenceFdKHR;
     if (!strcmp(name, "vkDeviceWaitIdle")) return (PFN_vkVoidFunction)mock_DeviceWaitIdle;
@@ -200,6 +221,8 @@ int main(int argc, char **argv) {
         printf("DEVICES creates=%d destroys=%d queues=%d\n", device_creates, device_destroys, queue_gets);
         printf("SUBMIT pools=%d/%d commands=%d/%d events=%d/%d fences=%d/%d submits=%d executions=%d idle=%d\n", pools_created, pools_destroyed, commands_allocated, commands_freed, events_created, events_destroyed, fences_created, fences_destroyed, submits, executions, idle_calls);
         printf("INTEROP buffers=%d/%d images=%d/%d memories=%d/%d AHB=%d/%d consumers=%d CPU=%d flush=%d invalidate=%d\n", buffers_created, buffers_destroyed, images_created, images_destroyed, memories_created, memories_freed, ahb_created, ahb_freed, consumers, cpu_locks, flushes, invalidates);
+        printf("RENDERER objects=%d/%d dispatches=%d shaderBytes=%d\n", renderer_created, renderer_destroyed, dispatches, shader_bytes);
+        assert(renderer_created == renderer_destroyed);
         assert(buffers_created == buffers_destroyed && images_created == images_destroyed && memories_created == memories_freed && ahb_created == ahb_freed);
         assert(pools_created == pools_destroyed && commands_allocated == commands_freed && events_created == events_destroyed && fences_created == fences_destroyed);
         return 0;

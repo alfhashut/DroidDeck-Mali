@@ -12,6 +12,7 @@
 #include <vulkan/vk_icd.h>
 #include "capability_transport.h"
 #include "submit_protocol.h"
+#include "renderer_protocol.h"
 #include "interop_protocol.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
@@ -133,7 +134,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
     }
     struct proxy_instance *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    s->wire_version = mb_interop_mode() ? MB_INTEROP_VERSION : mb_submit_mode() ? MB_SUBMIT_VERSION : mb_device_mode() ? MB_DEVICE_VERSION : (mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION);
+    s->wire_version = mb_renderer_mode() ? MB_RENDERER_VERSION : mb_interop_mode() ? MB_INTEROP_VERSION : mb_submit_mode() ? MB_SUBMIT_VERSION : mb_device_mode() ? MB_DEVICE_VERSION : (mb_capability_mode() ? MB_CAP_VERSION : MB_SESSION_VERSION);
     s->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     strcpy(address.sun_path, path);
     struct timeval timeout = { .tv_sec = 10 };
@@ -331,11 +332,18 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
 #include "submit_entries.def"
 #undef MB_SUBMIT_ENTRY
     }
-    if (((struct proxy_instance *)instance)->wire_version == MB_INTEROP_VERSION) {
+    if (((struct proxy_instance *)instance)->wire_version >= MB_INTEROP_VERSION) {
 #define MB_INTEROP_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;
 #include "interop_entries.def"
 #undef MB_INTEROP_ENTRY
         if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
+    }
+    if (((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {
+#define MB_RENDERER_ENTRY(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)proxy_##n;
+#include "renderer_entries.def"
+#undef MB_RENDERER_ENTRY
+        if (!strcmp(name, "vkWaitSemaphores")) return (PFN_vkVoidFunction)proxy_WaitSemaphoresKHR;
+        if (!strcmp(name, "vkGetSemaphoreCounterValue")) return (PFN_vkVoidFunction)proxy_GetSemaphoreCounterValueKHR;
     }
     return physical_proc(name);
 }

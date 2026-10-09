@@ -3,7 +3,7 @@
 #include "interop_test_api.h"
 static VkResult interop_rpc(struct proxy_logical *d, uint32_t op, const uint8_t *args, uint32_t n,
         uint8_t *out, uint32_t expected) {
-    if (!d || d->owner->wire_version != MB_INTEROP_VERSION || n > MB_INTEROP_CHUNK + 16 || expected > MB_INTEROP_CHUNK) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!d || d->owner->wire_version < MB_INTEROP_VERSION || n > MB_INTEROP_CHUNK + 16 || expected > MB_INTEROP_CHUNK) return VK_ERROR_FEATURE_NOT_PRESENT;
     uint8_t request[MB_INTEROP_CHUNK + 20], reply[MB_PREFIX_BYTES + MB_INTEROP_CHUNK]; uint32_t bytes = 0;
     mb_put_u32(request, d->id); if (n) memcpy(request + 4, args, n);
     pthread_mutex_lock(&d->owner->lock);
@@ -35,6 +35,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateBuffer(VkDevice device, const 
     return r;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateImage(VkDevice device, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
+    if (device && ((struct proxy_logical *)device)->owner->wire_version == MB_RENDERER_VERSION) return renderer_CreateImage(device, ci, a, out);
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
     *out = VK_NULL_HANDLE;
     if (!device || !ci || a || ci->sType != VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO || ci->pNext || ci->flags ||
@@ -162,6 +163,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_CmdFillBuffer(VkCommandBuffer command, V
 static int interop_color_range(const VkImageSubresourceRange *r) { return r && r->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && !r->baseMipLevel && r->levelCount == 1 && !r->baseArrayLayer && r->layerCount == 1; }
 static VKAPI_ATTR void VKAPI_CALL proxy_CmdPipelineBarrier(VkCommandBuffer command, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags flags,
         uint32_t memory_count, const VkMemoryBarrier *memory, uint32_t buffer_count, const VkBufferMemoryBarrier *buffers, uint32_t image_count, const VkImageMemoryBarrier *images) {
+    if (command && ((struct proxy_resource *)command)->owner->owner->wire_version == MB_RENDERER_VERSION && !buffer_count) { renderer_Barrier(command, src, dst, flags, memory_count, memory, buffer_count, buffers, image_count, images); return; }
     (void)memory; struct proxy_resource *c = interop_command(command); if (!c) return;
     VkResult r = VK_ERROR_FEATURE_NOT_PRESENT; uint8_t args[44]; struct proxy_resource *o = NULL;
     uint32_t sa = 0, da = 0, old = 0, next = 0, sf = 0, df = 0, kind = 0;
@@ -178,6 +180,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_CmdPipelineBarrier(VkCommandBuffer comma
     submit_void_error(c->owner, "vkCmdPipelineBarrier", r);
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_CmdClearColorImage(VkCommandBuffer command, VkImage image, VkImageLayout layout, const VkClearColorValue *color, uint32_t n, const VkImageSubresourceRange *ranges) {
+    if (command && ((struct proxy_resource *)command)->owner->owner->wire_version == MB_RENDERER_VERSION) { renderer_Clear(command, image, layout, color, n, ranges); return; }
     struct proxy_resource *c = interop_command(command); if (!c) return;
     struct proxy_resource *im = submit_find(c->owner, (uintptr_t)image, PROXY_IMAGE); VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
     if (im && color && n == 1 && interop_color_range(ranges)) {
@@ -188,6 +191,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_CmdClearColorImage(VkCommandBuffer comma
     submit_void_error(c->owner, "vkCmdClearColorImage", r);
 }
 static void interop_copy_image(VkCommandBuffer command, VkImage image, VkImageLayout layout, VkBuffer buffer, uint32_t n, const VkBufferImageCopy *regions, uint32_t direction) {
+    if (command && ((struct proxy_resource *)command)->owner->owner->wire_version == MB_RENDERER_VERSION) { renderer_Copy(command, image, layout, buffer, n, regions, direction); return; }
     struct proxy_resource *c = interop_command(command); if (!c) return;
     struct proxy_resource *im = submit_find(c->owner, (uintptr_t)image, PROXY_IMAGE), *b = submit_find(c->owner, (uintptr_t)buffer, PROXY_BUFFER); VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
     if (im && b && n == 1 && regions && !regions->bufferOffset && !regions->bufferRowLength && !regions->bufferImageHeight &&

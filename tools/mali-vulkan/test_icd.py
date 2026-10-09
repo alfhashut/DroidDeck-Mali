@@ -79,7 +79,8 @@ class IcdTests(unittest.TestCase):
                     process.communicate()
                     self.fail("broker shutdown timed out")
                 errors.seek(0)
-                self.assertEqual(process.returncode, 0, errors.read())
+                self.broker_errors = errors.read()
+                self.assertEqual(process.returncode, 0, self.broker_errors)
                 self.cleanup_output = output
                 self.assertFalse(path.exists(), "broker must remove its socket")
 

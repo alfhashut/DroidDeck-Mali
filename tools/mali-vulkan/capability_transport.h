@@ -7,9 +7,12 @@
 #include <unistd.h>
 #include "capabilities.h"
 
+static inline int mb_renderer_mode(void) {
+    const char *v = getenv("MALI_VULKAN_RENDERER_TEST"); return v && !strcmp(v, "1");
+}
 static inline int mb_interop_mode(void) {
     const char *value = getenv("MALI_VULKAN_INTEROP_TEST");
-    return value && !strcmp(value, "1");
+    return mb_renderer_mode() || (value && !strcmp(value, "1"));
 }
 static inline int mb_submit_mode(void) {
     const char *value = getenv("MALI_VULKAN_SUBMIT_TEST");

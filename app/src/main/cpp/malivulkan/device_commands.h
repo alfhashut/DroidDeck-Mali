@@ -3,8 +3,14 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         uint32_t bytes, uint8_t *reply, uint32_t *extra, uint32_t *count, VkResult *result) {
     if (op == MB_DEVICE_CREATE) {
         struct mb_device_request r;
-        uint32_t service = 0;
-        if (s->wire_version == MB_INTEROP_VERSION) {
+        uint32_t service = 0, timeline = 0, scalar = 0, fp16 = 0;
+        if (s->wire_version == MB_RENDERER_VERSION) {
+            if (bytes < 16) return MB_PROTOCOL_ERROR;
+            timeline = mb_get_u32(wire + bytes - 12); scalar = mb_get_u32(wire + bytes - 8); fp16 = mb_get_u32(wire + bytes - 4);
+            bytes -= 12;
+            if (timeline != 1 || scalar != 1 || fp16) { *result = VK_ERROR_FEATURE_NOT_PRESENT; return MB_VULKAN_ERROR; }
+        }
+        if (s->wire_version >= MB_INTEROP_VERSION) {
             if (bytes < 4) return MB_PROTOCOL_ERROR;
             service = mb_get_u32(wire + bytes - 4); bytes -= 4;
             if (service > 1) return MB_PROTOCOL_ERROR;
@@ -30,12 +36,24 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         *result = VK_ERROR_FEATURE_NOT_PRESENT; return MB_VULKAN_ERROR; }
 #include "features_fields.def"
 #undef MB_FEATURE
+        if (s->wire_version == MB_RENDERER_VERSION) {
+            VkPhysicalDeviceProperties physical; get_properties(s, r.physical_id - 1, &physical);
+            const char *required[] = {"VK_KHR_timeline_semaphore", "VK_EXT_scalar_block_layout", "VK_KHR_image_format_list"};
+            if (physical.vendorID != 0x13b5 || physical.apiVersion < VK_API_VERSION_1_1 || s->native_api < VK_API_VERSION_1_1 ||
+                !(caps->queried & MB_Q_TIMELINE) || !caps->timeline.timelineSemaphore || !(caps->queried & MB_Q_SCALAR) || !caps->scalar.scalarBlockLayout) {
+                free(caps); *result = VK_ERROR_FEATURE_NOT_PRESENT; return MB_VULKAN_ERROR;
+            }
+            if (r.extension_count != 3) { free(caps); *result = VK_ERROR_EXTENSION_NOT_PRESENT; return MB_VULKAN_ERROR; }
+            for (unsigned i = 0; i < 3; ++i) if (!mb_has_extension(caps->extensions, caps->extension_count, required[i]) || strcmp(r.extensions[i], required[i])) {
+                free(caps); *result = VK_ERROR_EXTENSION_NOT_PRESENT; return MB_VULKAN_ERROR;
+            }
+        }
         uint32_t queue_flags = caps->queues[r.family].queueFlags;
         VkPhysicalDeviceMemoryProperties memory = caps->memory;
         if (service) {
             const char *required[] = {"VK_ANDROID_external_memory_android_hardware_buffer", "VK_EXT_queue_family_foreign", "VK_KHR_external_fence_fd"};
             VkPhysicalDeviceProperties service_properties; get_properties(s, r.physical_id - 1, &service_properties);
-            if (r.extension_count || s->native_api < VK_API_VERSION_1_1 || service_properties.apiVersion < VK_API_VERSION_1_1) { free(caps); *result = VK_ERROR_FEATURE_NOT_PRESENT; return MB_VULKAN_ERROR; }
+            if ((s->wire_version != MB_RENDERER_VERSION && r.extension_count) || s->native_api < VK_API_VERSION_1_1 || service_properties.apiVersion < VK_API_VERSION_1_1) { free(caps); *result = VK_ERROR_FEATURE_NOT_PRESENT; return MB_VULKAN_ERROR; }
             for (unsigned i = 0; i < 3; ++i) {
                 if (!mb_has_extension(caps->extensions, caps->extension_count, required[i])) {
                     ERROR("AHB native service requires %s", required[i]); free(caps); *result = VK_ERROR_EXTENSION_NOT_PRESENT; return MB_VULKAN_ERROR;
@@ -59,6 +77,9 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         VkDeviceCreateInfo info = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue, .enabledExtensionCount = r.extension_count,
             .ppEnabledExtensionNames = extensions, .pEnabledFeatures = &r.features};
+        VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalar_features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT, .scalarBlockLayout = scalar};
+        VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline_features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR, .pNext = &scalar_features, .timelineSemaphore = timeline};
+        if (s->wire_version == MB_RENDERER_VERSION) info.pNext = &timeline_features;
         VkPhysicalDeviceProperties properties; get_properties(s, r.physical_id - 1, &properties);
         LOG("device test selected physical ID=%u name=%s API=%u.%u.%u", r.physical_id, properties.deviceName,
             VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion), VK_VERSION_PATCH(properties.apiVersion));
@@ -69,7 +90,7 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
 #define MB_FEATURE(n) if (r.features.n) { LOG("enabled feature: " #n "=1"); ++enabled_features; }
 #include "features_fields.def"
 #undef MB_FEATURE
-        LOG("enabled core feature bits=%u; extension feature bits=0", enabled_features);
+        LOG("enabled core feature bits=%u; extension feature bits=%u", enabled_features, s->wire_version == MB_RENDERER_VERSION ? 2u : 0u);
         VkDevice handle = VK_NULL_HANDLE;
         *result = create(s->devices[r.physical_id - 1], &info, NULL, &handle);
         LOG("broker vkCreateDevice result=%d", (int)*result);
@@ -92,8 +113,13 @@ static uint32_t native_device_command(struct vk_session *s, uint32_t op, const u
         if (s->wire_version >= MB_SUBMIT_VERSION && native_submit_init(d)) {
             native_close_device(d); *result = VK_ERROR_INITIALIZATION_FAILED; return MB_LOADER_ERROR;
         }
-        if (s->wire_version == MB_INTEROP_VERSION && native_interop_init(d, service)) {
+        if (s->wire_version >= MB_INTEROP_VERSION && native_interop_init(d, service)) {
             native_close_device(d); *result = VK_ERROR_INITIALIZATION_FAILED; return MB_LOADER_ERROR;
+        }
+        if (s->wire_version == MB_RENDERER_VERSION) {
+            if (native_renderer_init(d)) { native_close_device(d); *result = VK_ERROR_INITIALIZATION_FAILED; return MB_LOADER_ERROR; }
+            d->renderer.limits = properties.limits;
+            LOG("Mali compatibility renderer enabled: physical API %u.%u.%u; timeline=1 scalar=1 FP16=0; no version spoof; robustness2 not advertised", VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion), VK_VERSION_PATCH(properties.apiVersion));
         }
         mb_put_u32(reply, d->id); *extra = 4; *count = 1; return MB_OK;
     }

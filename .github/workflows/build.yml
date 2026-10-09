@@ -330,6 +330,8 @@ jobs:
           grep -a -q -F -- 'vk-image-memory-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
           grep -a -q -F -- 'vk-ahb-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
           grep -a -q -F -- 'vk-ahb-present-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
+          grep -a -q -F -- 'vk-gamescope-renderer-init-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
+          grep -a -q -F -- 'vk-gamescope-first-frame-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
 
       - name: Build the x86 preloads FEX guests load (glibc 2.31)
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -496,7 +498,8 @@ jobs:
               result = "MISSING" if name not in apk.namelist() else (
                   "NEW" if all(marker in apk.read(name) for marker in
                                (b"vk-enumerate-only", b"vk-capabilities", b"vk-create-device-test", b"vk-submit-test", b"vk-buffer-memory-test", b"vk-image-memory-test",
-                                b"vk-ahb-test", b"vk-ahb-present-test")) else "OLD")
+                                b"vk-ahb-test", b"vk-ahb-present-test",
+                                b"vk-gamescope-renderer-init-test", b"vk-gamescope-first-frame-test")) else "OLD")
           print(result)
           sys.exit(0 if result == "NEW" else 1)
           PY
