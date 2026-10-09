@@ -101,17 +101,27 @@ set -e
 cat out/gamescope-submit.log
 test "$SUBMIT_STATUS" -eq 1
 grep -F 'gamescope: submit test vkCreateInstance failed:' out/gamescope-submit.log
-# All memory and renderer paths must be in this packaged executable and exit before startup.
+# Memory/renderer diagnostics fail on the missing ICD; normal session/client
+# entrypoints instead fail their environment/socket preconditions before Vulkan.
 for diagnostic in vk-buffer-memory-test vk-image-memory-test vk-ahb-test vk-ahb-present-test vk-gamescope-renderer-init-test vk-gamescope-first-frame-test mali-session-test mali-wayland-client-test mali-wayland-session mali-interactive-client; do
   grep -F -- "--$diagnostic" out/gamescope-help.log
   set +e
-  env VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
+  env -u WAYLAND_SOCKET -u MALI_VULKAN_NORMAL_SESSION \
+    XDG_RUNTIME_DIR="$WORK/out" WAYLAND_DISPLAY="$WORK/out/missing-wayland" \
+    VK_DRIVER_FILES="$WORK/out/missing-icd.json" VK_ICD_FILENAMES="$WORK/out/missing-icd.json" \
     VK_LOADER_LAYERS_DISABLE='*' out/usr/local/bin/gamescope "--$diagnostic" > "out/gamescope-$diagnostic.log" 2>&1
   INTEROP_STATUS=$?
   set -e
   cat "out/gamescope-$diagnostic.log"
   test "$INTEROP_STATUS" -eq 1
-  grep -E 'vkCreateInstance.*VkResult[=:]' "out/gamescope-$diagnostic.log"
+  case "$diagnostic" in
+    mali-wayland-session)
+      grep -Fx 'normal Mali session requires its isolated environment and outer wayland-0' "out/gamescope-$diagnostic.log" ;;
+    mali-interactive-client)
+      grep -E '^interactive Wayland connect:' "out/gamescope-$diagnostic.log" ;;
+    *)
+      grep -E 'vkCreateInstance.*VkResult[=:][[:space:]]*-9([^0-9]|$)' "out/gamescope-$diagnostic.log" ;;
+  esac
 done
 # Every NEEDED library must be one the runtime ships, or the binary would not load there.
 NEEDED=$(readelf -d out/usr/local/bin/gamescope | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
