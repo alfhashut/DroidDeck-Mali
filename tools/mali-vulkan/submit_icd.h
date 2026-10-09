@@ -12,6 +12,7 @@ struct proxy_resource {
 };
 _Static_assert(offsetof(struct proxy_resource, loader) == 0, "command buffer dispatch word");
 static void proxy_free_resources(struct proxy_logical *d) {
+    free(d->write_request); d->write_request = NULL; d->write_capacity = 0;
     while (d->resources) { struct proxy_resource *next = d->resources->next; free(d->resources->mirror); free(d->resources); d->resources = next; }
 }
 static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t handle, enum proxy_resource_kind kind) {

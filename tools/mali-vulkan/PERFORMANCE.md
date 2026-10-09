@@ -1,16 +1,21 @@
 # Checkpoint 7P: normal Mali session measurements
 
-The user reports 5–6 FPS, occasionally about 10 FPS, in the phone-proven normal
-Launch path. A primary per-frame bottleneck and a performance gain have **not**
-yet been established with this instrumentation. These are source findings:
+Phone profiling supplied for CP7P identifies mapped-memory RPC traffic as the
+first major bottleneck: **416 RPCs/frame**, two queue submissions/frame. The
+Android compositor reported 93 GPU/zero-copy frames in ten seconds (9.3 FPS),
+about 1.05 ms average `render_scene`, no copy path and no pool drops. A 15-frame
+window had 6240 RPCs, 542.350 ms broker service, 1435.472 ms broker thread CPU,
+29.657 ms across 30 queue submissions and 117.509 ms across 60 timeline waits.
+These are the user's phone measurements before the bulk-write change; its FPS
+gain still needs a new phone run. Source audit:
 
 - Every renderer/command-recording RPC waits synchronously for a broker reply,
   including void Vulkan commands. Commands have not been batched or made async.
-- Before each renderer queue submission, the ICD sends **all** persistently
-  mapped coherent memory in 4096-byte `MB_MEMORY_WRITE` chunks. The renderer's
-  512 KiB upload allocation alone contributes 128 round trips per submission.
-  This is a calculated contribution, not the measured total RPCs per frame.
-  SHM source upload, mapping reads, other allocations and command calls add work.
+- Before the bulk-write change, each renderer queue submission sent **all**
+  persistently mapped coherent memory in 4096-byte `MB_MEMORY_WRITE` chunks.
+  The 512 KiB upload allocation alone contributed 128 round trips/submission,
+  256/frame, about 61.5% of the measured 416. SHM source upload, mapping reads,
+  other allocations and command calls contribute the remaining work.
 - SHM source textures are imported each committed frame; fences and sync tokens
   are created/closed each frame. The three AHB outputs, connection, upload buffer,
   renderer, pipeline and descriptor infrastructure persist. Resource counts in
@@ -41,6 +46,53 @@ usually showed two Android-owned buffers, no drops, no pending commands and
 no open sync FDs after each frame. Those observations do not identify GPU/RPC
 time or rule out short pool stalls: the old build samples after its waits.
 No APK was installed and no phone configuration/session was changed.
+
+## Bulk mapped-memory writes
+
+Old path: `renderer_QueueSubmit()` walks coherent mappings, calls
+`interop_copy_mapping()`, then `interop_rpc()` for each 4 KiB chunk. Opcode
+**41 (`MB_MEMORY_WRITE`)** reaches `native_interop_command()`, which validates
+and copies into the real mapped allocation before replying. The proxy waits
+for every reply before issuing opcode 76 (`MB_RENDERER_SUBMIT`).
+
+The new path keeps opcode 41, wire v7, little-endian schema and zero-payload
+acknowledgment. Its payload is `device:u32, memory:u32, offset:u64, length:u32,
+length bytes`. Writes use up to **512 KiB data/message** (524308-byte request),
+within the existing 524544-byte broker request buffer. This bounds messages,
+not allocations or mapped ranges. A range larger than 512 KiB is split into
+`ceil(length/524288)` acknowledged writes, including its final partial chunk.
+Reads and wire-v6 writes retain the existing 4 KiB bound. Old v7 4 KiB writes
+remain valid, including Checkpoint 6 callers. Use matching proxy/broker assets;
+an older broker will reject larger writes, rather than submit incomplete data.
+
+`interop_upload_mapping()` builds the full request directly in a reusable
+per-device heap buffer. The connection mutex protects buffer growth, filling,
+all sends and acknowledgment checks for the range. The buffer is bounded to
+512 KiB + 20 bytes and freed by both existing device/instance cleanup paths.
+There is no per-chunk allocation, large stack allocation or fire-and-forget
+operation. All coherent ranges are still uploaded in full, including unchanged
+bytes; dirty tracking and readback transport are outside this optimization.
+
+The native handler checks host visibility, pending GPU use, AHB exclusion,
+allocation bounds, mapped bounds, nonzero length, the version-specific maximum,
+and exact payload length before copying. Subtraction-based range checks avoid
+overflow; `length == message_bytes - 20` avoids unchecked header+length sums.
+Existing Map/Unmap/Flush/Invalidate semantics remain. Success acknowledges the
+completed native copy. Missing/malformed acknowledgments disconnect the stream;
+allocation, native or socket errors stop uploading and return before submission.
+If a later chunk fails, earlier writes may exist in mapped memory, but that
+queue submission never executes. No synchronization or output ownership changes.
+
+| Known persistent upload buffer | Before | Expected after |
+| --- | --- | --- |
+| Writes per 512 KiB range/submission | 128 | 1 |
+| Writes for two submissions/frame | 256 | 2 |
+| Total RPCs/frame, changing only that contribution | 416 | 162 |
+
+Other mapped writes also collapse, so the actual total may be lower than 162.
+Upload bytes remain unchanged for the same workload. Existing CP7P counters
+still observe opcode 41 through the same measured `rpc()` wrapper: next phone
+logs must verify RPCs/frame, write calls/frame, bytes/frame, service/CPU and FPS.
 
 ## Reports and interpretation
 
@@ -125,10 +177,15 @@ Cheap local checks, with no project compilation:
 
 ```sh
 cd tools/mali-vulkan
-python3 -B -m unittest -v test_perf test_normal.NormalOwnershipTests.test_android_owned_release_timeout_and_restart
+python3 -B -m unittest -v test_bulk test_perf test_normal.NormalOwnershipTests.test_android_owned_release_timeout_and_restart
 ```
 
 These build only a tiny mocked-clock metric harness and the standalone ownership
 registry with Android buffer stubs. They verify accounting, report cadence,
 p95, pool protection, timeout/release accounting and header/patch parity. They
 do not establish phone FPS, GPU time, full Vulkan integration or Android timing.
+`test_bulk` additionally compiles only extracted transfer, native memory-switch,
+queue-submit, cleanup and metric helpers with in-memory stubs. It checks exact
+bytes, request reuse, multiple coherent ranges/submissions, partial chunks,
+upload/error ordering, malformed acknowledgments, offsets/overflow, allocation
+failure, native host-visible/pending/AHB guards and legacy read/write bounds.

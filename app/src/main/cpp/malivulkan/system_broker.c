@@ -28,6 +28,8 @@
 #include "normal_protocol.h"
 #include "normal_ownership.h"
 #include "normal_perf.h"
+_Static_assert(MB_MEMORY_WRITE_HEADER + MB_INTEROP_WRITE_MAX <= MB_RENDERER_MAX_REQUEST,
+               "bulk mapped writes must fit the bounded broker request buffer");
 
 static _Thread_local int session_quiet;
 #define LOG(...) do { if (!session_quiet) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__); } while (0)

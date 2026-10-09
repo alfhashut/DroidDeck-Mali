@@ -1266,7 +1266,7 @@
 +#endif
 --- a/src/interop_protocol.h
 +++ b/src/interop_protocol.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,62 @@
 +/* Version 6: bounded diagnostic operations, little endian scalars and byte payloads.
 + * Every request starts with device ID. IDs are connection-local, typed, never reused.
 + * No addresses, descriptors, Vulkan structs or arbitrary pNext chains on the wire.
@@ -1274,9 +1274,15 @@
 + */
 +#ifndef DROIDDECK_INTEROP_PROTOCOL_H
 +#define DROIDDECK_INTEROP_PROTOCOL_H
++#include <stdint.h>
 +#define MB_INTEROP_VERSION 6u
 +#define MB_INTEROP_MAX_MEMORY (1024u * 1024u)
-+#define MB_INTEROP_CHUNK 4096u
++#define MB_INTEROP_CHUNK 4096u /* reads and legacy v6 writes */
++#define MB_INTEROP_BULK_VERSION 7u
++/* Per-message bound, not an allocation/mapped-range limit. Fits the existing
++ * renderer request buffer (512 KiB + 256); larger ranges use multiple writes. */
++#define MB_INTEROP_WRITE_MAX (512u * 1024u)
++#define MB_MEMORY_WRITE_HEADER 20u
 +#define MB_INTEROP_MAX_REFS 16u
 +#define MB_BUFFER_CREATE 32u /* device,u64 size,u32 usage -> ID */
 +#define MB_BUFFER_DESTROY 33u /* device,ID */
@@ -1287,7 +1293,7 @@
 +#define MB_MEMORY_MAP 38u /* device,memory,u64 offset,u64 size */
 +#define MB_MEMORY_UNMAP 39u /* device,memory */
 +#define MB_MEMORY_READ 40u /* device,memory,u64 absolute offset,u32 length -> bytes */
-+#define MB_MEMORY_WRITE 41u /* same header, then length bytes */
++#define MB_MEMORY_WRITE 41u /* same header, then length bytes; v7 bulk writes allowed */
 +#define MB_MEMORY_FLUSH 42u /* device,memory,u64 offset,u64 size */
 +#define MB_MEMORY_INVALIDATE 43u /* same; native range, atom alignment enforced */
 +#define MB_IMAGE_CREATE 44u /* device,width,height,usage -> ID; fixed optimal RGBA8 */
@@ -1308,4 +1314,18 @@
 +#define MB_SYNC_CLOSE 57u /* device,sync ID; pending producer rejected */
 +#define MB_AHB_INSPECT 58u /* device,AHB,sync,pattern(0 clear,1 quadrants) -> CPU checked (0/1) */
 +#define MB_AHB_PRESENT 59u /* device,AHB,sync -> completed consumer handoff; no pixel copying */
++static inline uint32_t mb_interop_write_limit(uint32_t version) {
++    return version >= MB_INTEROP_BULK_VERSION ? MB_INTEROP_WRITE_MAX : MB_INTEROP_CHUNK;
++}
++/* Subtraction-based checks never evaluate offset+length or map_offset+map_size. */
++static inline int mb_interop_mapped_range(uint64_t allocation, uint64_t map_offset,
++        uint64_t map_size, uint64_t offset, uint64_t length) {
++    return length && map_offset <= allocation && map_size <= allocation - map_offset &&
++        offset >= map_offset && offset - map_offset <= map_size &&
++        length <= map_size - (offset - map_offset);
++}
++static inline int mb_interop_write_size(uint32_t version, uint32_t bytes, uint64_t length) {
++    return bytes >= MB_MEMORY_WRITE_HEADER && length && length <= mb_interop_write_limit(version) &&
++        length == bytes - MB_MEMORY_WRITE_HEADER;
++}
 +#endif

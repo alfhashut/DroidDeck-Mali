@@ -13,6 +13,8 @@ struct proxy_logical {
     uint32_t id, family, count;
     struct proxy_queue queues[MB_DEVICE_MAX_QUEUES];
     struct proxy_resource *resources;
+    uint8_t *write_request; /* connection-lock protected, reused by mapped uploads */
+    uint32_t write_capacity;
     atomic_int submit_failed;
     VkPhysicalDeviceMemoryProperties memory_properties;
     size_t map_alignment;

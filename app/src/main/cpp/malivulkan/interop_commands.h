@@ -219,9 +219,9 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
             *result = v->MapMemory(d->handle, m->handle, offset, size, 0, &m->map);
             if (*result == VK_SUCCESS) { m->map_offset = offset; m->map_size = size; } break;
         }
-        if (!m->map || offset < m->map_offset || !interop_range(m->map_size, offset - m->map_offset, size)) return MB_PROTOCOL_ERROR;
+        if (!m->map || !mb_interop_mapped_range(m->size, m->map_offset, m->map_size, offset, size)) return MB_PROTOCOL_ERROR;
         if (op == MB_MEMORY_READ || op == MB_MEMORY_WRITE) {
-            if (size > MB_INTEROP_CHUNK || (op == MB_MEMORY_WRITE && bytes != 20 + size)) return MB_PROTOCOL_ERROR;
+            if (op == MB_MEMORY_WRITE ? !mb_interop_write_size(s->wire_version, bytes, size) : size > MB_INTEROP_CHUNK) return MB_PROTOCOL_ERROR;
             uint8_t *ptr = (uint8_t *)m->map + offset - m->map_offset;
             if (op == MB_MEMORY_WRITE) memcpy(ptr, w + 20, (size_t)size);
             else { memcpy(reply, ptr, (size_t)size); *extra = (uint32_t)size; *count = 1; } break;

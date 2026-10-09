@@ -92,15 +92,49 @@ static VkResult interop_bind(VkDevice device, uintptr_t handle, enum proxy_resou
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_BindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize o) { return interop_bind(d, (uintptr_t)b, PROXY_BUFFER, MB_BUFFER_BIND, m, o); }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_BindImageMemory(VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize o) { return interop_bind(d, (uintptr_t)im, PROXY_IMAGE, MB_IMAGE_BIND, m, o); }
+/* Keep the connection locked until every chunk has an exact success/error ACK.
+ * QueueSubmit is sent only after this returns success for every coherent map.
+ * Reuse one bounded request buffer; no large stack buffer or per-chunk malloc. */
+static VkResult interop_upload_mapping(struct proxy_resource *m, uint64_t offset, uint64_t size) {
+    struct proxy_logical *d = m->owner;
+    if (!d || d->owner->wire_version < MB_INTEROP_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
+    struct proxy_instance *s = d->owner;
+    uint32_t limit = mb_interop_write_limit(s->wire_version);
+    uint32_t capacity = MB_MEMORY_WRITE_HEADER + (size > limit ? limit : (uint32_t)size);
+    VkResult r = VK_SUCCESS;
+    pthread_mutex_lock(&s->lock);
+    if (d->write_capacity < capacity) {
+        uint8_t *request = realloc(d->write_request, capacity);
+        if (!request) { r = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
+        d->write_request = request; d->write_capacity = capacity;
+    }
+    for (uint64_t n = 0; n < size;) {
+        uint32_t length = size - n > limit ? limit : (uint32_t)(size - n);
+        uint8_t *request = d->write_request, reply[MB_PREFIX_BYTES]; uint32_t bytes = 0;
+        mb_put_u32(request, d->id); mb_put_u32(request + 4, m->id);
+        mb_put_u64(request + 8, offset + n); mb_put_u32(request + 16, length);
+        memcpy(request + MB_MEMORY_WRITE_HEADER, m->mirror + (offset - m->map_offset) + n, length);
+        r = rpc(s, MB_MEMORY_WRITE, request, MB_MEMORY_WRITE_HEADER + length, reply, &bytes, sizeof(reply));
+        if ((r == VK_SUCCESS && bytes != sizeof(reply)) ||
+            (bytes && (bytes != sizeof(reply) || mb_get_u32(reply + 8) != 0))) {
+            shutdown(s->fd, SHUT_RDWR); r = VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (r != VK_SUCCESS) break;
+        n += length;
+    }
+done:
+    pthread_mutex_unlock(&s->lock);
+    return r;
+}
 static VkResult interop_copy_mapping(struct proxy_resource *m, uint64_t offset, uint64_t size, int upload) {
-    if (!m->mirror || offset < m->map_offset || offset - m->map_offset > m->map_size || !size || size > m->map_size - (offset - m->map_offset)) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!m || !m->mirror || !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, offset, size)) return VK_ERROR_INITIALIZATION_FAILED;
+    if (upload) return interop_upload_mapping(m, offset, size);
     uint8_t args[16 + MB_INTEROP_CHUNK];
     for (uint64_t n = 0; n < size;) {
         uint32_t length = size - n > MB_INTEROP_CHUNK ? MB_INTEROP_CHUNK : (uint32_t)(size - n);
         mb_put_u32(args, m->id); mb_put_u64(args + 4, offset + n); mb_put_u32(args + 12, length);
         uint8_t *p = m->mirror + offset + n - m->map_offset;
-        if (upload) memcpy(args + 16, p, length);
-        VkResult r = interop_rpc(m->owner, upload ? MB_MEMORY_WRITE : MB_MEMORY_READ, args, 16 + (upload ? length : 0), upload ? NULL : p, upload ? 0 : length);
+        VkResult r = interop_rpc(m->owner, MB_MEMORY_READ, args, 16, p, length);
         if (r != VK_SUCCESS) return r;
         n += length;
     }
