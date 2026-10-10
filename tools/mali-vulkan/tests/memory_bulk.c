@@ -18,6 +18,8 @@ typedef void *VkDeviceMemory;
 typedef void *VkCommandBuffer;
 typedef uint64_t VkDeviceSize;
 typedef unsigned VkMemoryMapFlags;
+typedef void (*PFN_vkVoidFunction)(void);
+#define LOG(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
 #define VKAPI_ATTR
 #define VKAPI_CALL
 #define VK_SUCCESS 0
@@ -139,6 +141,7 @@ static void submit_void_error(struct proxy_logical *d, const char *name, VkResul
 }
 #include "mapping.inc"
 #include "submit.inc"
+#include "device_dispatch.inc"
 #include "cleanup.inc"
 static void setup(uint32_t version) {
     connection.wire_version = version; connection.perf_enabled = 1; assert(!pthread_mutex_init(&connection.lock, NULL));
@@ -149,7 +152,7 @@ static void setup(uint32_t version) {
 }
 static struct proxy_resource *mapping(unsigned i, uint64_t size, uint64_t base) {
     struct proxy_resource *m = calloc(1, sizeof(*m)); assert(m);
-    m->owner = &device; m->id = i + 1; m->kind = PROXY_MEMORY; m->live = 1; m->pool = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    m->owner = &device; m->id = i + 1; m->kind = PROXY_MEMORY; m->live = 1; m->pool = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     m->allocation = base + size + 64; m->map_offset = base; m->map_size = size; m->mirror = malloc((size_t)size); assert(m->mirror);
     for (uint64_t n = 0; n < size; ++n) m->mirror[n] = (uint8_t)(n * 31 + i);
     m->next = device.resources; device.resources = m;
@@ -243,17 +246,27 @@ static VkResult map_native(void *d, void *handle, uint64_t offset, uint64_t size
     (void)d; assert(!offset && size == 230400 && !flags); *out = handle; return VK_SUCCESS;
 }
 static void unmap_native(void *d, void *handle) { (void)d; assert(handle == memories[1].handle && !pending_memory); }
-static void persistent_map(void) {
+static void persistent_map_case(int staging) {
     setup(7); mapping(0, 512u * 1024u, 0);
     struct proxy_resource *stage = mapping(1, 230400, 0);
     free(stage->mirror); stage->mirror = NULL;
     stage->allocation = 230400; memories[1].size = 230400;
     memories[1].handle = memories[1].map; memories[1].map = NULL;
+    memset(memories[1].handle, 0xa7, 230400); // Ordinary maps must download real bytes.
     native.interop.MapMemory = map_native; native.interop.UnmapMemory = unmap_native;
     void *pointer = NULL;
-    assert(proxy_MapMemory(&device, stage, 0, VK_WHOLE_SIZE, 0, &pointer) == VK_SUCCESS);
-    assert(pointer == stage->mirror && memory_maps == 1 && reads == 2 && !memory_unmaps);
-    assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_SUCCESS);
+    if (staging) {
+        typedef VkResult (*MapStaging)(VkDevice, VkDeviceMemory, void **);
+        MapStaging map = (MapStaging)proxy_GetDeviceProcAddr(&device, "vkDroidDeckMapStagingMALI");
+        assert(map && map(&device, stage, &pointer) == VK_SUCCESS);
+        for (unsigned i = 0; i < 230400; ++i) assert(!((uint8_t *)pointer)[i]);
+    } else {
+        assert(proxy_MapMemory(&device, stage, 0, VK_WHOLE_SIZE, 0, &pointer) == VK_SUCCESS);
+        assert(!memcmp(pointer, memories[1].map, 230400));
+        assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_SUCCESS);
+    }
+    unsigned expectedReads = staging ? 0 : 2;
+    assert(pointer == stage->mirror && memory_maps == 1 && reads == expectedReads && !memory_unmaps);
     for (unsigned frame = 0; frame < 40; ++frame) {
         // The caller's pool proved the previous U complete before this full copy.
         assert(!pending_memory);
@@ -265,10 +278,39 @@ static void persistent_map(void) {
         assert(submit() == VK_SUCCESS); // R leaves this pending mapping untouched
         pending_memory = 0;
     }
-    assert(memory_maps == 1 && reads == 2 && !memory_unmaps && writes == 120 && submits == 80);
+    assert(memory_maps == 1 && reads == expectedReads && !memory_unmaps && writes == 120 && submits == 80);
     proxy_UnmapMemory(&device, stage);
     assert(memory_unmaps == 1 && !stage->mirror && !stage->map_size && !stage->staging_managed && !stage->staging_command);
     assert(!memories[1].map && !atomic_load(&device.submit_failed));
+    finish();
+}
+static void staging_dispatch(void) {
+    setup(7);
+    typedef VkResult (*Arm)(VkDevice, VkDeviceMemory, VkCommandBuffer);
+    typedef VkResult (*MapStaging)(VkDevice, VkDeviceMemory, void **);
+    Arm arm = (Arm)proxy_GetDeviceProcAddr(&device, "vkDroidDeckStagingMALI");
+    MapStaging map = (MapStaging)proxy_GetDeviceProcAddr(&device, "vkDroidDeckMapStagingMALI");
+    assert(arm == proxy_DroidDeckStagingMALI && map == proxy_DroidDeckMapStagingMALI);
+    assert(!proxy_GetDeviceProcAddr(NULL, "vkDroidDeckStagingMALI"));
+    assert(!proxy_GetDeviceProcAddr(&device, NULL));
+    assert(map(&device, NULL, NULL) == VK_SUCCESS);
+    connection.wire_version = 6;
+    assert(map(&device, NULL, NULL) == VK_ERROR_FEATURE_NOT_PRESENT);
+    connection.wire_version = 7; connection.perf_enabled = 0;
+    assert(map(&device, NULL, NULL) == VK_ERROR_FEATURE_NOT_PRESENT);
+    connection.perf_enabled = 1;
+    assert(map(&device, NULL, NULL) == VK_SUCCESS && !memory_maps && !reads && !writes && !submits);
+    struct proxy_resource *m = mapping(0, 64, 0);
+    void *out = (void *)1;
+    assert(map(&device, m, &out) == VK_ERROR_INITIALIZATION_FAILED && !out); // already mapped
+    free(m->mirror); m->mirror = NULL;
+    m->live = 0; assert(map(&device, m, &out) == VK_ERROR_INITIALIZATION_FAILED && !out); m->live = 1;
+    m->pool = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    assert(map(&device, m, &out) == VK_ERROR_INITIALIZATION_FAILED && !out);
+    m->pool |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    m->owner = NULL; assert(map(&device, m, &out) == VK_ERROR_INITIALIZATION_FAILED && !out); m->owner = &device;
+    m->allocation = 0; assert(map(&device, m, &out) == VK_ERROR_INITIALIZATION_FAILED && !out);
+    assert(!memory_maps && !reads && !writes);
     finish();
 }
 static void read_bulk(void) {
@@ -416,7 +458,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "read_errors")) read_errors();
     else if (!strcmp(argv[1], "ordering")) ordering();
     else if (!strcmp(argv[1], "persistent_staging")) persistent_staging();
-    else if (!strcmp(argv[1], "persistent_map")) persistent_map();
+    else if (!strcmp(argv[1], "persistent_map")) persistent_map_case(1);
+    else if (!strcmp(argv[1], "ordinary_map")) persistent_map_case(0);
+    else if (!strcmp(argv[1], "staging_dispatch")) staging_dispatch();
     else if (!strcmp(argv[1], "errors")) errors();
     else if (!strcmp(argv[1], "bounds")) bounds();
     else if (!strcmp(argv[1], "legacy")) legacy();

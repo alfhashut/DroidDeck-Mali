@@ -829,7 +829,7 @@
 +int mali_interactive_main();
 --- a/src/mali_normal.inc
 +++ b/src/mali_normal.inc
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,163 @@
 +/* Normal nested Wayland AHB output. Compiled in the real Gamescope renderer TU. */
 +#include "mali_normal.hpp"
 +#include "mali_output_pool.hpp"
@@ -870,9 +870,10 @@
 +#include "mali_normal_perf.inc"
 +bool vulkan_mali_normal_init(unsigned width, unsigned height) {
 +    MaliRequire(maliStaging.live() == 0, "normal staging survived previous session");
-+    maliCompletedTimeline.reset(); maliLocalWaits = {}; maliStaging.stats = {}; maliStaging.backend.maps = {}; maliStaging.backend.staging = nullptr; maliStaging.cursor = 0; maliWaitProfilingActive = false;
++    maliCompletedTimeline.reset(); maliLocalWaits = {}; maliStaging.stats = {}; maliStaging.backend.maps = {}; maliStaging.backend.staging = nullptr; maliStaging.backend.mapStaging = nullptr; maliStaging.cursor = 0; maliWaitProfilingActive = false;
 +    normalOutput = {}; normalPerf = {}; normalOutput.width = width; normalOutput.height = height;
 +    if (!MaliInitializeRenderer(true)) return false;
++    if (maliStaging.backend.resolve() != VK_SUCCESS) { g_device.ShutdownMaliDiagnostic(); return false; }
 +    normalOutput.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
 +    normalOutput.transport = (PFN_vkDroidDeckWaylandMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckWaylandMALI");
 +    normalOutput.performance = (PFN_vkDroidDeckPerformanceMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckPerformance2MALI");
@@ -2026,7 +2027,7 @@
 +};
 --- a/src/mali_staging.inc
 +++ b/src/mali_staging.inc
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,88 @@
 +/* Normal staging slots own their whole-allocation coherent mapping. The pool
 + * proves completion before CPU reuse, resizing, unmapping or destruction. */
 +#include "staging_api.h"
@@ -2037,6 +2038,24 @@
 +    };
 +    struct MapCounters { uint64_t created = 0, unmaps = 0, failures = 0; } maps;
 +    PFN_vkDroidDeckStagingMALI staging = nullptr;
++    PFN_vkDroidDeckMapStagingMALI mapStaging = nullptr;
++    VkResult resolve() {
++        staging = reinterpret_cast<PFN_vkDroidDeckStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckStagingMALI"));
++        mapStaging = reinterpret_cast<PFN_vkDroidDeckMapStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckMapStagingMALI"));
++        if (!staging || !mapStaging) {
++            std::fprintf(stderr, "persistent staging API unavailable: device lookup returned null for %s\n",
++                         !staging ? "vkDroidDeckStagingMALI" : "vkDroidDeckMapStagingMALI");
++            return VK_ERROR_FEATURE_NOT_PRESENT;
++        }
++        VkResult result = mapStaging(g_device.device(), VK_NULL_HANDLE, nullptr);
++        if (result != VK_SUCCESS) {
++            std::fprintf(stderr, "persistent staging API unavailable: wire-v7/normal-mode probe VkResult=%d (see proxy reason)\n", int(result));
++            staging = nullptr; mapStaging = nullptr;
++            return result;
++        }
++        std::fputs("persistent staging API: available\n", stderr);
++        return VK_SUCCESS;
++    }
 +    static constexpr int invalid = VK_ERROR_INITIALIZATION_FAILED;
 +    bool completed(uint64_t value) {
 +        return maliCompletedTimeline.covers(g_device.device(), g_device.maliScratchTimeline(), value);
@@ -2063,8 +2082,7 @@
 +        r = {};
 +    }
 +    int create(uint64_t bytes, Resource &r) {
-+        if (!staging) staging = reinterpret_cast<PFN_vkDroidDeckStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckStagingMALI"));
-+        if (!staging) return VK_ERROR_FEATURE_NOT_PRESENT;
++        if (!staging || !mapStaging) { VkResult result = resolve(); if (result != VK_SUCCESS) return result; }
 +        VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 +        bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 +        VkResult result = g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &r.buffer);
@@ -2072,17 +2090,23 @@
 +        VkMemoryRequirements requirements{};
 +        g_device.vk.GetBufferMemoryRequirements(g_device.device(), r.buffer, &requirements);
 +        uint32_t type = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, requirements.memoryTypeBits);
-+        if (type == ~0u || requirements.size < bytes) { destroy(r); return VK_ERROR_FEATURE_NOT_PRESENT; }
++        if (type == ~0u || requirements.size < bytes) {
++            std::fprintf(stderr, "persistent staging acquire unavailable: host-visible/coherent type=%u memoryTypeBits=0x%x allocation=%llu requested=%llu\n",
++                         type, requirements.memoryTypeBits, (unsigned long long)requirements.size, (unsigned long long)bytes);
++            destroy(r); return VK_ERROR_FEATURE_NOT_PRESENT;
++        }
 +        VkMemoryAllocateInfo allocation{}; allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 +        allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
 +        result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
 +        if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
 +        if (result == VK_SUCCESS) {
-+            result = g_device.vk.MapMemory(g_device.device(), r.memory, 0, VK_WHOLE_SIZE, 0, &r.mapped);
++            result = mapStaging(g_device.device(), r.memory, &r.mapped);
 +            if (result == VK_SUCCESS) { ++maps.created; r.mappedBytes = requirements.size; }
-+            else { ++maps.failures; r.mapped = nullptr; }
++            else {
++                ++maps.failures; r.mapped = nullptr;
++                std::fprintf(stderr, "persistent staging acquire failed: vkDroidDeckMapStagingMALI VkResult=%d\n", int(result));
++            }
 +        }
-+        if (result == VK_SUCCESS) result = staging(g_device.device(), r.memory, VK_NULL_HANDLE);
 +        if (result != VK_SUCCESS) destroy(r);
 +        return result;
 +    }
@@ -2131,9 +2155,12 @@
 +		if (result != VK_SUCCESS) g_device.FailMaliDiagnostic("normal SHM coherent upload arm", result);
 --- a/src/staging_api.h
 +++ b/src/staging_api.h
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,14 @@
 +/* Private normal-renderer contract, not a Vulkan extension or wire opcode.
-+ * NULL command opts a whole coherent mapping into pool-managed uploads.
++ * MapStaging maps a whole fresh coherent allocation without downloading bytes;
++ * the caller must overwrite the complete SHM image before arming its upload.
++ * (memory=NULL, out=NULL) probes wire-v7/normal-mode availability without RPCs.
++ * Staging with NULL command can also register an existing whole mapping.
 + * Before submitting each upload, arm its command after writing the safe slot.
 + * The proxy acknowledges the existing bulk upload before that QueueSubmit and
 + * does not re-upload this allocation for unrelated submits. Unmap ends opt-in. */
@@ -2141,4 +2168,5 @@
 +#define DD_STAGING_API_H
 +#include <vulkan/vulkan.h>
 +typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckStagingMALI)(VkDevice, VkDeviceMemory, VkCommandBuffer);
++typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckMapStagingMALI)(VkDevice, VkDeviceMemory, void **);
 +#endif

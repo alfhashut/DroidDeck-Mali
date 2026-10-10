@@ -8,7 +8,9 @@
 static unsigned waits, resets, created, destroyed, allocated, freed, bound;
 static unsigned mapsCreated, unmaps, armed;
 static int waitResult, createFailure;
-static bool missingProfile, missingStaging;
+static bool missingProfile, missingStaging, missingMap;
+static VkResult probeResult;
+static VkResult stagingMap(VkDevice, VkDeviceMemory, void **);
 static uint64_t nextId, expectedValue, expectedSemaphore = 10;
 static std::map<uint64_t, uint64_t> sizes, bindings;
 static std::map<uint64_t, std::vector<uint8_t>> memory;
@@ -16,7 +18,6 @@ static std::map<uint64_t, void *> mapped;
 static std::map<uint64_t, uint64_t> lastUse;
 static VkResult staging(VkDevice, VkDeviceMemory m, VkCommandBuffer command) {
     assert(mapped.count(m));
-    if (!command && createFailure == 6) return VK_ERROR_INITIALIZATION_FAILED;
     if (command) ++armed;
     return VK_SUCCESS;
 }
@@ -30,6 +31,7 @@ static VkResult profiledWait(VkDevice d, const VkSemaphoreWaitInfo *i, uint64_t 
 }
 static PFN_vkVoidFunction lookup(VkDevice, const char *name) {
     if (!std::strcmp(name, "vkDroidDeckStagingMALI")) return missingStaging ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(staging);
+    if (!std::strcmp(name, "vkDroidDeckMapStagingMALI")) return missingMap ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(stagingMap);
     assert(!std::strcmp(name, "vkDroidDeckProfiledWaitMALI"));
     return missingProfile ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(profiledWait);
 }
@@ -56,6 +58,11 @@ static VkResult mapMemory(VkDevice, VkDeviceMemory m, uint64_t offset, uint64_t 
     *out = nullptr;
     if (createFailure == 5) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     *out = memory.at(m).data(); mapped[m] = *out; ++mapsCreated; return VK_SUCCESS;
+}
+static VkResult stagingMap(VkDevice device, VkDeviceMemory m, void **out) {
+    if (!m && !out) return probeResult;
+    if (createFailure == 6) { *out = nullptr; return VK_ERROR_FEATURE_NOT_PRESENT; }
+    return mapMemory(device, m, 0, VK_WHOLE_SIZE, 0, out);
 }
 static void unmapMemory(VkDevice device, VkDeviceMemory m) {
     assert(!lastUse[m] || maliCompletedTimeline.covers(device, 10, lastUse[m]));
@@ -190,7 +197,7 @@ static void pool() {
         Slot *out = nullptr; assert(maliStaging.acquire(64, out) != 0 && !out);
         assert(!maliStaging.live() && !maliStaging.mappedLive() && mapped.empty() && memory.empty() && sizes.empty());
     }
-    assert(maliStaging.backend.maps.failures == 1);
+    assert(maliStaging.backend.maps.failures == 2);
     createFailure = 0;
     { Lease lease; assert(maliStaging.acquire(64, lease.slot) == 0);
       assert(maliStaging.shutdown() != 0 && maliStaging.live() == 1); }
@@ -201,6 +208,14 @@ static void pool() {
     Slot *out = nullptr;
     assert(maliStaging.acquire(64, out) == VK_ERROR_FEATURE_NOT_PRESENT && !out && !maliStaging.mappedLive());
     assert(memory.empty() && sizes.empty());
+    missingStaging = false; missingMap = true;
+    assert(maliStaging.acquire(64, out) == VK_ERROR_FEATURE_NOT_PRESENT && !out);
+    missingMap = false; probeResult = VK_ERROR_FEATURE_NOT_PRESENT;
+    assert(maliStaging.acquire(64, out) == VK_ERROR_FEATURE_NOT_PRESENT && !out);
+    assert(memory.empty() && sizes.empty() && !maliStaging.mappedLive());
+    probeResult = VK_SUCCESS;
+    { Lease lease; assert(maliStaging.acquire(64, lease.slot) == VK_SUCCESS); }
+    assert(maliStaging.shutdown() == VK_SUCCESS && memory.empty() && mapped.empty());
     { MaliStagingUploadScope outer; assert(maliStagingUploadRecording);
       { MaliStagingUploadScope inner; assert(maliStagingUploadRecording); } assert(maliStagingUploadRecording); }
     assert(!maliStagingUploadRecording);

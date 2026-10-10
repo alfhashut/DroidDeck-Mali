@@ -119,7 +119,11 @@ The slot resource stores `mapped` and `mappedBytes` (the memory requirements
 size). After the existing completion/reservation checks, the importer copies
 the full SHM image through that pointer; there is no per-frame map or unmap.
 Normal-only bounds checks retain both the logical capacity and allocation range.
-Initial coherent map/download semantics are unchanged and still run at creation.
+The private `vkDroidDeckMapStagingMALI` entrypoint maps this known upload-only
+allocation without an initial coherent download. It zeroes the local mirror,
+registers the whole mapping for scoped uploads, and returns its persistent pointer.
+The caller overwrites the complete SHM image before arming any upload. Ordinary
+`vkMapMemory` still performs its original coherent download, including diagnostics.
 Diagnostics and non-pooled SHM imports retain their original map/unmap path.
 
 **Submit scoping is necessary:** the old proxy queue path uploaded every live
@@ -127,8 +131,8 @@ coherent mirror before every submission. Simply retaining mappings would make
 render `R` re-upload staging still read by upload `U`; the unchanged broker
 pending-memory guard correctly rejects this. It would also upload idle slots.
 
-The private, local `vkDroidDeckStagingMALI` contract explicitly opts only these
-whole-allocation coherent mappings into pool-managed upload scoping. Registration
+The private, local `vkDroidDeckStagingMALI` contract arms only these
+whole-allocation coherent mappings for pool-managed uploads. Registration
 requires normal mode, wire v7, a live owned mapping and the complete valid range.
 After copying, the importer arms the real upload command. Its QueueSubmit uses
 the existing bounded `interop_copy_mapping()` bulk uploads and must receive all
@@ -148,6 +152,27 @@ Successful unmap clears the proxy's opt-in and armed-command metadata. Missing
 matching staging API fails before creating a slot; it does not fall back to
 unsafe all-mapping uploads. Session initialization resolves the API anew.
 
+### First-frame acquisition failure and dispatch fix
+
+The first persistent-mapping phone run failed before any staging creation RPC.
+`MaliStagingBackend::create()` returned `VK_ERROR_FEATURE_NOT_PRESENT` because
+device lookup of `vkDroidDeckStagingMALI` returned null. The ICD's instance lookup
+listed it, but `proxy_GetDeviceProcAddr()` omitted it. Gamescope obtains private
+device functions through `g_device.vk.GetDeviceProcAddr`, the same path as the
+already working performance/Wayland entrypoints. Matching headers and direct
+function tests did not exercise that table.
+
+Both private staging functions now appear in both ICD lookup tables. Their
+signatures are distinct; the existing arm/register signature is unchanged.
+No wire-v7 ABI or broker opcode changed. Normal startup resolves both and probes
+wire-v7/normal-mode availability before `MB_NORMAL_BEGIN`, reporting
+`persistent staging API: available` on success. Missing names, wrong wire version,
+disabled normal mode, incompatible allocation requirements and private mapping
+errors have specific diagnostics. Missing map support in an older staged ICD
+fails explicitly; it never falls back to per-frame mapping or unsafe uploads.
+There is no evidence from the supplied phone log of a different staged artifact;
+the source dispatch omission alone explains the observed local failure.
+
 ## Counters and expected steady RPCs
 
 The existing two-second opcode/category/RTT/FPS reports remain. New local rows:
@@ -160,7 +185,7 @@ MaliPerf staging-map: phase=window persistent-maps-created=0 persistent-map-reus
 ```
 
 Map counters reset with the two-second window; live mapped slots are a gauge.
-Creation/resize windows can contain maps and initial reads. A final `phase=teardown`
+Creation/resize windows can contain maps, but no staging reads. A final `phase=teardown`
 row reports unmaps and remaining mapped slots, including a failed drain's retained
 slots. A clean shutdown has zero mapped slots. Existing opcode, RTT, ownership,
 wait-reason and pool reports remain intact.
@@ -263,10 +288,16 @@ partial safe shutdown, real backend cleanup, queued layout vs completion,
 required barrier scopes, same-queue/semaphore/read-only guards, retained host
 memory/AHB guards, profiler/header parity and existing bulk/ownership behavior.
 Persistent cases also run the actual proxy map/unmap, upload and submit helpers:
-40 U/R frames retain one mapping and its initial two reads, with no steady map,
+40 U/R frames retain one mapping with zero initial/steady staging reads and no steady map,
 unmap or read calls, exact full-frame bytes and no pending staging re-upload.
 Other cases cover map/registration failure, pointer/range cleanup on resize,
 partial failed drains retaining live mappings, missing private API, failed ACKs
 preventing submit and unchanged automatic uploads for ordinary coherent memory.
+The bulk harness resolves both private functions through the actual ICD device
+lookup and invokes the capability probe/mapping. It checks v6 and disabled-mode
+rejection without broker work, invalid memory/mapping guards, and ordinary maps
+still downloading two initial chunks with exact bytes. Backend tests cover both
+missing device names, rejected availability probes and specific error messages.
+These are small extracted-source harnesses, not an Android Vulkan loader run.
 CI must still compile actual Gamescope/proxy/broker, followed by normal Launch,
 variable-size, stop/restart and zero-copy/release checks on the phone.

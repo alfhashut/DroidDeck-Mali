@@ -1,6 +1,7 @@
 """Standalone mapped-transfer tests; no ICD/broker/Gamescope/Android build."""
 from pathlib import Path
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -16,17 +17,29 @@ class BulkMemoryTests(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         build = Path(cls.temp.name)
         proxy = (ROOT / 'interop_icd.h').read_text()
-        upload = proxy.split('static VkResult interop_upload_mapping', 1)[1].split('static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory', 1)[0]
+        upload = proxy.split('static VkResult interop_upload_mapping', 1)[1].split('/* Only the private upload-only staging API', 1)[0]
         (build / 'upload.inc').write_text('static VkResult interop_upload_mapping' + upload)
         map_rpc = proxy.split('static VkResult interop_rpc', 1)[1].split('static void interop_publish', 1)[0]
         (build / 'map_rpc.inc').write_text('static VkResult interop_rpc' + map_rpc)
-        mappings = proxy.split('static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory', 1)[1].split('static VkResult interop_mapped_range', 1)[0]
-        (build / 'mapping.inc').write_text('static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory' + mappings)
+        mappings = proxy.split('static VkResult interop_map_memory', 1)[1].split('static VkResult interop_mapped_range', 1)[0]
+        (build / 'mapping.inc').write_text('static VkResult interop_map_memory' + mappings)
         native = (ROOT.parents[1] / 'app/src/main/cpp/malivulkan/interop_commands.h').read_text()
         memory = native.split('    case MB_MEMORY_MAP: case MB_MEMORY_UNMAP:', 1)[1].split('    case MB_COMMAND_FILL:', 1)[0]
         (build / 'native_memory.inc').write_text('    case MB_MEMORY_MAP: case MB_MEMORY_UNMAP:' + memory)
         renderer = (ROOT / 'renderer_icd.h').read_text().split('static VkResult renderer_QueueSubmit', 1)[1].split('static void renderer_Barrier', 1)[0]
         (build / 'submit.inc').write_text('static VkResult renderer_QueueSubmit' + renderer)
+        # Exercise the actual device lookup that Gamescope uses, rather than a
+        # hand-written lookup that can hide omissions in the ICD dispatch table.
+        dispatch = 'static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr' + (ROOT / 'device_icd.h').read_text().split(
+            'static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr', 1)[1]
+        names = set(re.findall(r'proxy_(\w+)', dispatch))
+        names.update(re.findall(r'DEVICE_ENTRY\((\w+)\)', dispatch))
+        for table in ('submit_entries.def', 'interop_entries.def', 'renderer_entries.def'):
+            names.update(re.findall(r'ENTRY\((\w+)\)', (ROOT / table).read_text()))
+        real = {'n', 'GetDeviceProcAddr', 'logical', 'MapMemory', 'UnmapMemory', 'DroidDeckStagingMALI', 'DroidDeckMapStagingMALI'}
+        stubs = ''.join('static void proxy_' + name + '(void) {}\n' for name in sorted(names - real))
+        version = next(line for line in (ROOT / 'submit_protocol.h').read_text().splitlines() if line.startswith('#define MB_SUBMIT_VERSION '))
+        (build / 'device_dispatch.inc').write_text(version + '\n' + stubs + dispatch)
         metric = (ROOT / 'icd_proxy.c').read_text().split('static VkResult rpc(struct proxy_instance *s,', 1)[1].split('static void proxy_free_logical', 1)[0]
         (build / 'metric.inc').write_text('static VkResult rpc(struct proxy_instance *s,' + metric)
         cleanup = (ROOT / 'submit_icd.h').read_text().split('static void proxy_free_resources', 1)[1].split('static struct proxy_resource *submit_find', 1)[0]
@@ -51,8 +64,14 @@ class BulkMemoryTests(unittest.TestCase):
     def test_persistent_staging_only_uploads_for_armed_submission(self):
         self.run_case('persistent_staging')
 
-    def test_persistent_map_reads_once_and_unmaps_after_completion(self):
+    def test_persistent_staging_map_skips_download_and_unmaps_after_completion(self):
         self.run_case('persistent_map')
+
+    def test_actual_device_private_api_resolution_and_availability(self):
+        self.run_case('staging_dispatch')
+
+    def test_ordinary_map_still_downloads_initial_coherent_bytes(self):
+        self.run_case('ordinary_map')
 
     def test_bulk_reads_exact_bytes_minimum_chunks_and_reply_reuse(self):
         self.run_case('read_bulk')

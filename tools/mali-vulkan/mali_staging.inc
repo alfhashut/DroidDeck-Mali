@@ -8,6 +8,24 @@ struct MaliStagingBackend {
     };
     struct MapCounters { uint64_t created = 0, unmaps = 0, failures = 0; } maps;
     PFN_vkDroidDeckStagingMALI staging = nullptr;
+    PFN_vkDroidDeckMapStagingMALI mapStaging = nullptr;
+    VkResult resolve() {
+        staging = reinterpret_cast<PFN_vkDroidDeckStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckStagingMALI"));
+        mapStaging = reinterpret_cast<PFN_vkDroidDeckMapStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckMapStagingMALI"));
+        if (!staging || !mapStaging) {
+            std::fprintf(stderr, "persistent staging API unavailable: device lookup returned null for %s\n",
+                         !staging ? "vkDroidDeckStagingMALI" : "vkDroidDeckMapStagingMALI");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        VkResult result = mapStaging(g_device.device(), VK_NULL_HANDLE, nullptr);
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "persistent staging API unavailable: wire-v7/normal-mode probe VkResult=%d (see proxy reason)\n", int(result));
+            staging = nullptr; mapStaging = nullptr;
+            return result;
+        }
+        std::fputs("persistent staging API: available\n", stderr);
+        return VK_SUCCESS;
+    }
     static constexpr int invalid = VK_ERROR_INITIALIZATION_FAILED;
     bool completed(uint64_t value) {
         return maliCompletedTimeline.covers(g_device.device(), g_device.maliScratchTimeline(), value);
@@ -34,8 +52,7 @@ struct MaliStagingBackend {
         r = {};
     }
     int create(uint64_t bytes, Resource &r) {
-        if (!staging) staging = reinterpret_cast<PFN_vkDroidDeckStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckStagingMALI"));
-        if (!staging) return VK_ERROR_FEATURE_NOT_PRESENT;
+        if (!staging || !mapStaging) { VkResult result = resolve(); if (result != VK_SUCCESS) return result; }
         VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         VkResult result = g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &r.buffer);
@@ -43,17 +60,23 @@ struct MaliStagingBackend {
         VkMemoryRequirements requirements{};
         g_device.vk.GetBufferMemoryRequirements(g_device.device(), r.buffer, &requirements);
         uint32_t type = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, requirements.memoryTypeBits);
-        if (type == ~0u || requirements.size < bytes) { destroy(r); return VK_ERROR_FEATURE_NOT_PRESENT; }
+        if (type == ~0u || requirements.size < bytes) {
+            std::fprintf(stderr, "persistent staging acquire unavailable: host-visible/coherent type=%u memoryTypeBits=0x%x allocation=%llu requested=%llu\n",
+                         type, requirements.memoryTypeBits, (unsigned long long)requirements.size, (unsigned long long)bytes);
+            destroy(r); return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
         VkMemoryAllocateInfo allocation{}; allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
         result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
         if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
         if (result == VK_SUCCESS) {
-            result = g_device.vk.MapMemory(g_device.device(), r.memory, 0, VK_WHOLE_SIZE, 0, &r.mapped);
+            result = mapStaging(g_device.device(), r.memory, &r.mapped);
             if (result == VK_SUCCESS) { ++maps.created; r.mappedBytes = requirements.size; }
-            else { ++maps.failures; r.mapped = nullptr; }
+            else {
+                ++maps.failures; r.mapped = nullptr;
+                std::fprintf(stderr, "persistent staging acquire failed: vkDroidDeckMapStagingMALI VkResult=%d\n", int(result));
+            }
         }
-        if (result == VK_SUCCESS) result = staging(g_device.device(), r.memory, VK_NULL_HANDLE);
         if (result != VK_SUCCESS) destroy(r);
         return result;
     }

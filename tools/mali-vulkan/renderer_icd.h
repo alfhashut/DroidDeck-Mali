@@ -268,21 +268,63 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
     }
     return result;
 }
-/* Local staging contract only. No RPC, global dirty tracking or fake completion. */
+/* Local capability probe. Guards are also enforced on every private operation. */
+static VkResult renderer_staging_available(struct proxy_logical *d) {
+    if (d->owner->wire_version != MB_RENDERER_VERSION) {
+        LOG("persistent staging API unavailable: wire version=%u required=%u", d->owner->wire_version, MB_RENDERER_VERSION);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (!d->owner->perf_enabled) {
+        LOG("persistent staging API unavailable: normal-session profiling mode disabled");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    return VK_SUCCESS;
+}
+/* Local staging contract only. No global dirty tracking or fake completion. */
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckStagingMALI(VkDevice device, VkDeviceMemory memory, VkCommandBuffer command) {
     if (!device) return VK_ERROR_INITIALIZATION_FAILED;
     struct proxy_logical *d = (struct proxy_logical *)device;
-    if (d->owner->wire_version != MB_RENDERER_VERSION || !d->owner->perf_enabled) return VK_ERROR_FEATURE_NOT_PRESENT;
+    VkResult available = renderer_staging_available(d);
+    if (available != VK_SUCCESS) return available;
     struct proxy_resource *m = submit_find(d, (uintptr_t)memory, PROXY_MEMORY);
     struct proxy_resource *c = command ? submit_find(d, (uintptr_t)command, PROXY_COMMAND) : NULL;
     if (!m || m->owner != d || !m->mirror || !(m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
         !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, 0, m->allocation) ||
-        (command && (!c || c->owner != d || !c->id))) return VK_ERROR_INITIALIZATION_FAILED;
+        (command && (!c || c->owner != d || !c->id))) {
+        LOG("persistent staging arm/register failed: memory identity, coherent whole mapping or command identity invalid");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     pthread_mutex_lock(&d->owner->lock);
     VkResult result = VK_ERROR_INITIALIZATION_FAILED;
     if (!command && !m->staging_managed && !m->staging_command) { m->staging_managed = 1; result = VK_SUCCESS; }
     else if (command && m->staging_managed && !m->staging_command) { m->staging_command = c->id; result = VK_SUCCESS; }
     pthread_mutex_unlock(&d->owner->lock);
+    return result;
+}
+/* Upload-only pool allocations: native map once, zeroed local mirror, no READ.
+ * Ordinary vkMapMemory still downloads coherent memory. QueueSubmit still ACKs
+ * all armed uploads before U; unrelated R submissions skip these mappings. */
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckMapStagingMALI(VkDevice device, VkDeviceMemory memory, void **out) {
+    if (out) *out = NULL;
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    struct proxy_logical *d = (struct proxy_logical *)device;
+    VkResult result = renderer_staging_available(d);
+    if (result != VK_SUCCESS) return result;
+    if (!memory && !out) return VK_SUCCESS; /* availability probe */
+    if (!out) return VK_ERROR_INITIALIZATION_FAILED;
+    struct proxy_resource *m = submit_find(d, (uintptr_t)memory, PROXY_MEMORY);
+    uint32_t required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!m || m->owner != d || !m->id || !m->allocation || m->mirror ||
+        m->staging_managed || m->staging_command || (m->pool & required) != required) {
+        LOG("persistent staging map failed: memory identity, unmapped allocation or host-visible/coherent type invalid");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    result = interop_map_memory(device, memory, 0, VK_WHOLE_SIZE, 0, out, 0);
+    if (result == VK_SUCCESS) {
+        pthread_mutex_lock(&d->owner->lock);
+        m->staging_managed = 1;
+        pthread_mutex_unlock(&d->owner->lock);
+    }
     return result;
 }
 static void renderer_Barrier(VkCommandBuffer command, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags flags, uint32_t memory_count, const VkMemoryBarrier *memory, uint32_t buffer_count, const VkBufferMemoryBarrier *buffers, uint32_t n, const VkImageMemoryBarrier *images) {

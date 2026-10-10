@@ -164,23 +164,27 @@ static VkResult interop_copy_mapping(struct proxy_resource *m, uint64_t offset, 
     if (!m || !m->mirror || !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, offset, size)) return VK_ERROR_INITIALIZATION_FAILED;
     return upload ? interop_upload_mapping(m, offset, size) : interop_download_mapping(m, offset, size);
 }
-static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void **out) {
+/* Only the private upload-only staging API may suppress the initial download. */
+static VkResult interop_map_memory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void **out, int download) {
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
     *out = NULL; if (!device || flags) return VK_ERROR_FEATURE_NOT_PRESENT;
     struct proxy_logical *d = (struct proxy_logical *)device; struct proxy_resource *m = submit_find(d, (uintptr_t)memory, PROXY_MEMORY);
     if (!m || m->mirror || offset >= m->allocation) return VK_ERROR_MEMORY_MAP_FAILED;
     if (size == VK_WHOLE_SIZE) size = m->allocation - offset;
     size_t align = d->map_alignment < sizeof(void *) ? sizeof(void *) : d->map_alignment;
-    if (!size || size > m->allocation - offset || (align & (align - 1)) || offset % align) return VK_ERROR_MEMORY_MAP_FAILED;
+    if (!size || size > SIZE_MAX || size > m->allocation - offset || (align & (align - 1)) || offset % align) return VK_ERROR_MEMORY_MAP_FAILED;
     void *ptr = NULL; if (posix_memalign(&ptr, align, (size_t)size)) return VK_ERROR_OUT_OF_HOST_MEMORY;
     uint8_t args[20]; mb_put_u32(args, m->id); mb_put_u64(args + 4, offset); mb_put_u64(args + 12, size);
     VkResult r = interop_rpc(d, MB_MEMORY_MAP, args, 20, NULL, 0);
     if (r != VK_SUCCESS) { free(ptr); return r; }
     m->mirror = ptr; m->map_offset = offset; m->map_size = size; memset(ptr, 0, (size_t)size);
-    if (m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) r = interop_copy_mapping(m, offset, size, 0);
+    if (download && (m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) r = interop_copy_mapping(m, offset, size, 0);
     if (r == VK_SUCCESS) *out = ptr;
     else { mb_put_u32(args, m->id); (void)interop_rpc(d, MB_MEMORY_UNMAP, args, 4, NULL, 0); free(m->mirror); m->mirror = NULL; }
     return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void **out) {
+    return interop_map_memory(device, memory, offset, size, flags, out, 1);
 }
 static VKAPI_ATTR void VKAPI_CALL proxy_UnmapMemory(VkDevice device, VkDeviceMemory memory) {
     if (!device) return;

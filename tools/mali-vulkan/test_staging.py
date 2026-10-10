@@ -26,6 +26,13 @@ class StagingTests(unittest.TestCase):
                 result = subprocess.run([str(binary), *args], capture_output=True, text=True, timeout=2)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('completed watermark and real staging backend PASS', result.stdout)
+                self.assertIn('persistent staging API: available', result.stderr)
+                for reason in ('device lookup returned null for vkDroidDeckStagingMALI',
+                               'device lookup returned null for vkDroidDeckMapStagingMALI',
+                               'wire-v7/normal-mode probe VkResult=-8',
+                               'vkDroidDeckMapStagingMALI VkResult=-8',
+                               'host-visible/coherent type='):
+                    self.assertIn(reason, result.stderr)
 
     def test_actual_broker_queued_upload_guards_and_planned_layout(self):
         with tempfile.TemporaryDirectory(prefix='mali-upload-dependency-') as directory:
@@ -78,11 +85,17 @@ class StagingTests(unittest.TestCase):
         self.assertIn('if (!staging.slot) g_device.vk.UnmapMemory', patch)
         self.assertIn('maliStaging.backend.prepare(staging.slot->resource, cmdBuffer->rawBuffer())', patch)
         backend = (ROOT / 'mali_staging.inc').read_text()
-        self.assertEqual(backend.count('g_device.vk.MapMemory('), 1)
+        self.assertNotIn('g_device.vk.MapMemory(', backend)
+        self.assertIn('mapStaging(g_device.device(), r.memory, &r.mapped)', backend)
         self.assertEqual(backend.count('g_device.vk.UnmapMemory('), 1)
         self.assertLess(backend.index('g_device.resetCmdBuffers(completedSequence)'), backend.index('g_device.vk.UnmapMemory'))
         self.assertIn('m->staging_managed = m->staging_command = 0', (ROOT / 'interop_icd.h').read_text())
         self.assertIn('"vkDroidDeckStagingMALI"', (ROOT / 'icd_proxy.c').read_text())
+        for entry in ('vkDroidDeckStagingMALI', 'vkDroidDeckMapStagingMALI'):
+            self.assertIn('"' + entry + '"', (ROOT / 'device_icd.h').read_text())
+            self.assertIn('"' + entry + '"', (ROOT / 'icd_proxy.c').read_text())
+        init = normal.split('bool vulkan_mali_normal_init', 1)[1].split('bool vulkan_mali_normal_outputs', 1)[0]
+        self.assertLess(init.index('maliStaging.backend.resolve()'), init.index('MB_NORMAL_BEGIN'))
         self.assertNotIn('maliCompletedTimeline.reset', perf)  # report reset must retain completion knowledge
         self.assertIn('maliCompletedTimeline.reset()', normal.split('bool vulkan_mali_normal_init', 1)[1])
         scope = (ROOT / 'mali_wait_profile.hpp').read_text()
