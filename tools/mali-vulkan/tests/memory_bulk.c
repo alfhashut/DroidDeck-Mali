@@ -10,6 +10,7 @@
 #include "interop_protocol.h"
 #include "renderer_protocol.h"
 #include "normal_perf.h"
+#include "normal_memory_perf.h"
 typedef int VkResult;
 typedef void *VkQueue;
 typedef void *VkFence;
@@ -31,20 +32,21 @@ typedef void (*PFN_vkVoidFunction)(void);
 #define VK_WHOLE_SIZE UINT64_MAX
 #define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT 1u
 #define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT 2u
+#define VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT 16u
 #define VK_STRUCTURE_TYPE_SUBMIT_INFO 1
 #define VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR 2
 #define VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE 3
 typedef struct { int sType; const void *pNext; unsigned waitSemaphoreValueCount, signalSemaphoreValueCount; const uint64_t *pSignalSemaphoreValues; } VkTimelineSemaphoreSubmitInfoKHR;
 typedef struct { int sType; const void *pNext; unsigned waitSemaphoreCount, commandBufferCount, signalSemaphoreCount; void **pCommandBuffers, **pSignalSemaphores; } VkSubmitInfo;
 typedef struct { int sType; void *memory; uint64_t offset, size; } VkMappedMemoryRange;
-struct proxy_instance { pthread_mutex_t lock; uint32_t wire_version; int fd, perf_enabled; struct dd_perf_rpc perf; } connection;
-enum proxy_resource_kind { PROXY_MEMORY, PROXY_COMMAND, PROXY_SEMAPHORE, PROXY_FENCE };
+struct proxy_instance { pthread_mutex_t lock; uint32_t wire_version; int fd, perf_enabled; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; } connection;
+enum proxy_resource_kind { PROXY_MEMORY, PROXY_COMMAND, PROXY_SEMAPHORE, PROXY_FENCE, PROXY_BUFFER };
 struct proxy_logical;
 struct proxy_resource {
     struct proxy_logical *owner; struct proxy_resource *next;
     uint32_t id, pool; enum proxy_resource_kind kind; int live;
     uint8_t *mirror; uint64_t allocation, map_offset, map_size;
-    uint32_t staging_managed, staging_command;
+    uint32_t staging_managed, staging_command, profile_usage, profile_upload;
 };
 struct proxy_logical { struct proxy_instance *owner; uint32_t id; struct proxy_resource *resources; uint8_t *write_request, *read_reply; uint32_t write_capacity, read_capacity; uint64_t map_alignment; atomic_int submit_failed; } device;
 struct proxy_queue { uint32_t id; struct proxy_logical *owner; } queue;
@@ -83,6 +85,10 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
         uint32_t bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
     /* The real upload helper holds this lock throughout the transfer. */
     assert(pthread_mutex_trylock(&s->lock) != 0);
+    if (op == MB_BUFFER_BIND) {
+        assert(bytes == 20 && mb_get_u32(request) == device.id);
+        memset(reply, 0, MB_PREFIX_BYTES); *reply_bytes = MB_PREFIX_BYTES; return VK_SUCCESS;
+    }
     if (op == MB_RENDERER_SUBMIT) {
         for (struct proxy_resource *m = device.resources; m; m = m->next) if ((m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && (!m->staging_managed || m->staging_command == command.id)) {
             struct native_memory *n = interop_find_memory(&native, m->id);
@@ -136,6 +142,7 @@ static VkResult renderer_rpc(struct proxy_logical *d, uint32_t op, const uint8_t
     pthread_mutex_unlock(&d->owner->lock); return r;
 }
 #include "map_rpc.inc"
+#include "profile_binding.inc"
 static void submit_void_error(struct proxy_logical *d, const char *name, VkResult result) {
     (void)name; if (result != VK_SUCCESS) atomic_store(&d->submit_failed, result);
 }
@@ -159,12 +166,13 @@ static struct proxy_resource *mapping(unsigned i, uint64_t size, uint64_t base) 
     memories[i] = (struct native_memory){.id = m->id, .size = m->allocation, .map_offset = base, .map_size = size, .map = calloc(1, (size_t)size)};
     assert(memories[i].map); return m;
 }
-static VkResult submit(void) {
+static VkResult submit_with_fence(VkFence fence) {
     uint64_t value = submits + 1; void *c = &command, *s = &semaphore;
     VkTimelineSemaphoreSubmitInfoKHR timeline = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &value};
     VkSubmitInfo info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &timeline, .commandBufferCount = 1, .pCommandBuffers = &c, .signalSemaphoreCount = 1, .pSignalSemaphores = &s};
-    return renderer_QueueSubmit(&queue, 1, &info, NULL);
+    return renderer_QueueSubmit(&queue, 1, &info, fence);
 }
+static VkResult submit(void) { return submit_with_fence(NULL); }
 static void finish(void) {
     proxy_free_resources(&device); assert(!device.resources && !device.write_request && !device.write_capacity);
     assert(!device.read_reply && !device.read_capacity);
@@ -311,6 +319,53 @@ static void staging_dispatch(void) {
     m->owner = NULL; assert(map(&device, m, &out) == VK_ERROR_INITIALIZATION_FAILED && !out); m->owner = &device;
     m->allocation = 0; assert(map(&device, m, &out) == VK_ERROR_INITIALIZATION_FAILED && !out);
     assert(!memory_maps && !reads && !writes);
+    finish();
+}
+static void write_profile(void) {
+    setup(7);
+    struct proxy_resource *uniform = mapping(0, 524288, 0), *stage = mapping(1, 230400, 0);
+    uniform->allocation = uniform->map_size; stage->allocation = stage->map_size;
+    struct proxy_resource buffer = {.id=20, .kind=PROXY_BUFFER, .owner=&device, .live=1, .profile_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+    assert(interop_bind(&device, (uintptr_t)&buffer, PROXY_BUFFER, MB_BUFFER_BIND, uniform, 0) == VK_SUCCESS);
+    assert(uniform->profile_usage == VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    struct proxy_resource fence = {.id=21, .kind=PROXY_FENCE, .owner=&device, .live=1};
+    assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_SUCCESS);
+    for (unsigned frame=0; frame<40; ++frame) {
+        memset(stage->mirror, (int)frame, (size_t)stage->map_size);
+        assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_SUCCESS);
+        assert(submit() == VK_SUCCESS);
+        pending_memory = stage->id;
+        assert(submit_with_fence(&fence) == VK_SUCCESS); pending_memory = 0;
+    }
+    struct dd_memory_profile *p = &connection.memory_perf;
+    struct dd_write_row *shm = &p->row[DD_WRITE_STAGING][DD_WRITE_U];
+    struct dd_write_row *u = &p->row[DD_WRITE_UNIFORM][DD_WRITE_U], *r = &p->row[DD_WRITE_UNIFORM][DD_WRITE_R];
+    assert(writes == 120 && submits == 80 && !reads && !memory_maps && !memory_unmaps);
+    assert(shm->calls == 40 && shm->length == 230400 && shm->full == 40);
+    assert(u->calls == 40 && r->calls == 40 && u->length == 524288 && r->length == 524288);
+    assert(u->first_id == r->first_id && !u->offset && !r->offset && !shm->offset);
+    assert(shm->bytes + u->bytes + r->bytes == 40u * 1278976u);
+    assert(connection.perf.upload_bytes == shm->bytes + u->bytes + r->bytes);
+    assert(shm->acknowledged_bytes + u->acknowledged_bytes + r->acknowledged_bytes == connection.perf.upload_bytes);
+    assert(connection.perf.op[MB_MEMORY_WRITE].count == shm->calls + u->calls + r->calls);
+    assert(shm->wire_bytes + u->wire_bytes + r->wire_bytes == connection.perf.upload_bytes + 120u * 36u);
+    assert(!p->row[DD_WRITE_STAGING][DD_WRITE_R].calls && !p->row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].calls);
+    FILE *log = tmpfile(); assert(log);
+    dd_memory_report(p, log, 1); dd_memory_report(p, log, 1000000000);
+    assert(ftell(log) == 0 && p->row[DD_WRITE_UNIFORM][DD_WRITE_R].calls == 40);
+    dd_memory_report(p, log, 2000000001); assert(ftell(log) > 0 && !p->row[DD_WRITE_UNIFORM][DD_WRITE_R].calls);
+    fclose(log); finish();
+    struct dd_memory_profile failure = {0};
+    dd_memory_write(&failure, DD_WRITE_OTHER, 1, 1024, 0, 1024, 0, 1024, 0);
+    assert(failure.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].bytes == 1024);
+    assert(!failure.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].ok && !failure.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].acknowledged_bytes);
+}
+static void profile_disabled(void) {
+    setup(7); struct proxy_resource *m = mapping(0, 524288, 0);
+    connection.perf_enabled = 0;
+    assert(submit() == VK_SUCCESS && writes == 1 && submits == 1);
+    assert(!memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
+    assert(!connection.perf.upload_bytes && !connection.memory_perf.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].calls);
     finish();
 }
 static void read_bulk(void) {
@@ -461,6 +516,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "persistent_map")) persistent_map_case(1);
     else if (!strcmp(argv[1], "ordinary_map")) persistent_map_case(0);
     else if (!strcmp(argv[1], "staging_dispatch")) staging_dispatch();
+    else if (!strcmp(argv[1], "write_profile")) write_profile();
+    else if (!strcmp(argv[1], "profile_disabled")) profile_disabled();
     else if (!strcmp(argv[1], "errors")) errors();
     else if (!strcmp(argv[1], "bounds")) bounds();
     else if (!strcmp(argv[1], "legacy")) legacy();

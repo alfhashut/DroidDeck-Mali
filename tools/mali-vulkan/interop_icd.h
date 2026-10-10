@@ -31,7 +31,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateBuffer(VkDevice device, const 
     if (!device || !ci || a || ci->sType != VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO || ci->pNext || ci->flags || ci->sharingMode != VK_SHARING_MODE_EXCLUSIVE || ci->queueFamilyIndexCount) return VK_ERROR_FEATURE_NOT_PRESENT;
     uint8_t args[12]; mb_put_u64(args, ci->size); mb_put_u32(args + 8, ci->usage); struct proxy_resource *o;
     VkResult r = interop_new((struct proxy_logical *)device, MB_BUFFER_CREATE, PROXY_BUFFER, args, sizeof(args), &o);
-    if (r == VK_SUCCESS) { *out = (VkBuffer)(uintptr_t)o; }
+    if (r == VK_SUCCESS) { *out = (VkBuffer)(uintptr_t)o; if (((struct proxy_logical *)device)->owner->perf_enabled) o->profile_usage = ci->usage; }
     return r;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateImage(VkDevice device, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
@@ -88,7 +88,9 @@ static VkResult interop_bind(VkDevice device, uintptr_t handle, enum proxy_resou
     struct proxy_logical *d = (struct proxy_logical *)device; struct proxy_resource *o = submit_find(d, handle, kind), *m = submit_find(d, (uintptr_t)memory, PROXY_MEMORY);
     if (!o || !m) return VK_ERROR_INITIALIZATION_FAILED;
     uint8_t args[16]; mb_put_u32(args, o->id); mb_put_u32(args + 4, m->id); mb_put_u64(args + 8, offset);
-    return interop_rpc(d, op, args, 16, NULL, 0);
+    VkResult result = interop_rpc(d, op, args, 16, NULL, 0);
+    if (result == VK_SUCCESS && d->owner->perf_enabled && kind == PROXY_BUFFER) m->profile_usage |= o->profile_usage;
+    return result;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_BindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize o) { return interop_bind(d, (uintptr_t)b, PROXY_BUFFER, MB_BUFFER_BIND, m, o); }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_BindImageMemory(VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize o) { return interop_bind(d, (uintptr_t)im, PROXY_IMAGE, MB_IMAGE_BIND, m, o); }
@@ -118,6 +120,12 @@ static VkResult interop_upload_mapping(struct proxy_resource *m, uint64_t offset
         if ((r == VK_SUCCESS && bytes != sizeof(reply)) ||
             (bytes && (bytes != sizeof(reply) || mb_get_u32(reply + 8) != 0))) {
             shutdown(s->fd, SHUT_RDWR); r = VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (s->perf_enabled) {
+            unsigned role = m->staging_managed ? DD_WRITE_STAGING :
+                (m->profile_usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ? DD_WRITE_UNIFORM : DD_WRITE_OTHER;
+            dd_memory_write(&s->memory_perf, role, m->id, m->allocation, m->map_offset, m->map_size,
+                offset + n, length, r == VK_SUCCESS);
         }
         if (r != VK_SUCCESS) break;
         n += length;
@@ -359,6 +367,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckPerformance2MALI(VkDevice d
     struct proxy_instance *s = ((struct proxy_logical *)device)->owner;
     if (!s->perf_enabled || s->wire_version != MB_RENDERER_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     pthread_mutex_lock(&s->lock);
+    dd_memory_report(&s->memory_perf, stderr, dd_perf_now());
     *out = s->perf;
     if (reset) memset(&s->perf, 0, sizeof(s->perf));
     pthread_mutex_unlock(&s->lock);

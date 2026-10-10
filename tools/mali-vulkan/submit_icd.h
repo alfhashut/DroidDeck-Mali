@@ -11,6 +11,8 @@ struct proxy_resource {
     uint64_t allocation, map_offset, map_size;
     /* Explicit normal staging opt-in; ordinary coherent mappings are unchanged. */
     uint32_t staging_managed, staging_command;
+    /* Profiling metadata only; never used for validation or memory transport. */
+    uint32_t profile_usage, profile_upload;
 };
 _Static_assert(offsetof(struct proxy_resource, loader) == 0, "command buffer dispatch word");
 static void proxy_free_resources(struct proxy_logical *d) {
@@ -21,8 +23,16 @@ static void proxy_free_resources(struct proxy_logical *d) {
 static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t handle, enum proxy_resource_kind kind) {
     struct proxy_resource *found = NULL;
     pthread_mutex_lock(&d->owner->lock);
-    for (struct proxy_resource *o = d->resources; o; o = o->next)
+    uint64_t visited = 0;
+    for (struct proxy_resource *o = d->resources; o; o = o->next) {
+        if (d->owner->perf_enabled) ++visited;
         if ((uintptr_t)o == handle && o->kind == kind && o->live) { found = o; break; }
+    }
+    if (d->owner->perf_enabled) {
+        struct dd_memory_profile *p = &d->owner->memory_perf;
+        ++p->lookups; p->visited += visited;
+        if (visited > p->max_visit) p->max_visit = visited;
+    }
     pthread_mutex_unlock(&d->owner->lock);
     return found;
 }

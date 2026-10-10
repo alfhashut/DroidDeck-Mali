@@ -251,17 +251,32 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
     if (!q->id || !c || !s || (fence && !f)) return VK_ERROR_INITIALIZATION_FAILED;
     if (d->submit_failed) return (VkResult)atomic_load(&d->submit_failed);
     /* Persistently mapped coherent upload data must reach the REAL mapped allocation. */
-    for (struct proxy_resource *m = d->resources; m; m = m->next) if (m->live && m->kind == PROXY_MEMORY && m->mirror && (m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-        /* A pool slot is written only for its explicitly armed upload command.
-         * Re-uploading it for R would race the still-pending upload U. */
-        if (m->staging_managed && m->staging_command != c->id) continue;
-        VkResult r = interop_copy_mapping(m, m->map_offset, m->map_size, 1);
-        if (r != VK_SUCCESS) return r;
+    uint64_t nodes = 0, live = 0, mapped = 0;
+    for (struct proxy_resource *m = d->resources; m; m = m->next) {
+        int is_live = m->live;
+        if (d->owner->perf_enabled) {
+            ++nodes; live += !!is_live; mapped += is_live && m->kind == PROXY_MEMORY && m->mirror;
+        }
+        if (is_live && m->kind == PROXY_MEMORY && m->mirror && (m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            /* A pool slot is written only for its explicitly armed upload command.
+             * Re-uploading it for R would race the still-pending upload U. */
+            if (m->staging_managed && m->staging_command != c->id) continue;
+            unsigned previous_phase = dd_memory_submit_phase;
+            dd_memory_submit_phase = c->profile_upload ? DD_WRITE_U : f ? DD_WRITE_R : DD_WRITE_OUTSIDE;
+            VkResult r = interop_copy_mapping(m, m->map_offset, m->map_size, 1);
+            dd_memory_submit_phase = previous_phase;
+            if (r != VK_SUCCESS) return r;
+        }
     }
     uint8_t args[24]; uint32_t fields[] = {q->id, c->id, f ? f->id : 0, s->id}; for (unsigned i = 0; i < 4; ++i) mb_put_u32(args + i * 4, fields[i]); mb_put_u64(args + 16, t->pSignalSemaphoreValues[0]);
     VkResult result = renderer_rpc(d, MB_RENDERER_SUBMIT, args, 24, NULL, 0);
     if (result == VK_SUCCESS) {
         pthread_mutex_lock(&d->owner->lock);
+        if (d->owner->perf_enabled) {
+            d->owner->memory_perf.submit_nodes = nodes; d->owner->memory_perf.submit_live = live;
+            d->owner->memory_perf.submit_mapped = mapped; ++d->owner->memory_perf.submits;
+        }
+        c->profile_upload = 0;
         for (struct proxy_resource *m = d->resources; m; m = m->next)
             if (m->staging_managed && m->staging_command == c->id) m->staging_command = 0;
         pthread_mutex_unlock(&d->owner->lock);
@@ -297,7 +312,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckStagingMALI(VkDevice device
     pthread_mutex_lock(&d->owner->lock);
     VkResult result = VK_ERROR_INITIALIZATION_FAILED;
     if (!command && !m->staging_managed && !m->staging_command) { m->staging_managed = 1; result = VK_SUCCESS; }
-    else if (command && m->staging_managed && !m->staging_command) { m->staging_command = c->id; result = VK_SUCCESS; }
+    else if (command && m->staging_managed && !m->staging_command) {
+        m->staging_command = c->id; result = VK_SUCCESS;
+        if (d->owner->perf_enabled) c->profile_upload = 1;
+    }
     pthread_mutex_unlock(&d->owner->lock);
     return result;
 }

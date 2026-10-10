@@ -21,6 +21,8 @@ class BulkMemoryTests(unittest.TestCase):
         (build / 'upload.inc').write_text('static VkResult interop_upload_mapping' + upload)
         map_rpc = proxy.split('static VkResult interop_rpc', 1)[1].split('static void interop_publish', 1)[0]
         (build / 'map_rpc.inc').write_text('static VkResult interop_rpc' + map_rpc)
+        binding = proxy.split('static VkResult interop_bind', 1)[1].split('static VKAPI_ATTR VkResult VKAPI_CALL proxy_BindBufferMemory', 1)[0]
+        (build / 'profile_binding.inc').write_text('static VkResult interop_bind' + binding)
         mappings = proxy.split('static VkResult interop_map_memory', 1)[1].split('static VkResult interop_mapped_range', 1)[0]
         (build / 'mapping.inc').write_text('static VkResult interop_map_memory' + mappings)
         native = (ROOT.parents[1] / 'app/src/main/cpp/malivulkan/interop_commands.h').read_text()
@@ -72,6 +74,12 @@ class BulkMemoryTests(unittest.TestCase):
 
     def test_ordinary_map_still_downloads_initial_coherent_bytes(self):
         self.run_case('ordinary_map')
+
+    def test_three_write_purposes_ranges_bytes_and_submission_attribution(self):
+        self.run_case('write_profile')
+
+    def test_disabled_write_profiling_keeps_transport_identical(self):
+        self.run_case('profile_disabled')
 
     def test_bulk_reads_exact_bytes_minimum_chunks_and_reply_reuse(self):
         self.run_case('read_bulk')

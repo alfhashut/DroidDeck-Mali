@@ -6,7 +6,7 @@
 #include <time.h>
 #include "normal_wait_perf.h"
 #define DD_PERF_OPS 92u
-#define DD_PERF_TARGET_NS UINT64_C(33333333)
+#define DD_PERF_TARGET_NS UINT64_C(16666666)
 #define DD_PERF_INTERVAL_NS UINT64_C(2000000000)
 #define DD_PERF_SAMPLES 256u
 struct dd_perf_op { uint64_t count, ns, worst; };
@@ -41,7 +41,7 @@ static inline void dd_perf_merge(struct dd_perf_rpc *p, const struct dd_perf_rpc
     for (unsigned i = 0; i < DD_PERF_DESTROY_KINDS; ++i) p->renderer_destroy_kind[i] += q->renderer_destroy_kind[i];
 }
 /* Nearest rank p95. Sort a bounded copy at report time, never in the frame path.
- * At the 30 Hz target a two-second window fits without dropping samples. */
+ * At 30 or 60 Hz a two-second window fits without dropping samples. */
 static inline uint64_t dd_perf_p95(const uint64_t *samples, unsigned count) {
     uint64_t sorted[DD_PERF_SAMPLES];
     if (count > DD_PERF_SAMPLES) count = DD_PERF_SAMPLES;

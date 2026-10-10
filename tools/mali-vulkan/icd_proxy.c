@@ -15,6 +15,7 @@
 #include "renderer_protocol.h"
 #include "interop_protocol.h"
 #include "normal_api.h"
+#include "normal_memory_perf.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
 #endif
@@ -43,6 +44,7 @@ struct proxy_instance {
     uint32_t wire_version;
     int perf_enabled;
     struct dd_perf_rpc perf;
+    struct dd_memory_profile memory_perf;
     VkResult device_destroy_result;
     struct proxy_logical *logical;
     struct proxy_device devices[MB_MAX_DEVICES];

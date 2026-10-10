@@ -514,11 +514,12 @@
 +}
 --- a/src/mali_normal.cpp
 +++ b/src/mali_normal.cpp
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,288 @@
 +/* Experimental normal single-client session. Output is the actual CWaylandBackend,
 + * input uses its existing seat listeners, SHM imports use Gamescope's renderer.
 + * The application is an argv child, with no diagnostic frame limit/injection. */
 +#include "mali_normal.hpp"
++#include "normal_detail_perf.hpp"
 +#include "backend.h"
 +#include "backends.h"
 +#include "rendervulkan.hpp"
@@ -713,7 +714,7 @@
 +    for (auto &b : host.buffers) { if (b.buffer) wl_buffer_destroy(b.buffer); b = {}; }
 +    if (host.display) wl_display_flush(host.display);
 +}
-+static unsigned normalPacingHz = 30;
++static unsigned normalPacingHz = 60;
 +unsigned mali_normal_pacing_hz() { return normalPacingHz; }
 +int mali_normal_main(int argc, char **argv) {
 +    std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -738,7 +739,7 @@
 +    if (!normalPacingHz) { std::fputs("invalid diagnostic Mali pacing: MALI_VULKAN_PERF_HZ must be 30 or 60\n", stderr); return 1; }
 +    const auto framePeriod = std::chrono::nanoseconds(1000000000ull / normalPacingHz);
 +    std::printf("MaliPerf pacing: target=%uHz period=%.3fms mode=%s event-loop-yield=2ms\n",
-+        normalPacingHz, framePeriod.count() / 1e6, normalPacingHz == 30 ? "normal/default" : "diagnostic");
++        normalPacingHz, framePeriod.count() / 1e6, normalPacingHz == 60 ? "normal/default" : "diagnostic override");
 +    g_maliNormalSessionActive = true; failed = false; stopped = 0;
 +    std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
 +    g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
@@ -751,7 +752,7 @@
 +    // with identical counters, without changing any ownership/sync checks.
 +    const char *baselineEnv = getenv("MALI_VULKAN_PERF_BASELINE");
 +    bool perfBaseline = baselineEnv && !strcmp(baselineEnv, "1");
-+    std::printf("MaliPerf mode: %s; aggregate interval=2s target=%uHz\n", perfBaseline ? "baseline (old pacing, upload before pool check)" : "paced from frame start, pre-upload pool check", normalPacingHz);
++    std::printf("MaliPerf mode: %s; aggregate interval=2s target=%uHz default=60Hz\n", perfBaseline ? "baseline (old pacing, upload before pool check)" : "paced from frame start, pre-upload pool check", normalPacingHz);
 +    auto next = std::chrono::steady_clock::now(); auto progress = next;
 +    int childStatus = 0;
 +    while (ok && !stopped && !failed) {
@@ -771,13 +772,15 @@
 +            auto source = wrapped && wrapped->buf ? vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr) : nullptr;
 +            vulkan_mali_normal_upload_done();
 +            if (!source) { vulkan_mali_normal_frame_end(false); ok = false; break; }
++            MaliCpuScope sceneScope(DD_CPU_SCENE, DD_CPU_FRAME);
 +            FrameInfo_t frame{}; auto &layer = *frame.layers.push();
 +            layer.tex = source.get(); layer.opacity = 1.0f; layer.filter = GamescopeUpscaleFilter::NEAREST;
 +            layer.scale = {source->width() / float(width), source->height() / float(height)};
 +            layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU; layer.blackBorder = true; layer.applyColorMgmt = false; frame.outputEncodingEOTF = EOTF_Gamma22;
++            sceneScope.finish();
 +            int result = connector->Present(&frame, false);
 +            // Include import texture cleanup in frame/RPC accounting.
-+            source = nullptr;
++            { MaliCpuScope retire(DD_CPU_RETIRE, DD_CPU_FRAME); source = nullptr; }
 +            vulkan_mali_normal_frame_end(result == 0);
 +            if (result == 0) {
 +                timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time); wlr_surface_send_frame_done(server.surface, &time);
@@ -816,8 +819,8 @@
 +inline bool mali_normal_verbose() { const char *v = getenv("MALI_VULKAN_VERBOSE"); return v && !strcmp(v, "1"); }
 +// Local diagnostic control only; no Vulkan/broker protocol changes.
 +inline unsigned mali_normal_parse_pacing(const char *value) {
-+    if (!value || !*value || !strcmp(value, "30")) return 30;
-+    if (!strcmp(value, "60")) return 60;
++    if (!value || !*value || !strcmp(value, "60")) return 60;
++    if (!strcmp(value, "30")) return 30;
 +    return 0;
 +}
 +unsigned mali_normal_pacing_hz();
@@ -843,7 +846,7 @@
 +int mali_interactive_main();
 --- a/src/mali_normal.inc
 +++ b/src/mali_normal.inc
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,165 @@
 +/* Normal nested Wayland AHB output. Compiled in the real Gamescope renderer TU. */
 +#include "mali_normal.hpp"
 +#include "mali_output_pool.hpp"
@@ -885,6 +888,7 @@
 +bool vulkan_mali_normal_init(unsigned width, unsigned height) {
 +    MaliRequire(maliStaging.live() == 0, "normal staging survived previous session");
 +    maliCompletedTimeline.reset(); maliLocalWaits = {}; maliStaging.stats = {}; maliStaging.backend.maps = {}; maliStaging.backend.staging = nullptr; maliStaging.backend.mapStaging = nullptr; maliStaging.cursor = 0; maliWaitProfilingActive = false;
++    maliCpuDetail = {};
 +    normalOutput = {}; normalPerf = {}; normalOutput.width = width; normalOutput.height = height;
 +    if (!MaliInitializeRenderer(true)) return false;
 +    if (maliStaging.backend.resolve() != VK_SUCCESS) { g_device.ShutdownMaliDiagnostic(); return false; }
@@ -928,6 +932,7 @@
 +    if (slot.committedNs) { normalPerf.ackNs += dd_perf_now() - slot.committedNs; ++normalPerf.ackCount; slot.committedNs = 0; }
 +}
 +int vulkan_mali_normal_present(const FrameInfo_t *frame) {
++    MaliCpuScope outputScope(DD_CPU_OTHER, DD_CPU_OUTPUT);
 +    auto &s = normalOutput;
 +    if (s.stopping) return -1;
 +    uint64_t acquireStart = dd_perf_now();
@@ -1088,7 +1093,7 @@
 +#include "mali_normal.inc"
 --- a/src/mali_normal_perf.inc
 +++ b/src/mali_normal_perf.inc
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,153 @@
 +/* Normal session only. Fixed-size counters; formatting/sorting once per 2 s. */
 +#include <algorithm>
 +#include "renderer_protocol.h"
@@ -1121,14 +1126,14 @@
 +    MaliRequire(MaliResult(normalOutput.performance(g_device.device(), &ignored, VK_TRUE), "normal local performance reset"), "normal local performance reset");
 +    auto &p = normalPerf;
 +    dd_perf_merge(&p.outside, &ignored); // Preserve RPCs between frame attempts.
-+    p.begin = dd_perf_now(); p.cpuBegin = dd_perf_cpu_now(); p.currentUpload = p.currentComposite = p.currentAcquire = p.currentCommit = 0;
++    p.begin = dd_perf_now(); p.cpuBegin = dd_perf_cpu_now(); maliCpuDetail.begin(); p.currentUpload = p.currentComposite = p.currentAcquire = p.currentCommit = 0;
 +}
 +void vulkan_mali_normal_upload_done() { normalPerf.currentUpload = dd_perf_now() - normalPerf.begin; }
 +void vulkan_mali_normal_frame_end(bool presented) {
 +    auto &p = normalPerf; dd_perf_rpc rpc{};
 +    MaliRequire(MaliResult(normalOutput.performance(g_device.device(), &rpc, VK_TRUE), "normal local performance snapshot"), "normal local performance snapshot");
 +    dd_perf_merge(&p.rpc, &rpc); ++p.attempts;
-+    uint64_t now = dd_perf_now(), work = now - p.begin;
++    uint64_t now = dd_perf_now(), work = now - p.begin; maliCpuDetail.end();
 +    p.cpuNs += dd_perf_cpu_now() - p.cpuBegin;
 +    if (p.attempts <= DD_PERF_SAMPLES) p.samples[p.attempts - 1] = work;
 +    p.frameNs += work; p.uploadNs += p.currentUpload; p.compositeNs += p.currentComposite;
@@ -1188,7 +1193,7 @@
 +    uint64_t syncWait = p.rpc.op[MB_RENDERER_WAIT].ns + p.rpc.op[MB_SYNC_WAIT].ns;
 +    uint64_t nonRpc = p.frameNs > rpcNs ? p.frameNs - rpcNs : 0;
 +    uint64_t outsideFrames = uint64_t(window) > p.frameNs ? uint64_t(window) - p.frameNs : 0;
-+    std::printf("MaliPerf frame: committed-FPS=%.2f Android-FPS=%.2f frames=%u attempts=%u work-avg/p95=%.3f/%.3fms cadence-avg/p95=%.3f/%.3fms missed=%u last-work=%.3fms last-RPCs=%llu last-RPC=%.3fms last-worst=%.3fms opcode=%u target=%uHz\n",
++    std::printf("MaliPerf frame: committed-FPS=%.2f Android-FPS=%.2f frames=%u attempts=%u work-avg/p95=%.3f/%.3fms cadence-avg/p95=%.3f/%.3fms missed=%u last-work=%.3fms last-RPCs=%llu last-RPC=%.3fms last-worst=%.3fms opcode=%u target=%uHz default=60Hz\n",
 +        p.frames * 1e9 / window, (stats.presented - p.previousPresented) * 1e9 / window, p.frames, p.attempts,
 +        p.frameNs / attempts / 1e6, dd_perf_p95(p.samples, p.attempts) / 1e6, p.cadenceNs / frames / 1e6,
 +        dd_perf_p95(p.cadence, p.frames) / 1e6, p.missed, p.lastFrameNs / 1e6,
@@ -1214,6 +1219,7 @@
 +        p.outputWaitNs / 1e6, p.occupiedNs / window, p.androidNs / window, p.maxAndroid, stats.owned,
 +        stats.counts[19], stats.counts[18], top[0], p.rpc.op[top[0]].ns / 1e6,
 +        top[1], p.rpc.op[top[1]].ns / 1e6, top[2], p.rpc.op[top[2]].ns / 1e6);
++    maliCpuDetail.report(p.attempts, p.compositeNs / attempts / 1e6);
 +    dd_perf_report_opcodes(stdout, &p.rpc, &p.outside, p.frames, p.attempts);
 +    uint64_t attributed = 0;
 +    for (unsigned i = 0; i < DD_WAIT_REASONS; ++i) {
@@ -1252,7 +1258,7 @@
 +#include <time.h>
 +#include "normal_wait_perf.h"
 +#define DD_PERF_OPS 92u
-+#define DD_PERF_TARGET_NS UINT64_C(33333333)
++#define DD_PERF_TARGET_NS UINT64_C(16666666)
 +#define DD_PERF_INTERVAL_NS UINT64_C(2000000000)
 +#define DD_PERF_SAMPLES 256u
 +struct dd_perf_op { uint64_t count, ns, worst; };
@@ -1287,7 +1293,7 @@
 +    for (unsigned i = 0; i < DD_PERF_DESTROY_KINDS; ++i) p->renderer_destroy_kind[i] += q->renderer_destroy_kind[i];
 +}
 +/* Nearest rank p95. Sort a bounded copy at report time, never in the frame path.
-+ * At the 30 Hz target a two-second window fits without dropping samples. */
++ * At 30 or 60 Hz a two-second window fits without dropping samples. */
 +static inline uint64_t dd_perf_p95(const uint64_t *samples, unsigned count) {
 +    uint64_t sorted[DD_PERF_SAMPLES];
 +    if (count > DD_PERF_SAMPLES) count = DD_PERF_SAMPLES;

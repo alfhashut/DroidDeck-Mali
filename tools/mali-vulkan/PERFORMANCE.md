@@ -1,5 +1,10 @@
 # Checkpoint 7P: normal Mali session measurements
 
+The current instrumentation-only pass is documented in
+[normal-frame cost attribution](FRAME_COST.md): exclusive compositor/SHM/output
+stages, all three mapped-write ranges, and context for the time-dependent
+slowdown. Its baseline is the phone-validated 60 Hz, 34-RPC/frame path.
+
 Phone profiling supplied for CP7P identifies mapped-memory RPC traffic as the
 first major bottleneck: **416 RPCs/frame**, two queue submissions/frame. The
 Android compositor reported 93 GPU/zero-copy frames in ten seconds (9.3 FPS),
@@ -186,7 +191,7 @@ actual counts, timings and FPS; no FPS result is promised by this change.
 
 Reports appear every two seconds while the normal loop runs, including idle or
 pool-blocked windows. Fixed-size counters collect every attempt, with bounded
-samples for p95 (256 samples; 60 normally fit at the 30 Hz target). No command
+samples for p95 (256 samples; 120 normally fit at the default 60 Hz target). No command
 trace, per-frame printing, allocations or extra per-command RPCs are added.
 The existing STATS request now occurs at the reporting interval. The proxy's
 private `vkDroidDeckPerformanceMALI` snapshot only copies/resets local counters
@@ -329,9 +334,9 @@ reuse and output retirement are already satisfied. The current
 [completed-value/staging reuse pass and async-fence audit](NORMAL_REUSE.md)
 are now phone-validated at exactly 38 in-frame RPCs/frame, one real output wait,
 two staging slots with no steady churn/reuse waits, and healthy 25–27 FPS windows
-(peak 27.4), zero-copy and no pool drops. Persistent staging maps are the next
-change: remove two reads, one map and one unmap per steady frame, targeting
-34 RPCs/frame. That prediction and any FPS effect require a new phone run.
+(peak 27.4), zero-copy and no pool drops. Persistent staging maps are also now
+phone-validated: 34 RPCs/frame, no steady reads/maps/unmaps, and no reuse waits
+or map failures.
 
 For an instrumented baseline using the original pacing/upload ordering, add
 this line to the existing `/sdcard/Download/droiddeck-env` settings file:
@@ -347,7 +352,7 @@ line confirms the mode. This flag does not change synchronization, ownership,
 capability reporting or diagnostics, and does not revert bulk mapped writes.
 No device file was modified by this work.
 
-### Diagnostic 60 Hz pacing comparison
+### Default 60 Hz pacing and the 30 Hz override
 
 Persistent staging mappings are now phone-validated: 34.00 frame RPCs/frame,
 zero steady-state read/map/unmap calls, three writes/frame, two mapped slots,
@@ -355,25 +360,28 @@ zero steady-state read/map/unmap calls, three writes/frame, two mapped slots,
 measured 28.5 FPS, 285 GPU/zero-copy frames, ~1.04 ms Android `render_scene`,
 and zero pool drops. Only output-producer-completion remains forwarded once/frame.
 
-To compare the same normal Launch workload at 60 Hz, add this line to
+Normal Launch now defaults to 60 Hz when `MALI_VULKAN_PERF_HZ` is unset (or
+empty). To force the same workload to 30 Hz for comparison, add this line to
 `/sdcard/Download/droiddeck-env`, then stop and restart through normal Launch:
 
 ```text
-MALI_VULKAN_PERF_HZ=60
+MALI_VULKAN_PERF_HZ=30
 ```
 
-Remove the line or set `MALI_VULKAN_PERF_HZ=30` for the baseline. Remove the old
+Remove the line or set `MALI_VULKAN_PERF_HZ=60` to restore 60 Hz. Remove the old
 `MALI_VULKAN_PERF_BASELINE=1` setting (or set it to 0) for both runs so only the
 pacing target differs. Only exact 30/60 values pass the Android service's Mali
 allowlist; other overrides remain excluded. A directly launched Gamescope rejects
 an invalid pacing value before renderer initialization. No UI preference changes.
 
-Startup confirms `MaliPerf pacing: target=60Hz period=16.667ms mode=diagnostic
-event-loop-yield=2ms`; periodic frame rows also identify `target=60Hz`.
-Default pacing remains 30 Hz / 33.333 ms. Both the software deadline and nominal
+Startup confirms `MaliPerf pacing: target=60Hz period=16.667ms mode=normal/default
+event-loop-yield=2ms`; periodic frame rows identify the active target and
+`default=60Hz`. The 30 Hz override reports `mode=diagnostic override`.
+Default pacing is 60 Hz / 16.667 ms; the 30 Hz override uses 33.333 ms.
+Both the software deadline and nominal
 nested/output refresh follow the selected target. The existing 2 ms event-loop
 yield, frame callbacks, pool availability gate, Vulkan work and synchronization
-remain unchanged. This is a 60 Hz diagnostic, not an uncapped mode. Missed-frame
+remain unchanged. Neither target is uncapped. Missed-frame
 accounting uses the selected budget with the same 1 ms cadence tolerance. The
 fixed 256-sample p95 buffer accommodates a two-second window at either target.
 
@@ -396,7 +404,9 @@ resource and ownership counters remain enabled. No extra per-frame RPCs or logs.
 FPS materially above 30 demonstrates headroom hidden by the former target.
 If it remains around 28–30, compare output completion, queue submit and total
 client RTT against the frame budget before choosing a synchronization change.
-The 60 Hz result is pending phone measurement; no FPS improvement is promised.
+The supplied 60 Hz run initially reached ~47 FPS and later settled near
+~25–30 FPS. The new [frame-cost attribution](FRAME_COST.md) instruments that
+slowdown; its cause remains unproven pending phone measurements.
 
 Cheap local checks, with no project compilation:
 

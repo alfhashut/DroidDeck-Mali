@@ -68,6 +68,7 @@ class PerformanceTests(unittest.TestCase):
 #include <string.h>
 #include <pthread.h>
 #include "normal_perf.h"
+#include "normal_memory_perf.h"
 #define VKAPI_ATTR
 #define VKAPI_CALL
 #define VK_SUCCESS 0
@@ -77,7 +78,7 @@ class PerformanceTests(unittest.TestCase):
 typedef int VkResult;
 typedef unsigned VkBool32;
 typedef void *VkDevice;
-struct proxy_instance { int perf_enabled, wire_version; pthread_mutex_t lock; struct dd_perf_rpc perf; };
+struct proxy_instance { int perf_enabled, wire_version; pthread_mutex_t lock; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; };
 struct proxy_logical { struct proxy_instance *owner; };
 #include "snapshot.inc"
 int main(void) {
@@ -139,8 +140,8 @@ int main(void) {
 #include <initializer_list>
 #include "mali_normal.hpp"
 int main() {
-    assert(mali_normal_parse_pacing(nullptr) == 30);
-    assert(mali_normal_parse_pacing("") == 30);
+    assert(mali_normal_parse_pacing(nullptr) == 60);
+    assert(mali_normal_parse_pacing("") == 60);
     assert(mali_normal_parse_pacing("30") == 30);
     assert(mali_normal_parse_pacing("60") == 60);
     for (const char *bad : {"0", "-1", "120", "uncapped", "60x", " 60", "60 "})
@@ -159,6 +160,8 @@ int main() {
         self.assertIn('next = (perfBaseline ? std::chrono::steady_clock::now() : now) + framePeriod', main)
         self.assertIn('std::this_thread::sleep_for(std::chrono::milliseconds(2))', main)
         self.assertIn('target=%uHz period=%.3fms mode=%s event-loop-yield=2ms', main)
+        self.assertIn('normalPacingHz == 60 ? "normal/default" : "diagnostic override"', main)
+        self.assertIn('target=%uHz default=60Hz', main)
         self.assertIn('now >= next && (perfBaseline || vulkan_mali_normal_available())', main)
 
     def test_real_aggregator_with_mock_clock_and_rpc_snapshots(self):
@@ -170,6 +173,7 @@ int main() {
                 (root / name).write_text(added_file(PATCH, name))
             wrapper = (ROOT / 'icd_proxy.c').read_text().split('static VkResult rpc(struct proxy_instance *s,', 1)[1].split('static void proxy_free_logical', 1)[0]
             (root / 'rpc_metric.inc').write_text('static VkResult rpc(struct proxy_instance *s,' + wrapper)
+            (root / 'normal_detail_perf.hpp').write_text((ROOT / 'normal_detail_perf.hpp').read_text())
             (root / 'mali_output_pool.hpp').write_text(added_file(PATCH.with_name('0120-mali-persistent-session.patch'), 'mali_output_pool.hpp'))
             (root / 'test.cpp').write_text(r'''
 #include <cassert>
@@ -186,6 +190,7 @@ static int fake_clock_gettime(clockid_t clock, timespec *t) {
 }
 #define clock_gettime fake_clock_gettime
 #include "normal_perf.h"
+#include "normal_detail_perf.hpp"
 #include "mali_output_pool.hpp"
 #include "interop_protocol.h"
 #include "renderer_protocol.h"
@@ -290,7 +295,7 @@ int main() {
     dd_perf_rpc empty{};
     dd_perf_report_opcodes(stdout, &empty, &empty, 0, 0);
     maliStaging.backend.maps.unmaps = 2; NormalStagingMapReport("teardown");
-    // Identical 20 ms work is within the default budget, over the 60 Hz budget.
+    // Identical 20 ms work fits the 30 Hz override, exceeds the 60 Hz default.
     // Pacing changes attribution only; snapshots introduce no broker wait/work.
     for (unsigned hz : {30u, 60u}) {
         testPacingHz = hz; normalPerf = {};
@@ -307,7 +312,7 @@ int main() {
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=2)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('committed-FPS=1.00 Android-FPS=0.50 frames=2', result.stdout)
-            self.assertIn('opcode=63 target=30Hz', result.stdout)
+            self.assertIn('opcode=63 target=30Hz default=60Hz', result.stdout)
             self.assertIn('work-avg/p95=35.000/50.000ms', result.stdout)
             self.assertIn('per-frame=5.00 total=10 total=16.000ms', result.stdout)
             self.assertIn('uploads/frame=8192bytes write-RPCs/frame=2.00', result.stdout)
