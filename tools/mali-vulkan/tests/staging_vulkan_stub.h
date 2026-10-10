@@ -3,6 +3,7 @@
 #include <cstdint>
 #define VKAPI_PTR
 #define VK_NULL_HANDLE 0
+#define VK_WHOLE_SIZE UINT64_MAX
 #define VK_SUCCESS 0
 #define VK_TIMEOUT 2
 #define VK_ERROR_INITIALIZATION_FAILED -3
@@ -21,6 +22,7 @@ using VkBool32 = uint32_t;
 using VkSemaphore = uint64_t;
 using VkBuffer = uint64_t;
 using VkDeviceMemory = uint64_t;
+using VkCommandBuffer = void *;
 struct VkSemaphoreWaitInfo {
     unsigned sType; const void *pNext; unsigned flags, semaphoreCount;
     const VkSemaphore *pSemaphores; const uint64_t *pValues;

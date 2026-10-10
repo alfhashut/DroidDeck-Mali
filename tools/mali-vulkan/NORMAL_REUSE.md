@@ -1,4 +1,4 @@
-# CP7P: completed timeline knowledge, retained staging, async-fence audit
+# CP7P: completed timeline knowledge and persistent mapped staging
 
 ## Phone-validated input
 
@@ -11,9 +11,14 @@ The attribution build measured 47 in-frame RPCs/frame and four renderer waits:
 | Output producer completion | 5.9–6.1 ms | Materially blocked |
 | Output command retirement | ~0.01 ms | Already satisfied; same render value |
 
-FPS remained about 23–26, zero-copy, ~1 ms Android scene work, no pool drops.
-These measurements validate the attribution baseline. The optimizations below
-still need matching CI assets and a new phone run; no new FPS is claimed.
+The subsequent A+B pass is now phone-validated: exactly 38 in-frame RPCs/frame,
+descriptor and retirement waits locally completed, one forwarded output wait,
+two staging slots with 100% warmed hits and no reuse waits, creation, resizing
+or failures. Healthy windows were 25–27 FPS (peak 27.4), zero-copy, no pool drops.
+The remaining output wait measured ~6.0–6.4 ms native. Mapped reads cost roughly
+4.98–5.51 ms/frame RTT and writes 3.77–4.23 ms/frame in the supplied samples.
+Persistent mappings are the current change and still need matching CI assets
+and phone validation. No further FPS improvement is claimed.
 
 ## A. Trusted completed value
 
@@ -56,14 +61,14 @@ reuse, destruction or successful release of that pending slot. A canceled
 unsubmitted lease becomes available without inventing a new producer sequence.
 Creation failures safely destroy only their unsubmitted partial resources.
 
-The SHM importer still maps coherent memory, copies exactly stride × height
-bytes, performs the same channel conversion and unmaps before submission.
-It retains the staging VkBuffer, VkDeviceMemory and binding instead of freeing
-them immediately after `U`. There is no persistent mapped mirror or dirty-range
-optimization: existing acknowledged bulk mapped transfers/order are unchanged.
-A retained larger-capacity slot can map/transfer more padding than a smaller
-new allocation; the logical pixel bytes and copy extent remain identical.
-Stride × height is checked for overflow before pool acquisition.
+The initial A+B importer retained the staging VkBuffer, VkDeviceMemory and
+binding, but still mapped/unmapped every import. The current persistent-mapping
+change below extends that lifetime to the mapping itself. Each import still
+copies exactly stride × height bytes and performs the same channel conversion.
+A retained larger-capacity slot can transfer more padding than a smaller new
+allocation; logical pixel bytes and copy extent remain identical. Stride × height
+is checked for overflow before acquisition and against the mapped allocation
+before copying. There is no dirty-range or partial-image optimization.
 
 Removing the host wait also requires preserving GPU visibility. The upload
 command's **existing** final image barrier now includes shader-read destination
@@ -100,6 +105,49 @@ Shutdown cleans every safe slot; a failed wait retains the pending slot and
 reports failure. Existing device failure cleanup handles remaining resources
 after its safe drain. AHB release acknowledgment is independent and unchanged.
 
+## Persistent coherent staging mappings (current change)
+
+The confirmed old flow was `vulkan_create_texture_from_wlr_buffer()` →
+`vkMapMemory(..., VK_WHOLE_SIZE)` → `proxy_MapMemory()` → acknowledged native
+map and full coherent mirror download (`MB_MEMORY_READ`, two messages for the
+230400-byte SHM image) → full CPU copy/channel conversion → `proxy_UnmapMemory()`
+→ coherent bulk upload → real native unmap. This happened once per import,
+despite reuse of the buffer/allocation pair.
+
+The backend now maps offset zero and the whole allocation once after binding.
+The slot resource stores `mapped` and `mappedBytes` (the memory requirements
+size). After the existing completion/reservation checks, the importer copies
+the full SHM image through that pointer; there is no per-frame map or unmap.
+Normal-only bounds checks retain both the logical capacity and allocation range.
+Initial coherent map/download semantics are unchanged and still run at creation.
+Diagnostics and non-pooled SHM imports retain their original map/unmap path.
+
+**Submit scoping is necessary:** the old proxy queue path uploaded every live
+coherent mirror before every submission. Simply retaining mappings would make
+render `R` re-upload staging still read by upload `U`; the unchanged broker
+pending-memory guard correctly rejects this. It would also upload idle slots.
+
+The private, local `vkDroidDeckStagingMALI` contract explicitly opts only these
+whole-allocation coherent mappings into pool-managed upload scoping. Registration
+requires normal mode, wire v7, a live owned mapping and the complete valid range.
+After copying, the importer arms the real upload command. Its QueueSubmit uses
+the existing bounded `interop_copy_mapping()` bulk uploads and must receive all
+ACKs before sending `MB_RENDERER_SUBMIT`. Success consumes the arm; failure
+retains it and propagates failure without pretending submission succeeded.
+Unrelated submits skip those managed slots. Ordinary coherent mappings retain
+the existing upload-before-every-submit behavior. This is neither a global
+`vkMapMemory` change nor automatic dirty tracking, and introduces no wire opcode,
+version bump, advertised Vulkan extension or extra RPC.
+
+CPU writes still require the slot's real last upload completion. Resizing and
+shutdown prove completion, retire recorded references, unmap exactly once,
+destroy/free and clear the pointer/range. Replacements receive a fresh mapping.
+Failed drains retain their in-flight mappings/resources; safe slots can still
+be cleaned. Map/registration failures clean only unsubmitted partial resources.
+Successful unmap clears the proxy's opt-in and armed-command metadata. Missing
+matching staging API fails before creating a slot; it does not fall back to
+unsafe all-mapping uploads. Session initialization resolves the API anew.
+
 ## Counters and expected steady RPCs
 
 The existing two-second opcode/category/RTT/FPS reports remain. New local rows:
@@ -108,7 +156,14 @@ The existing two-second opcode/category/RTT/FPS reports remain. New local rows:
 MaliPerf local-wait: wait-reason=descriptor-set-reuse requests=... locally-completed=... forwarded=... requests/frame=1.00 forwarded/frame=0.00
 MaliPerf local-wait: wait-reason=output-command-retirement requests=... locally-completed=... forwarded=... requests/frame=1.00 forwarded/frame=0.00
 MaliPerf staging: hits=... misses=... reuse-waits=... resources-created=... resized=... failures=... live=2 limit=3
+MaliPerf staging-map: phase=window persistent-maps-created=0 persistent-map-reuse-hits=53 unmaps=0 map-failures=0 mapped-slots-live=2 (window totals)
 ```
+
+Map counters reset with the two-second window; live mapped slots are a gauge.
+Creation/resize windows can contain maps and initial reads. A final `phase=teardown`
+row reports unmaps and remaining mapped slots, including a failed drain's retained
+slots. A clean shutdown has zero mapped slots. Existing opcode, RTT, ownership,
+wait-reason and pool reports remain intact.
 
 Reason ID 1 keeps its wire value and snapshot size but is now named
 `shm-staging-slot-reuse`. It measures fallback waits, rather than immediate
@@ -116,20 +171,23 @@ destruction. A warmed compatible pool should have hits, no new resources and
 no reuse waits. RPC wait rows count only real calls; local rows expose skipped
 waits separately. Native wait timing retains its prior measurement definitions.
 
-| Category | Phone baseline | Expected after A+B |
-| --- | ---: | ---: |
-| Mapped transfer | 7 | 7 |
-| Recording | 14 | 14 |
-| Resource management | 12 | 7 |
-| Timeline/synchronization | 8 | 5 |
-| Descriptor/resource updates | 3 | 2 |
-| Queue submit | 2 | 2 |
-| AHB presentation | 1 | 1 |
-| Total in-frame RPCs | **47** | **38** |
+| Category | Attribution baseline | Phone A+B | Persistent mapping expected |
+| --- | ---: | ---: | ---: |
+| Mapped transfer | 7 | 7 | 3 |
+| Recording | 14 | 14 | 14 |
+| Resource management | 12 | 7 | 7 |
+| Timeline/synchronization | 8 | 5 | 5 |
+| Descriptor/resource updates | 3 | 2 | 2 |
+| Queue submit | 2 | 2 | 2 |
+| AHB presentation | 1 | 1 | 1 |
+| Total in-frame RPCs | **47** | **38** | **34** |
 
-A alone predicts 45/frame. B additionally removes the upload wait, five staging
-management calls and one buffer bind, predicting 38/frame after warm-up. Four
-source-image destruction calls outside the frame snapshot still exist, plus
+A alone predicted 45/frame. B additionally removed the upload wait, five staging
+management calls and one buffer bind; the phone confirmed 38/frame. Persistent
+mapping targets two reads, one map and one unmap removed per steady frame:
+**38 → 34/frame**, with the existing three bulk write messages/frame retained
+for the measured sizes. Four source-image destruction calls outside the frame
+snapshot still exist, plus
 periodic STATS. Variable sizes, cold command allocation or slot pressure add work.
 Expected renderer wait RPCs are one/frame (output producer completion), with
 staging fallback waits only under pressure. The real producer SYNC_FD wait and
@@ -204,5 +262,11 @@ failures, lease cancellation, no unsafe reuse/destruction after failed waits,
 partial safe shutdown, real backend cleanup, queued layout vs completion,
 required barrier scopes, same-queue/semaphore/read-only guards, retained host
 memory/AHB guards, profiler/header parity and existing bulk/ownership behavior.
+Persistent cases also run the actual proxy map/unmap, upload and submit helpers:
+40 U/R frames retain one mapping and its initial two reads, with no steady map,
+unmap or read calls, exact full-frame bytes and no pending staging re-upload.
+Other cases cover map/registration failure, pointer/range cleanup on resize,
+partial failed drains retaining live mappings, missing private API, failed ACKs
+preventing submit and unchanged automatic uploads for ordinary coherent memory.
 CI must still compile actual Gamescope/proxy/broker, followed by normal Launch,
 variable-size, stop/restart and zero-copy/release checks on the phone.

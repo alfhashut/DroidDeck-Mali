@@ -379,6 +379,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
         if (!strcmp(name, "vkDroidDeckPerformanceMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformanceMALI;
         if (!strcmp(name, "vkDroidDeckPerformance2MALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformance2MALI;
         if (!strcmp(name, "vkDroidDeckProfiledWaitMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckProfiledWaitMALI;
+        if (!strcmp(name, "vkDroidDeckStagingMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckStagingMALI;
         if (!strcmp(name, "vkDroidDeckSessionTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckSessionTEST;
     }
     if (((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {

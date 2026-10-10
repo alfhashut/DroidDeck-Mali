@@ -327,8 +327,11 @@ durations. [Wait attribution](WAIT_ATTRIBUTION.md) is now phone-validated:
 SHM cleanup costs ~1.4–1.9 ms native, output completion ~5.9–6.1 ms; descriptor
 reuse and output retirement are already satisfied. The current
 [completed-value/staging reuse pass and async-fence audit](NORMAL_REUSE.md)
-predict 38 in-frame RPCs/frame and one real renderer wait/frame after warm-up.
-Those new optimization results still require phone validation.
+are now phone-validated at exactly 38 in-frame RPCs/frame, one real output wait,
+two staging slots with no steady churn/reuse waits, and healthy 25–27 FPS windows
+(peak 27.4), zero-copy and no pool drops. Persistent staging maps are the next
+change: remove two reads, one map and one unmap per steady frame, targeting
+34 RPCs/frame. That prediction and any FPS effect require a new phone run.
 
 For an instrumented baseline using the original pacing/upload ordering, add
 this line to the existing `/sdcard/Download/droiddeck-env` settings file:
@@ -373,3 +376,8 @@ are compiled, with in-memory native/transport stubs.
 broker dependency guards with small Vulkan stubs. It covers bounded reuse,
 failed waits retaining resources, safe partial cleanup, strict producer proof,
 queued image visibility, descriptor-update protection and unchanged AHB guards.
+Persistent mapping cases exercise full-allocation map creation, pointer reuse,
+safe unmapping/resize, map errors, the private staging contract and map counters.
+`test_bulk` additionally checks actual proxy map/unmap helpers over 40 U/R pairs:
+only initial reads, exact coherent uploads before U, no staging re-upload during
+pending U, ordinary coherent upload semantics, and error/ACK propagation.

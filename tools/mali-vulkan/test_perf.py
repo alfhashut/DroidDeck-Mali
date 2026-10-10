@@ -21,7 +21,7 @@ def added_file(patch, name):
 
 class PerformanceTests(unittest.TestCase):
     def test_header_copies_and_wire_unchanged(self):
-        for name in ('normal_api.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'mali_wait_profile.hpp', 'mali_staging_pool.hpp', 'mali_staging.inc', 'normal_protocol.h', 'renderer_protocol.h', 'interop_protocol.h'):
+        for name in ('normal_api.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'mali_wait_profile.hpp', 'mali_staging_pool.hpp', 'mali_staging.inc', 'staging_api.h', 'normal_protocol.h', 'renderer_protocol.h', 'interop_protocol.h'):
             self.assertEqual(added_file(PATCH, name), (ROOT / name).read_text(), name)
         self.assertNotIn('Performance', (ROOT / 'normal_protocol.h').read_text())
         local = (ROOT / 'interop_icd.h').read_text().split('proxy_DroidDeckPerformanceMALI', 1)[1].split('proxy_DroidDeckWaylandMALI', 1)[0]
@@ -171,8 +171,10 @@ static dd_perf_rpc pending;
 static bool maliWaitProfilingActive;
 static struct { uint64_t requests[DD_WAIT_REASONS]{}, skipped[DD_WAIT_REASONS]{}, forwarded[DD_WAIT_REASONS]{}; } maliLocalWaits;
 static struct {
-    struct { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0; } stats;
+    struct { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0, mapReuses = 0; } stats;
+    struct { struct { uint64_t created = 0, unmaps = 0, failures = 0; } maps; } backend;
     unsigned live() const { return 2; }
+    unsigned mappedLive() const { return 2; }
 } maliStaging;
 static int snapshot(int, dd_perf_rpc *out, int reset) { *out = pending; if (reset) pending = {}; return 0; }
 static struct { int device() { return 1; } } g_device;
@@ -235,7 +237,10 @@ int main() {
     assert(normalPerf.lastWorst == 3000000 && normalPerf.lastWorstOp == 63);
     assert(normalPerf.outside.op[62].count == 1 && normalPerf.rpc.op[62].count == 0);
     dd_perf_add(&pending, 0, 1000000); // Unknown opcode remains accounted as other.
+    maliStaging.backend.maps.created = 2; maliStaging.backend.maps.failures = 1;
+    maliStaging.stats.mapReuses = 38;
     fakeNow = 3000000000; vulkan_mali_normal_tick();
+    assert(!maliStaging.backend.maps.created && !maliStaging.backend.maps.failures && !maliStaging.stats.mapReuses);
     assert(normalPerf.frames == 0 && normalPerf.rpc.op[41].count == 0 && normalPerf.outside.op[62].count == 0);
     assert(pending.op[91].count == 0); // STATS must not leak into next frame.
     assert(normalPerf.lastEnd && normalPerf.previousPresented == 1);
@@ -250,6 +255,7 @@ int main() {
     // Truly empty window is finite, emits no opcode rows, and has no leaders.
     dd_perf_rpc empty{};
     dd_perf_report_opcodes(stdout, &empty, &empty, 0, 0);
+    maliStaging.backend.maps.unmaps = 2; NormalStagingMapReport("teardown");
 }
 ''')
             binary = root / 'test'
@@ -262,6 +268,8 @@ int main() {
             self.assertIn('uploads/frame=8192bytes write-RPCs/frame=2.00', result.stdout)
             self.assertIn('main-thread-CPU=17.500ms off-CPU=52.500ms', result.stdout)
             self.assertEqual(result.stdout.count('MaliPerf frame:'), 3)
+            self.assertIn('MaliPerf staging-map: phase=window persistent-maps-created=2 persistent-map-reuse-hits=38 unmaps=0 map-failures=1 mapped-slots-live=2', result.stdout)
+            self.assertIn('MaliPerf staging-map: phase=teardown persistent-maps-created=0 persistent-map-reuse-hits=0 unmaps=2 map-failures=0 mapped-slots-live=2', result.stdout)
             self.assertIn('frames=0 attempts=1 work-avg/p95=10.000/10.000ms', result.stdout)
             self.assertIn('frames=0 attempts=0', result.stdout)
             windows = result.stdout.split('MaliPerf opcode-window: ')[1:]

@@ -12,11 +12,12 @@ template<class Backend> struct MaliStagingPool {
     static constexpr unsigned limit = 3, preferred = 2;
     using Resource = typename Backend::Resource;
     struct Slot { Resource resource{}; uint64_t capacity = 0, sequence = 0; bool live = false, reserved = false; };
-    struct Counters { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0; } stats;
+    struct Counters { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0, mapReuses = 0; } stats;
     Backend backend;
     Slot slots[limit]{};
     unsigned cursor = 0;
     unsigned live() const { unsigned n = 0; for (const auto &s : slots) n += s.live; return n; }
+    unsigned mappedLive() const { unsigned n = 0; for (const auto &s : slots) n += s.live && s.resource.mapped; return n; }
     bool safe(const Slot &s) { return !s.sequence || backend.completed(s.sequence); }
     int make(Slot &s, uint64_t bytes, Slot *&out) {
         int result = backend.create(bytes, s.resource);
@@ -34,7 +35,7 @@ template<class Backend> struct MaliStagingPool {
         for (unsigned i = 0; i < limit; ++i) {
             unsigned index = (cursor + i) % limit; auto &s = slots[index];
             if (!s.live || s.reserved || s.capacity < bytes || !safe(s)) continue;
-            ++stats.hits; s.reserved = true; cursor = (index + 1) % limit; out = &s; return 0;
+            ++stats.hits; ++stats.mapReuses; s.reserved = true; cursor = (index + 1) % limit; out = &s; return 0;
         }
         ++stats.misses;
         // Resize only a proven completed slot. Never destroy pending storage.
@@ -51,7 +52,7 @@ template<class Backend> struct MaliStagingPool {
         if (oldest->capacity < bytes) {
             backend.destroy(oldest->resource, oldest->sequence); *oldest = {}; ++stats.resized; return make(*oldest, bytes, out);
         }
-        oldest->reserved = true; out = oldest; return 0;
+        ++stats.mapReuses; oldest->reserved = true; out = oldest; return 0;
     }
     struct Lease {
         Slot *slot = nullptr;

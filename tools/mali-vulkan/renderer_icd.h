@@ -251,9 +251,39 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
     if (!q->id || !c || !s || (fence && !f)) return VK_ERROR_INITIALIZATION_FAILED;
     if (d->submit_failed) return (VkResult)atomic_load(&d->submit_failed);
     /* Persistently mapped coherent upload data must reach the REAL mapped allocation. */
-    for (struct proxy_resource *m = d->resources; m; m = m->next) if (m->live && m->kind == PROXY_MEMORY && m->mirror && (m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { VkResult r = interop_copy_mapping(m, m->map_offset, m->map_size, 1); if (r != VK_SUCCESS) return r; }
+    for (struct proxy_resource *m = d->resources; m; m = m->next) if (m->live && m->kind == PROXY_MEMORY && m->mirror && (m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        /* A pool slot is written only for its explicitly armed upload command.
+         * Re-uploading it for R would race the still-pending upload U. */
+        if (m->staging_managed && m->staging_command != c->id) continue;
+        VkResult r = interop_copy_mapping(m, m->map_offset, m->map_size, 1);
+        if (r != VK_SUCCESS) return r;
+    }
     uint8_t args[24]; uint32_t fields[] = {q->id, c->id, f ? f->id : 0, s->id}; for (unsigned i = 0; i < 4; ++i) mb_put_u32(args + i * 4, fields[i]); mb_put_u64(args + 16, t->pSignalSemaphoreValues[0]);
-    return renderer_rpc(d, MB_RENDERER_SUBMIT, args, 24, NULL, 0);
+    VkResult result = renderer_rpc(d, MB_RENDERER_SUBMIT, args, 24, NULL, 0);
+    if (result == VK_SUCCESS) {
+        pthread_mutex_lock(&d->owner->lock);
+        for (struct proxy_resource *m = d->resources; m; m = m->next)
+            if (m->staging_managed && m->staging_command == c->id) m->staging_command = 0;
+        pthread_mutex_unlock(&d->owner->lock);
+    }
+    return result;
+}
+/* Local staging contract only. No RPC, global dirty tracking or fake completion. */
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckStagingMALI(VkDevice device, VkDeviceMemory memory, VkCommandBuffer command) {
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    struct proxy_logical *d = (struct proxy_logical *)device;
+    if (d->owner->wire_version != MB_RENDERER_VERSION || !d->owner->perf_enabled) return VK_ERROR_FEATURE_NOT_PRESENT;
+    struct proxy_resource *m = submit_find(d, (uintptr_t)memory, PROXY_MEMORY);
+    struct proxy_resource *c = command ? submit_find(d, (uintptr_t)command, PROXY_COMMAND) : NULL;
+    if (!m || m->owner != d || !m->mirror || !(m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+        !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, 0, m->allocation) ||
+        (command && (!c || c->owner != d || !c->id))) return VK_ERROR_INITIALIZATION_FAILED;
+    pthread_mutex_lock(&d->owner->lock);
+    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+    if (!command && !m->staging_managed && !m->staging_command) { m->staging_managed = 1; result = VK_SUCCESS; }
+    else if (command && m->staging_managed && !m->staging_command) { m->staging_command = c->id; result = VK_SUCCESS; }
+    pthread_mutex_unlock(&d->owner->lock);
+    return result;
 }
 static void renderer_Barrier(VkCommandBuffer command, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags flags, uint32_t memory_count, const VkMemoryBarrier *memory, uint32_t buffer_count, const VkBufferMemoryBarrier *buffers, uint32_t n, const VkImageMemoryBarrier *images) {
     (void)memory; (void)buffers; struct proxy_resource *c = interop_command(command); if (!c) return; VkResult r = VK_ERROR_FEATURE_NOT_PRESENT; uint8_t args[464];

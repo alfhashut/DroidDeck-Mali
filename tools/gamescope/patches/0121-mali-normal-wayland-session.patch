@@ -829,7 +829,7 @@
 +int mali_interactive_main();
 --- a/src/mali_normal.inc
 +++ b/src/mali_normal.inc
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,162 @@
 +/* Normal nested Wayland AHB output. Compiled in the real Gamescope renderer TU. */
 +#include "mali_normal.hpp"
 +#include "mali_output_pool.hpp"
@@ -870,7 +870,7 @@
 +#include "mali_normal_perf.inc"
 +bool vulkan_mali_normal_init(unsigned width, unsigned height) {
 +    MaliRequire(maliStaging.live() == 0, "normal staging survived previous session");
-+    maliCompletedTimeline.reset(); maliLocalWaits = {}; maliStaging.stats = {}; maliStaging.cursor = 0; maliWaitProfilingActive = false;
++    maliCompletedTimeline.reset(); maliLocalWaits = {}; maliStaging.stats = {}; maliStaging.backend.maps = {}; maliStaging.backend.staging = nullptr; maliStaging.cursor = 0; maliWaitProfilingActive = false;
 +    normalOutput = {}; normalPerf = {}; normalOutput.width = width; normalOutput.height = height;
 +    if (!MaliInitializeRenderer(true)) return false;
 +    normalOutput.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
@@ -953,6 +953,7 @@
 +int vulkan_mali_normal_stop() {
 +    auto &s = normalOutput; s.stopping = true;
 +    VkResult stagingDrain = (VkResult)maliStaging.shutdown();
++    NormalStagingMapReport("teardown");
 +    if (stagingDrain != VK_SUCCESS) {
 +        std::fprintf(stderr, "normal staging drain FAILED: retained slots=%u VkResult=%d; no PASS\n", maliStaging.live(), int(stagingDrain));
 +        g_device.FailMaliDiagnostic("normal staging drain", stagingDrain);
@@ -1072,7 +1073,7 @@
 +#include "mali_normal.inc"
 --- a/src/mali_normal_perf.inc
 +++ b/src/mali_normal_perf.inc
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,151 @@
 +/* Normal session only. Fixed-size counters; formatting/sorting once per 2 s. */
 +#include <algorithm>
 +#include "renderer_protocol.h"
@@ -1090,6 +1091,13 @@
 +    unsigned lastWorstOp = 0, frames = 0, attempts = 0, missed = 0, maxAndroid = 0, previousPresented = 0;
 +    bool waitingOutput = false;
 +} normalPerf;
++}
++
++static void NormalStagingMapReport(const char *phase) {
++    const auto &maps = maliStaging.backend.maps;
++    std::printf("MaliPerf staging-map: phase=%s persistent-maps-created=%llu persistent-map-reuse-hits=%llu unmaps=%llu map-failures=%llu mapped-slots-live=%u (window totals)\n",
++        phase, (unsigned long long)maps.created, (unsigned long long)maliStaging.stats.mapReuses,
++        (unsigned long long)maps.unmaps, (unsigned long long)maps.failures, maliStaging.mappedLive());
 +}
 +
 +void vulkan_mali_normal_frame_begin() {
@@ -1209,7 +1217,8 @@
 +    std::printf("MaliPerf staging: hits=%llu misses=%llu reuse-waits=%llu resources-created=%llu resized=%llu failures=%llu live=%u limit=3 (buffer+memory pairs; window totals)\n",
 +        (unsigned long long)staging.hits, (unsigned long long)staging.misses, (unsigned long long)staging.waits,
 +        (unsigned long long)staging.created, (unsigned long long)staging.resized, (unsigned long long)staging.failures, maliStaging.live());
-+    maliLocalWaits = {}; staging = {};
++    NormalStagingMapReport("window");
++    maliLocalWaits = {}; staging = {}; maliStaging.backend.maps = {};
 +    std::fflush(stdout); // Pipe-backed session logs must not hold a report until exit.
 +    unsigned previous = stats.presented; uint64_t lastEnd = p.lastEnd;
 +    bool waiting = p.waitingOutput;
@@ -1939,7 +1948,7 @@
 +	}
 --- a/src/mali_staging_pool.hpp
 +++ b/src/mali_staging_pool.hpp
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
 +/* Fixed slot count; completion knowledge is supplied by the real backend.
 + * No slot destructor frees Vulkan resources: shutdown must prove safety. */
 +#pragma once
@@ -1954,11 +1963,12 @@
 +    static constexpr unsigned limit = 3, preferred = 2;
 +    using Resource = typename Backend::Resource;
 +    struct Slot { Resource resource{}; uint64_t capacity = 0, sequence = 0; bool live = false, reserved = false; };
-+    struct Counters { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0; } stats;
++    struct Counters { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0, mapReuses = 0; } stats;
 +    Backend backend;
 +    Slot slots[limit]{};
 +    unsigned cursor = 0;
 +    unsigned live() const { unsigned n = 0; for (const auto &s : slots) n += s.live; return n; }
++    unsigned mappedLive() const { unsigned n = 0; for (const auto &s : slots) n += s.live && s.resource.mapped; return n; }
 +    bool safe(const Slot &s) { return !s.sequence || backend.completed(s.sequence); }
 +    int make(Slot &s, uint64_t bytes, Slot *&out) {
 +        int result = backend.create(bytes, s.resource);
@@ -1976,7 +1986,7 @@
 +        for (unsigned i = 0; i < limit; ++i) {
 +            unsigned index = (cursor + i) % limit; auto &s = slots[index];
 +            if (!s.live || s.reserved || s.capacity < bytes || !safe(s)) continue;
-+            ++stats.hits; s.reserved = true; cursor = (index + 1) % limit; out = &s; return 0;
++            ++stats.hits; ++stats.mapReuses; s.reserved = true; cursor = (index + 1) % limit; out = &s; return 0;
 +        }
 +        ++stats.misses;
 +        // Resize only a proven completed slot. Never destroy pending storage.
@@ -1993,7 +2003,7 @@
 +        if (oldest->capacity < bytes) {
 +            backend.destroy(oldest->resource, oldest->sequence); *oldest = {}; ++stats.resized; return make(*oldest, bytes, out);
 +        }
-+        oldest->reserved = true; out = oldest; return 0;
++        ++stats.mapReuses; oldest->reserved = true; out = oldest; return 0;
 +    }
 +    struct Lease {
 +        Slot *slot = nullptr;
@@ -2016,11 +2026,17 @@
 +};
 --- a/src/mali_staging.inc
 +++ b/src/mali_staging.inc
-@@ -0,0 +1,43 @@
-+/* Normal renderer staging backend. Per-use Map/Unmap stays identical to SHM
-+ * import; only buffer/allocation/binding lifetimes change. */
+@@ -0,0 +1,65 @@
++/* Normal staging slots own their whole-allocation coherent mapping. The pool
++ * proves completion before CPU reuse, resizing, unmapping or destruction. */
++#include "staging_api.h"
 +struct MaliStagingBackend {
-+    struct Resource { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; };
++    struct Resource {
++        VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
++        void *mapped = nullptr; uint64_t mappedBytes = 0;
++    };
++    struct MapCounters { uint64_t created = 0, unmaps = 0, failures = 0; } maps;
++    PFN_vkDroidDeckStagingMALI staging = nullptr;
 +    static constexpr int invalid = VK_ERROR_INITIALIZATION_FAILED;
 +    bool completed(uint64_t value) {
 +        return maliCompletedTimeline.covers(g_device.device(), g_device.maliScratchTimeline(), value);
@@ -2038,11 +2054,17 @@
 +        // Buffer destruction also requires recorded references to be retired.
 +        // The pool only supplies a nonzero sequence after proving completion.
 +        if (completedSequence) g_device.resetCmdBuffers(completedSequence);
++        if (r.mapped) {
++            g_device.vk.UnmapMemory(g_device.device(), r.memory); ++maps.unmaps;
++            r.mapped = nullptr; r.mappedBytes = 0;
++        }
 +        if (r.buffer) g_device.vk.DestroyBuffer(g_device.device(), r.buffer, nullptr);
 +        if (r.memory) g_device.vk.FreeMemory(g_device.device(), r.memory, nullptr);
 +        r = {};
 +    }
 +    int create(uint64_t bytes, Resource &r) {
++        if (!staging) staging = reinterpret_cast<PFN_vkDroidDeckStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckStagingMALI"));
++        if (!staging) return VK_ERROR_FEATURE_NOT_PRESENT;
 +        VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 +        bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 +        VkResult result = g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &r.buffer);
@@ -2055,8 +2077,18 @@
 +        allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
 +        result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
 +        if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
++        if (result == VK_SUCCESS) {
++            result = g_device.vk.MapMemory(g_device.device(), r.memory, 0, VK_WHOLE_SIZE, 0, &r.mapped);
++            if (result == VK_SUCCESS) { ++maps.created; r.mappedBytes = requirements.size; }
++            else { ++maps.failures; r.mapped = nullptr; }
++        }
++        if (result == VK_SUCCESS) result = staging(g_device.device(), r.memory, VK_NULL_HANDLE);
 +        if (result != VK_SUCCESS) destroy(r);
 +        return result;
++    }
++    VkResult prepare(const Resource &r, VkCommandBuffer command) {
++        if (!r.mapped || !r.mappedBytes || !staging || !command) return VK_ERROR_INITIALIZATION_FAILED;
++        return staging(g_device.device(), r.memory, command);
 +    }
 +};
 +static MaliStagingPool<MaliStagingBackend> maliStaging;
@@ -2066,3 +2098,47 @@
 -	uint64_t completedSeqNo();
 +	uint64_t completedSeqNo();
 +	inline VkSemaphore maliScratchTimeline() const { return m_scratchTimelineSemaphore; }
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -4913,7 +4913,15 @@
+-	void *dst;
+-	result = g_device.vk.MapMemory( g_device.device(), bufferMemory, 0, VK_WHOLE_SIZE, 0, &dst );
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkMapMemory SHM upload", result);
+-		return nullptr;
++	void *dst = staging.slot ? staging.slot->resource.mapped : nullptr;
++	if (staging.slot) {
++		if (!dst || uint64_t(stride) * height > staging.slot->resource.mappedBytes) {
++			wlr_buffer_end_data_ptr_access(buf);
++			g_device.FailMaliDiagnostic("normal SHM persistent mapped range", VK_ERROR_INITIALIZATION_FAILED);
++			return nullptr;
++		}
++	} else {
++		result = g_device.vk.MapMemory( g_device.device(), bufferMemory, 0, VK_WHOLE_SIZE, 0, &dst );
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++            if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkMapMemory SHM upload", result);
++			return nullptr;
++		}
+@@ -4932 +4940 @@
+-	g_device.vk.UnmapMemory( g_device.device(), bufferMemory );
++	if (!staging.slot) g_device.vk.UnmapMemory( g_device.device(), bufferMemory );
+@@ -4949,0 +4958,2 @@
++		result = maliStaging.backend.prepare(staging.slot->resource, cmdBuffer->rawBuffer());
++		if (result != VK_SUCCESS) g_device.FailMaliDiagnostic("normal SHM coherent upload arm", result);
+--- a/src/staging_api.h
++++ b/src/staging_api.h
+@@ -0,0 +1,10 @@
++/* Private normal-renderer contract, not a Vulkan extension or wire opcode.
++ * NULL command opts a whole coherent mapping into pool-managed uploads.
++ * Before submitting each upload, arm its command after writing the safe slot.
++ * The proxy acknowledges the existing bulk upload before that QueueSubmit and
++ * does not re-upload this allocation for unrelated submits. Unmap ends opt-in. */
++#ifndef DD_STAGING_API_H
++#define DD_STAGING_API_H
++#include <vulkan/vulkan.h>
++typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckStagingMALI)(VkDevice, VkDeviceMemory, VkCommandBuffer);
++#endif

@@ -9,6 +9,8 @@ struct proxy_resource {
     atomic_int live;
     uint8_t *mirror;
     uint64_t allocation, map_offset, map_size;
+    /* Explicit normal staging opt-in; ordinary coherent mappings are unchanged. */
+    uint32_t staging_managed, staging_command;
 };
 _Static_assert(offsetof(struct proxy_resource, loader) == 0, "command buffer dispatch word");
 static void proxy_free_resources(struct proxy_logical *d) {

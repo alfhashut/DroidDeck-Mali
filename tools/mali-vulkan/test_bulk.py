@@ -18,6 +18,10 @@ class BulkMemoryTests(unittest.TestCase):
         proxy = (ROOT / 'interop_icd.h').read_text()
         upload = proxy.split('static VkResult interop_upload_mapping', 1)[1].split('static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory', 1)[0]
         (build / 'upload.inc').write_text('static VkResult interop_upload_mapping' + upload)
+        map_rpc = proxy.split('static VkResult interop_rpc', 1)[1].split('static void interop_publish', 1)[0]
+        (build / 'map_rpc.inc').write_text('static VkResult interop_rpc' + map_rpc)
+        mappings = proxy.split('static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory', 1)[1].split('static VkResult interop_mapped_range', 1)[0]
+        (build / 'mapping.inc').write_text('static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory' + mappings)
         native = (ROOT.parents[1] / 'app/src/main/cpp/malivulkan/interop_commands.h').read_text()
         memory = native.split('    case MB_MEMORY_MAP: case MB_MEMORY_UNMAP:', 1)[1].split('    case MB_COMMAND_FILL:', 1)[0]
         (build / 'native_memory.inc').write_text('    case MB_MEMORY_MAP: case MB_MEMORY_UNMAP:' + memory)
@@ -43,6 +47,12 @@ class BulkMemoryTests(unittest.TestCase):
 
     def test_all_coherent_uploads_acknowledged_before_each_submit(self):
         self.run_case('ordering')
+
+    def test_persistent_staging_only_uploads_for_armed_submission(self):
+        self.run_case('persistent_staging')
+
+    def test_persistent_map_reads_once_and_unmaps_after_completion(self):
+        self.run_case('persistent_map')
 
     def test_bulk_reads_exact_bytes_minimum_chunks_and_reply_reuse(self):
         self.run_case('read_bulk')

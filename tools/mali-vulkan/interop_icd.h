@@ -188,7 +188,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_UnmapMemory(VkDevice device, VkDeviceMem
     if (m && m->mirror) {
         r = m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? interop_copy_mapping(m, m->map_offset, m->map_size, 1) : VK_SUCCESS;
         if (r == VK_SUCCESS) { uint8_t args[4]; mb_put_u32(args, m->id); r = interop_rpc(d, MB_MEMORY_UNMAP, args, 4, NULL, 0); }
-        if (r == VK_SUCCESS) { free(m->mirror); m->mirror = NULL; m->map_size = 0; }
+        if (r == VK_SUCCESS) { free(m->mirror); m->mirror = NULL; m->map_size = 0; m->staging_managed = m->staging_command = 0; }
     }
     submit_void_error(d, "vkUnmapMemory", r);
 }

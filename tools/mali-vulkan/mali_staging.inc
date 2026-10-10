@@ -1,7 +1,13 @@
-/* Normal renderer staging backend. Per-use Map/Unmap stays identical to SHM
- * import; only buffer/allocation/binding lifetimes change. */
+/* Normal staging slots own their whole-allocation coherent mapping. The pool
+ * proves completion before CPU reuse, resizing, unmapping or destruction. */
+#include "staging_api.h"
 struct MaliStagingBackend {
-    struct Resource { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; };
+    struct Resource {
+        VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+        void *mapped = nullptr; uint64_t mappedBytes = 0;
+    };
+    struct MapCounters { uint64_t created = 0, unmaps = 0, failures = 0; } maps;
+    PFN_vkDroidDeckStagingMALI staging = nullptr;
     static constexpr int invalid = VK_ERROR_INITIALIZATION_FAILED;
     bool completed(uint64_t value) {
         return maliCompletedTimeline.covers(g_device.device(), g_device.maliScratchTimeline(), value);
@@ -19,11 +25,17 @@ struct MaliStagingBackend {
         // Buffer destruction also requires recorded references to be retired.
         // The pool only supplies a nonzero sequence after proving completion.
         if (completedSequence) g_device.resetCmdBuffers(completedSequence);
+        if (r.mapped) {
+            g_device.vk.UnmapMemory(g_device.device(), r.memory); ++maps.unmaps;
+            r.mapped = nullptr; r.mappedBytes = 0;
+        }
         if (r.buffer) g_device.vk.DestroyBuffer(g_device.device(), r.buffer, nullptr);
         if (r.memory) g_device.vk.FreeMemory(g_device.device(), r.memory, nullptr);
         r = {};
     }
     int create(uint64_t bytes, Resource &r) {
+        if (!staging) staging = reinterpret_cast<PFN_vkDroidDeckStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckStagingMALI"));
+        if (!staging) return VK_ERROR_FEATURE_NOT_PRESENT;
         VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         VkResult result = g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &r.buffer);
@@ -36,8 +48,18 @@ struct MaliStagingBackend {
         allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
         result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
         if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
+        if (result == VK_SUCCESS) {
+            result = g_device.vk.MapMemory(g_device.device(), r.memory, 0, VK_WHOLE_SIZE, 0, &r.mapped);
+            if (result == VK_SUCCESS) { ++maps.created; r.mappedBytes = requirements.size; }
+            else { ++maps.failures; r.mapped = nullptr; }
+        }
+        if (result == VK_SUCCESS) result = staging(g_device.device(), r.memory, VK_NULL_HANDLE);
         if (result != VK_SUCCESS) destroy(r);
         return result;
+    }
+    VkResult prepare(const Resource &r, VkCommandBuffer command) {
+        if (!r.mapped || !r.mappedBytes || !staging || !command) return VK_ERROR_INITIALIZATION_FAILED;
+        return staging(g_device.device(), r.memory, command);
     }
 };
 static MaliStagingPool<MaliStagingBackend> maliStaging;
