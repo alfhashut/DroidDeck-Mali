@@ -31,12 +31,21 @@ fi
 
 # Mali is an isolated normal session. The explicit environment was verified by
 # the Android service; failures never fall through to Turnip or Steam setup.
-if [ "$mode" = mali-wayland ]; then
+if [ "$mode" = mali-wayland ] || { [ "$mode" = steam ] && [ "${BL_MALI_STEAM_UI:-0}" = 1 ] && [ -z "${BL_INSIDE:-}" ]; }; then
   [ "${MALI_VULKAN_NORMAL_SESSION:-}" = 1 ] || { echo 'Mali normal session environment missing'; exit 65; }
   [ "${WAYLAND_DISPLAY:-}" = wayland-0 ] || { echo 'Mali outer Wayland socket must be wayland-0'; exit 65; }
   [ -S "${XDG_RUNTIME_DIR:?}/wayland-0" ] || { echo 'Android Wayland compositor socket is not ready'; exit 65; }
   [ -S "${MALI_VULKAN_BROKER_SOCKET:?}" ] || { echo 'Mali broker socket disappeared after readiness handshake'; exit 65; }
   [ -s "${VK_ICD_FILENAMES:?}" ] && [ "${VK_DRIVER_FILES:-}" = "$VK_ICD_FILENAMES" ] || { echo 'Mali proxy manifest missing'; exit 65; }
+  if [ "$mode" = steam ]; then
+    command -v Xwayland >/dev/null 2>&1 || { echo 'Mali Steam compatibility unavailable: Xwayland missing'; exit 66; }
+    [ -r /usr/lib/dri/swrast_dri.so ] || { echo 'Mali Steam compatibility unavailable: Mesa software GL (swrast_dri.so) missing'; exit 66; }
+    step 'Steam session selected; Mali Vulkan/AHB backend; ARM64 client UI compatibility'
+    echo '== Steam client graphics: ANGLE/OpenGL on Mesa llvmpipe; compositor retains Mali proxy Vulkan'
+    export BL_INSIDE=1
+    exec gamescope --backend wayland --mali-wayland-session --mali-xwayland --expose-wayland -f \
+      -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- "$0" steam
+  fi
   step 'Mali GPU support (experimental): normal nested Wayland session; no Steam'
   exec gamescope --backend wayland --mali-wayland-session --expose-wayland -f \
     -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- /usr/local/bin/gamescope --mali-interactive-client
@@ -337,7 +346,13 @@ case $mode in
     ;;
   steam)
     step "checking the Steam client (first run downloads it, ~1-2 min with nothing on screen)"
-    droiddeck-steam-install || exit $?
+    if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
+      echo '== Steam bootstrap start: existing droiddeck-steam-install'
+    fi
+    bootstrap_rc=0
+    droiddeck-steam-install || bootstrap_rc=$?
+    [ "${BL_MALI_STEAM_UI:-0}" != 1 ] || echo "== Steam bootstrap result=$bootstrap_rc"
+    [ "$bootstrap_rc" -eq 0 ] || exit "$bootstrap_rc"
     step "Steam client ready"
     steam_root=$XDG_DATA_HOME/Steam
     # Register the card library (bound at /mnt/droiddeck-sd) with the client - internal storage is
@@ -347,7 +362,7 @@ case $mode in
     # arguments to droiddeck-proton-extra: "ge", "cachyos", "ge --tag GE-Proton11-7", or a URL.
     # Hundreds of megabytes each, so it is only ever done on request, and the line is dropped once
     # it has succeeded - a failed download stays and is retried next session.
-    if [ -s "$HOME/.bl-proton-extra" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -s "$HOME/.bl-proton-extra" ]; then
       _bl_left=$HOME/.bl-proton-extra.left
       : > "$_bl_left"
       while read -r _bl_extra || [ -n "$_bl_extra" ]; do
@@ -367,7 +382,7 @@ case $mode in
     # tarball: those are not files anywhere, the client fetches them like any other app. One per
     # line, and the file is cleared once they have been passed on - the client either acts on a URL
     # or it does not, and repeating it every session would re-ask forever.
-    if [ -s "$HOME/.bl-steam-urls" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -s "$HOME/.bl-steam-urls" ]; then
       while read -r _bl_url || [ -n "$_bl_url" ]; do
         case ${_bl_url# } in steam://*) ;; *) continue ;; esac
         step "asking the client for $_bl_url"
@@ -405,8 +420,10 @@ case $mode in
 
     step "registering the app's game library with Steam"
     droiddeck-steam-library "$steam_root" || true
-    step "setting up the ARM64 Proton compatibility tool"
-    steam-compatibility "$steam_root" || true
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ]; then
+      step "setting up the ARM64 Proton compatibility tool"
+      steam-compatibility "$steam_root" || true
+    fi
     if [ -z "${BL_DESKTOP:-}" ] && [ "${BL_STEAM_UI:-}" != desktop ]; then
       droiddeck-steam-ui-scale "$steam_root" "${BL_WIDTH:-1280}" "${BL_HEIGHT:-720}" || true
     fi
@@ -418,10 +435,10 @@ case $mode in
     fi
     # Steam runs a game's shared redistributables inside its prefix on first launch; marking
     # them as already run keeps those x86 installers from starting under emulation at all.
-    droiddeck-seed-redists "$steam_root" || true
+    [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || droiddeck-seed-redists "$steam_root" || true
     # The compatibility tool runs Valve's arm64 Proton, which the client fetches like any depot.
     # Asked for on the command line the first time, so a Windows title has it before it is needed.
-    if [ ! -f "$steam_root/steamapps/appmanifest_4427310.acf" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ ! -f "$steam_root/steamapps/appmanifest_4427310.acf" ]; then
       step "asking the client to fetch the ARM64 Proton"
       set -- "$@" steam://install/4427310
       # Ported from Bannerlator's session script (device-proven 2026-09-22). The client decides
@@ -522,7 +539,7 @@ case $mode in
     # this asks it again a moment after input comes back from the client (app 769) to anything else,
     # which covers a game that minimizes late. Harmless when nothing is minimized.
     # BL_RESTORE_ON_RESUME=0 turns it off.
-    [ -z "${BL_DESKTOP:-}" ] && [ "${BL_RESTORE_ON_RESUME:-1}" = 1 ] && (
+    [ -z "${BL_DESKTOP:-}" ] && [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ "${BL_RESTORE_ON_RESUME:-1}" = 1 ] && (
       prev=
       xprop -spy -root GAMESCOPE_FOCUSED_APP 2>/dev/null | while read -r line; do
         app=${line##*= }
@@ -573,7 +590,7 @@ case $mode in
     # reads from has changed since its last run - a new manifest, a new depot or tool, the client
     # rewriting config.vdf - which [ -nt ] answers without starting anything, and once a minute
     # regardless.
-    (
+    [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && (
       beat=0
       compat_stamp=$HOME/.bl-compat-beat
       rm -f "$compat_stamp"
@@ -600,7 +617,7 @@ case $mode in
     # Debug aid while the runtime is being brought up: an app id dropped in ~/.bl-autolaunch is
     # handed to the client as a rungameid URL, so a launch can be reproduced without touching the
     # screen. Removed once the runtime is stable.
-    if [ -s "$HOME/.bl-autolaunch" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -s "$HOME/.bl-autolaunch" ]; then
       _bl_app=$(cat "$HOME/.bl-autolaunch")
       # A bare app id runs the game; a full steam:// URL is passed through, which is how a
       # validate or an install is driven without touching the screen.
@@ -678,7 +695,7 @@ BUSCONF
     # reaped with the client session. Native ARM64 runs directly. A legacy x86_64 asset is used
     # only when its recorded architecture says so and droiddeck-fex has FEX and its runtime ready.
     decky_loader=$HOME/homebrew/services/PluginLoader
-    if [ -f "$HOME/.droiddeck-decky-enabled" ] && [ -x "$decky_loader" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -f "$HOME/.droiddeck-decky-enabled" ] && [ -x "$decky_loader" ]; then
       decky_arch=$(cat "$HOME/homebrew/services/.droiddeck-decky-arch" 2>/dev/null || echo unknown)
       if [ "$decky_arch" = arm64 ] || { [ "$decky_arch" = x86_64 ] && /usr/local/bin/droiddeck-fex prepare >/dev/null; }; then
         (
@@ -723,7 +740,7 @@ BUSCONF
       export BL_CDP_GUARD=$BL_CDP_PORT
       echo "== steam: devtools port $BL_CDP_PORT, guest processes only"
     fi
-    droiddeck-steam-compat "$steam_root" 2>&1 &
+    [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || droiddeck-steam-compat "$steam_root" 2>&1 &
     # The client exits 42 when it has updated itself and wants a fresh start (steam.sh does this).
     # BL_STEAM_UI=desktop = the client's desktop UI (a window, the library as a list), which the
     # desktop's launchers ask for; gamescope shows one window at a time and the game takes over.
@@ -740,9 +757,9 @@ BUSCONF
     if [ "${BL_STEAMDECK:-0}" = 1 ] && [ "${BL_STEAM_UI:-}" != desktop ]; then
       _bl_ui+=(-steamdeck -steamos3)
       # The QAM's Scaling Filter lists NVIDIA Image Scaling only when told gamescope has it (it does).
-      export STEAM_GAMESCOPE_NIS_SUPPORTED=1
+      [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || export STEAM_GAMESCOPE_NIS_SUPPORTED=1
       # And shows its Scaling Mode and Scaling Filter only when told gamescope takes them.
-      export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
+      [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
       echo "== steam: Deck mode on (-steamdeck -steamos3)"
     fi
     # What a killed session leaves behind. Android ends sessions without warning (backgrounding, the
@@ -778,7 +795,7 @@ BUSCONF
     # Lossless Scaling (Steam app 993090): whether this account owns it, asked of the signed-in
     # client once a session until the answer is yes. From then on the app offers importing
     # Lossless.dll and passes BL_LOSSLESS_OWNED=1, so the question is never asked again.
-    if [ "${BL_LOSSLESS_OWNED:-0}" != 1 ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ "${BL_LOSSLESS_OWNED:-0}" != 1 ]; then
       (
         owned=$HOME/.config/droiddeck/lossless-owned
         for ((_i = 0; _i < 60; _i++)); do
@@ -793,7 +810,13 @@ BUSCONF
         done
       ) &
     fi
-    echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} -clientbeta $steam_channel -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan $*"
+    _bl_graphics=(-no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan)
+    if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
+      _bl_graphics=(-no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=gl)
+      echo "== Steam client display=$DISPLAY; graphics=software GL; UI visibility/sign-in requires phone evidence"
+      echo '== network: using Android DNS and existing NetworkManager bridge; login reachability not yet measured'
+    fi
+    echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} -clientbeta $steam_channel ${_bl_graphics[*]} $*"
     # An update that cannot install asks for a restart (rc=42) every time; the count is capped so a
     # session can never again loop in silence, which reads as a menu opening and closing by itself.
     steam_updates=0
@@ -809,7 +832,7 @@ BUSCONF
             "$steam_root/steamrtarm64/steam" -shutdown >/dev/null 2>&1 || true
             exit 0
           fi
-          if [ -f "$BL_LAUNCH_DIR/steam-game" ]; then
+          if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -f "$BL_LAUNCH_DIR/steam-game" ]; then
             game_id=$(cat "$BL_LAUNCH_DIR/steam-game" 2>/dev/null)
             rm -f "$BL_LAUNCH_DIR/steam-game"
             case $game_id in
@@ -847,16 +870,24 @@ BUSCONF
         droiddeck-steam-language "$HOME" "$BL_STEAM_LANGUAGE" || true
       fi
       step "starting the Steam client${BL_STEAM_UI:+ ($BL_STEAM_UI UI)}"
-      "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
-        -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 \
-        -cef-use-gl=angle -cef-use-angle=vulkan "$@"
-      rc=$?
+      if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
+        "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
+          "${_bl_graphics[@]}" "$@" &
+        steam_pid=$!
+        echo "== ARM64 Steam process pid=$steam_pid executable=$steam_root/steamrtarm64/steam"
+        rc=0
+        wait "$steam_pid" || rc=$?
+      else
+        "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
+          "${_bl_graphics[@]}" "$@"
+        rc=$?
+      fi
       echo "== steam exited rc=$rc"
       if [ -n "${BL_ADDED_GAMES:-}" ] && [ -f "$BL_ADDED_GAMES" ]; then
         droiddeck-steam-shortcuts "$steam_root" "$BL_ADDED_GAMES" || true
       fi
       collect_steam_logs
-      if [ -f "$HOME/.config/droiddeck/fex-wanted" ] && [ -x /usr/local/bin/droiddeck-fex ]; then
+      if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -f "$HOME/.config/droiddeck/fex-wanted" ] && [ -x /usr/local/bin/droiddeck-fex ]; then
         /usr/local/bin/droiddeck-fex status >/dev/null 2>&1 || true
       fi
       if [ -f "$HOME/.bl-stop-requested" ]; then
@@ -908,7 +939,8 @@ BUSCONF
       fi
       _bl_jobs=$(jobs -p)
       [ -n "$_bl_jobs" ] && kill $_bl_jobs 2>/dev/null
-      reap_orphans
+      # Mali owns Xwayland as a sibling of this script; never kill the compositor's XWM.
+      [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || reap_orphans
     fi
     exit "$rc"
     ;;

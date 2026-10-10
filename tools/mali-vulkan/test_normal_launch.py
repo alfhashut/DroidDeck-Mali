@@ -167,7 +167,10 @@ class NormalLaunchTests(unittest.TestCase):
     def test_reattached_activity_uses_live_mode_and_broker_lease_survives_stop_error(self):
         activity = (ROOT / "app/src/main/java/com/droiddeck/launcher/SessionActivity.kt").read_text()
         framegen = activity.split("private fun applyFrameGen()", 1)[1].split("val hz = refreshHz()", 1)[0]
-        self.assertIn("loadingMode() ==", framegen)
+        self.assertIn("loadingMali()", framegen)
+        selection = activity.split("private fun loadingMali()", 1)[1].split("private fun pausedTitle", 1)[0]
+        self.assertIn("SessionState.running", selection)
+        self.assertIn("SessionState.maliBackend", selection)
         self.assertIn("nativeSetFrameGenArmed(false, 0, 0)", framegen)
         self.assertIn("MaliSessionSelection.MODE -> getString(R.string.session_starting_mali)", activity)
         broker = (ROOT / "app/src/main/java/com/droiddeck/launcher/gpu/SystemVulkanBroker.kt").read_text()

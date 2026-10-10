@@ -213,6 +213,12 @@ class SessionService : Service() {
             return START_NOT_STICKY
         }
         SessionState.mode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_STEAM
+        SessionState.maliBackend = SessionState.mode == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE ||
+            (SessionState.mode == MODE_STEAM &&
+                (intent?.getBooleanExtra(EXTRA_MALI_BACKEND, false) == true ||
+                    com.droiddeck.launcher.gpu.VulkanInfo.cachedOrNull()?.let {
+                        com.droiddeck.launcher.gpu.MaliSessionSelection.supported(it)
+                    } == true))
         suspendPolicy = SessionPrefs.suspendPolicy(this, SessionState.mode)
         steamDownloadsInBackground = SessionPrefs.steamDownloadsInBackground(this)
         activityVisible = true
@@ -327,6 +333,19 @@ class SessionService : Service() {
 
         Log.i(TAG, GpuClockPin.start(this))
 
+        val maliSteam = SessionState.maliBackend && SessionState.mode == MODE_STEAM
+        val maliVulkan = if (maliSteam) try {
+            synchronized(maliStartupLock) {
+                if (gen != sessionGen || !SessionState.running) return
+                SessionEvents.record("steam.backend", mapOf("backend" to "Mali Vulkan/AHB", "client" to "ARM64 Steam UI only"))
+                com.droiddeck.launcher.gpu.MaliNormalBroker.start(this)
+            }
+        } catch (error: Throwable) {
+            if (gen != sessionGen || !SessionState.running) return
+            SessionEvents.fail("MALI_SESSION_START", error.message ?: "Mali Steam broker startup failed", -1)
+            stopSession(-1)
+            return
+        } else emptyList()
         val size = SessionState.outputSize
         val guest = ArrayList<String>()
         // The desktop's Steam launchers start the client there (droiddeck-steam-launch), through the
@@ -335,12 +354,18 @@ class SessionService : Service() {
         // Some GPUs need a component Proton does not ship. Apply those before the guest, so the
         // next game launch copies them into the prefix. A download failure is logged and the
         // session still starts; the next session tries again.
-        if (steamHere) {
+        if (steamHere && !maliSteam) {
             runCatching { ComponentsManager.ensureForcedPackages(this) }
                 .onSuccess { if (it != null) Log.i(TAG, it) }
                 .onFailure { Log.w(TAG, "forced components", it) }
         }
-        addClientEnvironment(guest, steamHere)
+        addClientEnvironment(guest, steamHere, maliSteam)
+        if (maliSteam) {
+            guest.addAll(maliVulkan)
+            guest.add("BL_MALI_STEAM_UI=1")
+            extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_BASELINE=0" || it == "MALI_VULKAN_PERF_BASELINE=1" }?.let { guest.add(it) }
+            extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_HZ=30" || it == "MALI_VULKAN_PERF_HZ=60" }?.let { guest.add(it) }
+        }
         // Where the fast path's description of proot's view goes, once the binds are known.
         val fastPathAt = guest.size
 
@@ -377,7 +402,7 @@ class SessionService : Service() {
         }
         // The user's own games, for the runtime's shortcuts writer to put in the client's library
         // before the client starts (see frontend/AddedGames and droiddeck-steam-shortcuts).
-        if (steamHere) {
+        if (steamHere && !maliSteam) {
             val added = com.droiddeck.launcher.frontend.AddedGames.scan(this)
             val listing = com.droiddeck.launcher.frontend.AddedGames.writeListing(this, added)
             guest.add("BL_ADDED_GAMES=" + listing.path)
@@ -402,7 +427,7 @@ class SessionService : Service() {
         }
         guest.add(LinuxRuntime.SESSION_SCRIPT)
         guest.add(SessionState.mode)
-        if (SessionState.mode == MODE_STEAM) SessionState.steamUrl?.takeIf { it.startsWith("steam://") }?.let {
+        if (SessionState.mode == MODE_STEAM && !maliSteam) SessionState.steamUrl?.takeIf { it.startsWith("steam://") }?.let {
             guest.add(it)
             Log.i(TAG, "steam: handing the client $it")
         }
@@ -495,20 +520,33 @@ class SessionService : Service() {
             it.replace("\\", "\\\\").replace(" ", "\\ ")
         }
         watchLaunchRequests(sessionRoot)
-        watchSyncWanted(root)
-        EsyncPacks.fetchInBackground(this, root)
+        if (!maliSteam) {
+            watchSyncWanted(root)
+            EsyncPacks.fetchInBackground(this, root)
+        }
         // One session replacing another (the desktop's Steam launchers): the old proot is killed
         // by the teardown a second after the new one has started, and its exit used to arrive
         // here as "session ended: 137" and end the NEW session. An exit belongs to the session
         // that started it.
-        val pid = HostProcess.start(line, hostEnv.asArray(), root, { status ->
-            if (gen != sessionGen) {
-                Log.i(TAG, "an earlier session's process ended ($status); the current one carries on")
-                return@start
+        val startGuest = {
+            HostProcess.start(line, hostEnv.asArray(), root, { status ->
+                if (gen != sessionGen) {
+                    Log.i(TAG, "an earlier session's process ended ($status); the current one carries on")
+                    return@start
+                }
+                Log.i(TAG, "session ended: $status")
+                stopSession(status ?: -1)
+            }, null)
+        }
+        val pid = if (maliSteam) synchronized(stopLock) {
+            if (gen != sessionGen || !SessionState.running) return
+            startGuest().also { started ->
+                if (started > 1) {
+                    sessionPid = started
+                    maliGuestStartedAt = readStat(started)?.second
+                }
             }
-            Log.i(TAG, "session ended: $status")
-            stopSession(status ?: -1)
-        }, null)
+        } else startGuest()
         Log.i(TAG, "session pid $pid, log ${sessionLog.path}")
         if (gen != sessionGen || !SessionState.running) {
             Log.i(TAG, "session stopped while its guest was starting; taking it down")
@@ -520,7 +558,9 @@ class SessionService : Service() {
                 components.reversed().forEach { runCatching { it.stop() } }
                 components.clear()
             }
-            if (pid > 1) Thread({ teardown(pid) }, "session-teardown").start()
+            // Mali's child was registered under stopLock; its dedicated stop owns the
+            // release drain. A generic teardown here could race and kill it first.
+            if (pid > 1 && !maliSteam) Thread({ teardown(pid) }, "session-teardown").start()
             return
         }
         sessionPid = pid
@@ -646,7 +686,7 @@ class SessionService : Service() {
     }
 
     /** The guest's base environment: paths, the display, the GL/Vulkan stack and the client's switches. */
-    private fun addClientEnvironment(guest: MutableList<String>, steamHere: Boolean) {
+    private fun addClientEnvironment(guest: MutableList<String>, steamHere: Boolean, maliSteam: Boolean = false) {
         guest.add("/usr/bin/env")
         guest.add("-i")
         guest.add("HOME=/root")
@@ -668,31 +708,33 @@ class SessionService : Service() {
         guest.add("WAYLAND_DISPLAY=wayland-0")
         guest.add("BL_ANDROID_CLIPBOARD=" + File(filesDir, "session/android-clipboard").path)
         guest.add("GAMESCOPE_FORCE_GENERAL_QUEUE=1")
-        // Steam's CEF needs GL and the rootfs ships no native GL driver: route it through Zink.
-        guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
-        guest.add("GALLIUM_DRIVER=zink")
-        guest.add("LIBGL_KOPPER_DRI2=true")
-        LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
-        // An imported glibc Turnip, when one is set (by the user, or by Auto): the session script
-        // checks the manifest and its library from inside and points the loader at it with
-        // VK_DRIVER_FILES, so the runtime's own driver above stays untouched and is what a bad
-        // import falls back to. One driver for every session: the driver's shader cache is keyed on
-        // its build, and with one per mode every emulator compiled its shaders twice.
-        val linuxDriverId = SessionPrefs.linuxDriver(this)
-        LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
-            ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
-        // Turnip's own debug switches, for the runtime's driver and everything on it. The file in
-        // Downloads holds the value verbatim ("sysmem", "sysmem,deck_emu"); with nothing there, an
-        // imported driver from the A710/A720/A722 legs gets "sysmem" on its own, which is what both
-        // its authors advise for those GPUs and what nothing else in the list needs.
-        tuDebug(linuxDriverId)?.let { guest.add("TU_DEBUG=$it") }
-        // Zink renders the client's UI (Chromium -> ANGLE -> Zink -> Turnip). Lazy descriptors is
-        // the mode Zink recommends where the driver has no descriptor buffer, and what Ludashi ships
-        // by default for its Zink path; a switch here because on one Fold the menus run at 14 fps.
-        // compact packs Zink's descriptor sets into fewer, so a draw binds less (WinNative's default).
-        if (SessionPrefs.zinkLazy(this)) {
-            guest.add("ZINK_DESCRIPTORS=lazy")
-            guest.add("ZINK_DEBUG=compact")
+        if (!maliSteam) {
+            // Steam's CEF needs GL and the rootfs ships no native GL driver: route it through Zink.
+            guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
+            guest.add("GALLIUM_DRIVER=zink")
+            guest.add("LIBGL_KOPPER_DRI2=true")
+            LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
+            // An imported glibc Turnip, when one is set (by the user, or by Auto): the session script
+            // checks the manifest and its library from inside and points the loader at it with
+            // VK_DRIVER_FILES, so the runtime's own driver above stays untouched and is what a bad
+            // import falls back to. One driver for every session: the driver's shader cache is keyed on
+            // its build, and with one per mode every emulator compiled its shaders twice.
+            val linuxDriverId = SessionPrefs.linuxDriver(this)
+            LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
+                ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
+            // Turnip's own debug switches, for the runtime's driver and everything on it. The file in
+            // Downloads holds the value verbatim ("sysmem", "sysmem,deck_emu"); with nothing there, an
+            // imported driver from the A710/A720/A722 legs gets "sysmem" on its own, which is what both
+            // its authors advise for those GPUs and what nothing else in the list needs.
+            tuDebug(linuxDriverId)?.let { guest.add("TU_DEBUG=$it") }
+            // Zink renders the client's UI (Chromium -> ANGLE -> Zink -> Turnip). Lazy descriptors is
+            // the mode Zink recommends where the driver has no descriptor buffer, and what Ludashi ships
+            // by default for its Zink path; a switch here because on one Fold the menus run at 14 fps.
+            // compact packs Zink's descriptor sets into fewer, so a draw binds less (WinNative's default).
+            if (SessionPrefs.zinkLazy(this)) {
+                guest.add("ZINK_DESCRIPTORS=lazy")
+                guest.add("ZINK_DEBUG=compact")
+            }
         }
         // The rest of the client-interface switches (SessionPrefs): GL marshalled off the calling
         // thread, no GL error checks, and the client run as SteamOS runs it (the script reads
@@ -730,7 +772,7 @@ class SessionService : Service() {
         // holds KEY=VALUE lines that go into the session's environment as written, after ours, so a
         // line here wins. Zink and Turnip tunables (ZINK_DESCRIPTORS=lazy, MESA_*), gamescope's,
         // the client's - whatever the experiment needs, without a build per attempt.
-        extraEnv().forEach { guest.add(it) }
+        if (!maliSteam) extraEnv().forEach { guest.add(it) }
         // Core masks, Bannerlator's two (cfca3912). The client's is sent whenever the override is
         // on, even naming every core: it exists to undo the pin Steam applies to its own interface
         // renderer, and the scheduler's default is exactly what that pin takes away. A game's is
@@ -1102,7 +1144,7 @@ class SessionService : Service() {
 
     private fun queueSteamGame(gameId: String?) {
         if (!GameLaunchLink.validId(gameId.orEmpty()) || !SessionState.running ||
-            SessionState.mode != MODE_STEAM || SessionState.stopRequested) {
+            SessionState.mode != MODE_STEAM || SessionState.maliBackend || SessionState.stopRequested) {
             Log.w(TAG, "ignored game launch outside a running Steam session")
             return
         }
@@ -1568,11 +1610,12 @@ class SessionService : Service() {
         components.clear()
         FakeInputWriter.releaseAllRingSlots()
         val steamClientMayRun = SessionState.mode == MODE_STEAM || SessionState.mode == MODE_DESKTOP
-        if (SessionState.mode == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE) {
+        if (SessionState.maliBackend) {
             val finishMali: () -> Unit = {
                 Thread({
                     var finalStatus = status
                     try {
+                        if (steamClientMayRun && prootPid > 1) askSteamToExit(prootPid)
                         stopMaliGuest(prootPid, maliStartedAt)
                         auxiliary.forEach { (pid, started) -> teardown(pid, started) }
                     } catch (error: Throwable) {
@@ -1842,6 +1885,7 @@ class SessionService : Service() {
         private const val FIRST_VIRTUAL_PAD = 16
 
         const val EXTRA_MODE = "mode"
+        const val EXTRA_MALI_BACKEND = "maliBackend"
         const val MODE_STEAM = "steam"
         const val MODE_DESKTOP = "lxqt"
         /** A program inside the runtime, fullscreen under gamescope (EXTRA_PROGRAM = its path). */
@@ -1858,8 +1902,10 @@ class SessionService : Service() {
         fun start(
             context: Context, mode: String = MODE_STEAM, program: String? = null,
             steamUi: String? = null, steamUrl: String? = null, programArgs: Array<String>? = null,
+            maliBackend: Boolean = false,
         ) {
             val intent = Intent(context, SessionService::class.java).putExtra(EXTRA_MODE, mode)
+                .putExtra(EXTRA_MALI_BACKEND, maliBackend)
             if (program != null) intent.putExtra(EXTRA_PROGRAM, program)
             if (programArgs != null) intent.putExtra(EXTRA_PROGRAM_ARGS, programArgs)
             if (steamUi != null) intent.putExtra(EXTRA_STEAM_UI, steamUi)

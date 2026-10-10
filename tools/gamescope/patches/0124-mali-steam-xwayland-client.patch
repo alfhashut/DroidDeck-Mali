@@ -1,0 +1,364 @@
+Subject: [PATCH] Mali Steam client Xwayland compatibility around validated SHM renderer
+
+--- a/src/mali_normal.cpp
++++ b/src/mali_normal.cpp
+@@ -10,6 +10,11 @@
+ #include <wlr/types/wlr_compositor.h>
+ #include <wlr/types/wlr_buffer.h>
+ #include <wlr/types/wlr_seat.h>
++#include <wlr/types/wlr_output.h>
++#include <wlr/backend/headless.h>
++#include <wlr/xwayland/xwayland.h>
++#include <wlr/xwayland/server.h>
++#include <wlr/util/log.h>
+ #include <wlr/interfaces/wlr_keyboard.h>
+ #include "wlr_end.hpp"
+ #include <wayland-client.h>
+@@ -27,6 +32,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <vector>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+@@ -50,6 +56,12 @@
+     wlr_seat *seat = nullptr; wlr_keyboard *keyboard = nullptr;
+     wl_listener created{}, committed{}, destroyed{};
+     pid_t child = -1; bool pending = false;
++    bool x11 = false, x11Ready = false;
++    pid_t childGroup = -1;
++    wlr_xwayland *xwayland = nullptr;
++    wlr_backend *x11Backend = nullptr;
++    wlr_output *x11Output = nullptr;
++    wl_listener x11ReadyListener{}, x11Created{};
+     unsigned commits = 0, frames = 0, motions = 0, buttons = 0, keys = 0;
+ } server;
+ static void Released(void *data, wl_buffer *) {
+@@ -72,6 +84,7 @@
+     }
+     wl_callback_destroy(callback); return done;
+ }
++#include "mali_x11.inc"
+ static void Commit(wl_listener *, void *) {
+     if (server.surface && wlr_surface_has_buffer(server.surface)) { server.pending = true; ++server.commits; }
+ }
+@@ -80,6 +93,7 @@
+     server.surface = nullptr; server.pending = false;
+ }
+ static void NewSurface(wl_listener *, void *data) {
++    if (server.x11) return; // XWM associates windows, not cursor/unpaired wl_surfaces.
+     if (server.surface) { mali_normal_failure("Checkpoint 7 accepts one interactive surface"); return; }
+     server.surface = static_cast<wlr_surface *>(data);
+     server.committed.notify = Commit; server.destroyed.notify = Destroy;
+@@ -129,26 +143,54 @@
+     server.created.notify = NewSurface; wl_signal_add(&compositor->events.new_surface, &server.created);
+     const char *socket = wl_display_add_socket_auto(server.display);
+     if (!socket) return false;
++    if (server.x11 && !StartX11(compositor)) return false;
+     std::string socketName(socket);
+     server.child = fork();
+     if (server.child < 0) return false;
+     if (!server.child) {
++        if (server.x11) {
++            if (setpgid(0, 0) < 0) { std::perror("Mali Steam client process group"); _Exit(127); }
++            setenv("DISPLAY", server.xwayland->display_name, 1);
++            // The narrow compute-only ICD is compositor-local, never Steam/CEF's driver.
++            for (const char *key : {"VK_DRIVER_FILES", "VK_ICD_FILENAMES", "BL_VK_DRIVER",
++                "MALI_VULKAN_BROKER_SOCKET", "MALI_VULKAN_NORMAL_SESSION",
++                "MALI_VULKAN_RENDERER_TEST", "MALI_VULKAN_AHB_TEST"}) unsetenv(key);
++            setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
++            setenv("MESA_LOADER_DRIVER_OVERRIDE", "swrast", 1);
++            setenv("GALLIUM_DRIVER", "llvmpipe", 1);
++        }
+         setenv("WAYLAND_DISPLAY", socketName.c_str(), 1);
+         execvp(command[0], command); std::perror("normal Wayland child exec"); _Exit(127);
+     }
++    if (server.x11) {
++        if (setpgid(server.child, server.child) < 0 && getpgid(server.child) != server.child) {
++            std::perror("Mali Steam client process group"); return false;
++        }
++        server.childGroup = server.child;
++        std::printf("Mali Steam Gamescope pid=%d client-supervisor pid=%d Xwayland pid=%d DISPLAY=%s; client GL=llvmpipe, compositor Vulkan=Mali proxy\n",
++            int(getpid()), int(server.child), int(server.xwayland->server->pid), server.xwayland->display_name);
++    }
+     std::printf("normal Wayland client pid=%d socket=%s; outer WAYLAND_DISPLAY=wayland-0; existing nested pointer/touch/keyboard seat\n", int(server.child), socketName.c_str());
+     return true;
+ }
+ static void StopServer() {
++    if (server.x11 && server.childGroup > 1) kill(-server.childGroup, SIGTERM);
+     if (server.child > 0) {
+-        kill(server.child, SIGTERM);
++        pid_t target = server.x11 && server.childGroup > 1 ? -server.childGroup : server.child;
++        kill(target, SIGTERM);
+         auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(500); int status = 0;
+         while (std::chrono::steady_clock::now() < end) {
+             pid_t r = waitpid(server.child, &status, WNOHANG);
+             if (r == server.child || (r < 0 && errno == ECHILD)) { server.child = -1; break; }
+             if (server.display) Dispatch(5);
+         }
+-        if (server.child > 0) { kill(server.child, SIGKILL); while (waitpid(server.child, &status, 0) < 0 && errno == EINTR) {} }
++        if (server.child > 0) { kill(target, SIGKILL); while (waitpid(server.child, &status, 0) < 0 && errno == EINTR) {} }
++    }
++    if (server.x11) {
++        // Software client helpers own no compositor Vulkan/AHB resources.
++        // Do not leave CEF/bus children behind after the supervisor has exited.
++        if (server.childGroup > 1) kill(-server.childGroup, SIGKILL);
++        StopX11();
+     }
+     if (server.display) {
+         wl_display_destroy_clients(server.display);
+@@ -206,8 +248,10 @@
+         std::fputs("normal Mali session requires its isolated environment and outer wayland-0\n", stderr); return 1;
+     }
+     unsigned width = 0, height = 0; char **command = nullptr; bool wayland = false;
++    bool x11 = false;
+     for (int i = 1; i < argc; ++i) {
+         if (!strcmp(argv[i], "--")) { if (i + 1 < argc) command = argv + i + 1; break; }
++        if (!strcmp(argv[i], "--mali-xwayland")) { x11 = true; continue; }
+         if (!strcmp(argv[i], "--mali-wayland-session") || !strcmp(argv[i], "--expose-wayland") || !strcmp(argv[i], "-f")) continue;
+         if (!strcmp(argv[i], "--backend") && i + 1 < argc) { wayland = !strcmp(argv[++i], "wayland"); continue; }
+         if ((!strcmp(argv[i], "-W") || !strcmp(argv[i], "-H")) && i + 1 < argc) {
+@@ -227,6 +271,7 @@
+     std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
+     g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
+     g_nNestedRefresh = g_nOutputRefresh = normalPacingHz * 1000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
++    server.x11 = x11;
+     bool renderer = vulkan_mali_normal_init(width, height);
+     bool backend = renderer && gamescope::IBackend::Set<gamescope::CWaylandBackend>();
+     auto connector = backend ? gamescope::IBackend::Get()->CreateVirtualConnector(0) : nullptr;
+@@ -242,9 +287,20 @@
+         gamescope::IBackend::Get()->PollState();
+         if (wl_display_get_error(host.display)) { mali_normal_failure("Android compositor disconnected"); break; }
+         if (!Dispatch(0)) { ok = false; break; }
++        if (server.x11) X11IdleCallbacks();
++        if (server.x11 && server.x11Ready && !server.xwayland->server->ready) {
++            mali_normal_failure("Steam Xwayland disconnected"); break;
++        }
+         if (server.child > 0) {
+             pid_t r = waitpid(server.child, &childStatus, WNOHANG);
+-            if (r == server.child) { server.child = -1; ok = WIFEXITED(childStatus) && WEXITSTATUS(childStatus) == 0; break; }
++            if (r == server.child) {
++                if (server.x11) {
++                    std::printf("Mali Steam client-supervisor exit status=%d signal=%d\n",
++                        WIFEXITED(childStatus) ? WEXITSTATUS(childStatus) : -1,
++                        WIFSIGNALED(childStatus) ? WTERMSIG(childStatus) : 0);
++                    kill(-server.child, SIGTERM); // no helper outlives its client
++                }
++                server.child = -1; ok = WIFEXITED(childStatus) && WEXITSTATUS(childStatus) == 0; break; }
+         }
+         vulkan_mali_normal_tick();
+         auto now = std::chrono::steady_clock::now();
+@@ -267,13 +323,16 @@
+             vulkan_mali_normal_frame_end(result == 0);
+             if (result == 0) {
+                 timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time); wlr_surface_send_frame_done(server.surface, &time);
++                if (server.x11) X11Presented();
+                 server.pending = false; ++server.frames; wl_display_flush_clients(server.display); progress = now;
+             } else if (result != EAGAIN) { ok = false; break; }
+             // Pace from frame start: a slow render must not pay another target period.
+             // No catch-up burst: the next iteration starts a fresh deadline.
+             next = (perfBaseline ? std::chrono::steady_clock::now() : now) + framePeriod;
+         }
+-        if (now - progress > std::chrono::seconds(15)) { mali_normal_failure("normal session made no frame progress for 15 seconds"); break; }
++        // Steam's bootstrap can download for minutes; an idle UI also needs no redraw.
++        // Child exit, Xwayland and outer socket failures remain fatal.
++        if (!server.x11 && now - progress > std::chrono::seconds(15)) { mali_normal_failure("normal session made no frame progress for 15 seconds"); break; }
+         std::this_thread::sleep_for(std::chrono::milliseconds(2));
+     }
+     ok &= !failed;
+@@ -284,5 +343,7 @@
+     if (host.display) wl_display_disconnect(host.display);
+     host = {}; g_maliNormalSessionActive = false;
+     std::printf("normal Mali Wayland session exit=%d client status=%d\n", ok ? 0 : 1, childStatus);
++    if (x11) std::printf("Mali Steam Gamescope pid=%d exit=%d; Mali release/drain result=%s\n",
++        int(getpid()), ok ? 0 : 1, ok ? "clean" : "failed (see release accounting)");
+     return ok ? 0 : 1;
+ }
+--- /dev/null
++++ b/src/mali_x11.inc
+@@ -0,0 +1,184 @@
++/* X11 client/window compatibility only. No changes to Vulkan rendering/output.
++ * Uses Gamescope's pinned wlroots XWM. Displays one focused client window through
++ * the existing SHM import; bootstrapping, modal windows and replacement are allowed.
++ * No Gamescope game/scaler capability properties are advertised here. */
++struct MaliXWindow {
++    wlr_xwayland_surface *window = nullptr;
++    bool dirty = false, presented = false;
++    wl_listener associate{}, dissociate{}, destroy{}, configure{}, activate{}, fullscreen{};
++    wl_listener map{}, unmap{}, commit{};
++};
++static std::vector<MaliXWindow *> xWindows;
++static bool x11Stopping = false;
++static void X11Unlisten(wl_listener &listener) {
++    if (listener.link.next) { wl_list_remove(&listener.link); listener.link = {}; }
++}
++static bool X11Eligible(MaliXWindow *w) {
++    return w->window->surface && w->window->surface->mapped &&
++        (!w->window->override_redirect ||
++         wlr_xwayland_surface_override_redirect_wants_focus(w->window));
++}
++static void X11Select(MaliXWindow *chosen = nullptr) {
++    if (x11Stopping) return;
++    if (chosen && !X11Eligible(chosen)) chosen = nullptr;
++    if (!chosen) for (auto it = xWindows.rbegin(); it != xWindows.rend(); ++it)
++        if (X11Eligible(*it)) { chosen = *it; break; }
++    wlr_surface *surface = chosen ? chosen->window->surface : nullptr;
++    if (surface == server.surface) return;
++    if (server.surface) {
++        auto previous = wlr_xwayland_surface_try_from_wlr_surface(server.surface);
++        if (previous) wlr_xwayland_surface_activate(previous, false);
++    }
++    wlr_seat_pointer_clear_focus(server.seat);
++    wlr_seat_keyboard_clear_focus(server.seat);
++    server.surface = surface;
++    server.pending = surface && wlr_surface_has_buffer(surface);
++    if (chosen) {
++        xWindows.erase(std::find(xWindows.begin(), xWindows.end(), chosen));
++        xWindows.push_back(chosen);
++        wlr_xwayland_surface_activate(chosen->window, true);
++        wlr_xwayland_surface_restack(chosen->window, nullptr, XCB_STACK_MODE_ABOVE);
++        wlr_surface_send_enter(surface, server.x11Output);
++        wlr_seat_keyboard_notify_enter(server.seat, surface, nullptr, 0, &server.keyboard->modifiers);
++        std::printf("Mali Steam X11 focus window=0x%x client-pid=%d; visibility not yet proven\n",
++            chosen->window->window_id, int(chosen->window->pid));
++    }
++}
++static void X11Commit(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, commit);
++    if (wlr_surface_has_buffer(w->window->surface)) {
++        w->dirty = true;
++        if (server.surface == w->window->surface) { server.pending = true; ++server.commits; }
++    }
++}
++static void X11Map(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, map);
++    w->dirty = true;
++    X11Select(w);
++}
++static void X11Unmap(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, unmap);
++    if (server.surface == w->window->surface) X11Select();
++}
++static void X11Dissociate(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, dissociate);
++    if (server.surface == w->window->surface) {
++        wlr_seat_pointer_clear_focus(server.seat); wlr_seat_keyboard_clear_focus(server.seat);
++        server.surface = nullptr; server.pending = false;
++    }
++    X11Unlisten(w->map); X11Unlisten(w->unmap); X11Unlisten(w->commit);
++}
++static void X11Associate(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, associate);
++    w->map.notify = X11Map; w->unmap.notify = X11Unmap; w->commit.notify = X11Commit;
++    wl_signal_add(&w->window->surface->events.map, &w->map);
++    wl_signal_add(&w->window->surface->events.unmap, &w->unmap);
++    wl_signal_add(&w->window->surface->events.commit, &w->commit);
++}
++static void X11Destroy(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, destroy);
++    X11Dissociate(&w->dissociate, nullptr);
++    X11Unlisten(w->associate); X11Unlisten(w->dissociate); X11Unlisten(w->destroy);
++    X11Unlisten(w->configure); X11Unlisten(w->activate); X11Unlisten(w->fullscreen);
++    xWindows.erase(std::find(xWindows.begin(), xWindows.end(), w)); delete w;
++    X11Select();
++}
++static void X11Configure(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, configure);
++    // C8A is a single focused UI, not a desktop/game window compositor.
++    wlr_xwayland_surface_configure(w->window, 0, 0, g_nPreferredOutputWidth, g_nPreferredOutputHeight);
++}
++static void X11Activate(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, activate);
++    X11Select(w);
++}
++static void X11Fullscreen(wl_listener *listener, void *) {
++    MaliXWindow *w = wl_container_of(listener, w, fullscreen);
++    wlr_xwayland_surface_set_fullscreen(w->window, true);
++    X11Configure(&w->configure, nullptr);
++}
++static void X11Created(wl_listener *, void *data) {
++    auto w = new MaliXWindow{}; w->window = static_cast<wlr_xwayland_surface *>(data);
++    xWindows.push_back(w);
++    w->associate.notify = X11Associate; w->dissociate.notify = X11Dissociate; w->destroy.notify = X11Destroy;
++    w->configure.notify = X11Configure; w->activate.notify = X11Activate; w->fullscreen.notify = X11Fullscreen;
++    wl_signal_add(&w->window->events.associate, &w->associate);
++    wl_signal_add(&w->window->events.dissociate, &w->dissociate);
++    wl_signal_add(&w->window->events.destroy, &w->destroy);
++    wl_signal_add(&w->window->events.request_configure, &w->configure);
++    wl_signal_add(&w->window->events.request_activate, &w->activate);
++    wl_signal_add(&w->window->events.request_fullscreen, &w->fullscreen);
++    if (!w->window->override_redirect) X11Configure(&w->configure, nullptr);
++}
++static void X11Ready(wl_listener *, void *) {
++    server.x11Ready = true;
++    wlr_xwayland_set_seat(server.xwayland, server.seat);
++    std::printf("Mali Steam Xwayland ready: DISPLAY=%s; SHM/software client; no proxy ICD for Steam\n", server.xwayland->display_name);
++}
++static bool StartX11(wlr_compositor *compositor) {
++    x11Stopping = false;
++    wlr_log_init(WLR_ERROR, nullptr); // keep Xwayland startup/crash stderr visible
++    // Advertise geometry to Xwayland/RandR only. No output buffers/rendering here.
++    server.x11Backend = wlr_headless_backend_create(wl_display_get_event_loop(server.display));
++    if (!server.x11Backend) return false;
++    server.x11Output = wlr_headless_add_output(server.x11Backend, g_nPreferredOutputWidth, g_nPreferredOutputHeight);
++    if (!server.x11Output) return false;
++    wlr_output_state state; wlr_output_state_init(&state);
++    wlr_output_state_set_enabled(&state, true);
++    wlr_output_state_set_custom_mode(&state, g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nOutputRefresh);
++    bool ok = wlr_output_commit_state(server.x11Output, &state);
++    wlr_output_state_finish(&state);
++    if (!ok || !wlr_backend_start(server.x11Backend)) return false;
++    wlr_output_create_global(server.x11Output, server.display);
++    // Verified Xwayland switch: disables glamor AND DRI3, forcing SHM client buffers.
++    setenv("XWAYLAND_NO_GLAMOR", "1", 1);
++    server.xwayland = wlr_xwayland_create(server.display, compositor, false);
++    if (!server.xwayland) return false;
++    server.x11ReadyListener.notify = X11Ready; server.x11Created.notify = X11Created;
++    wl_signal_add(&server.xwayland->events.ready, &server.x11ReadyListener);
++    wl_signal_add(&server.xwayland->events.new_surface, &server.x11Created);
++    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    while (!server.x11Ready && !stopped && !failed && std::chrono::steady_clock::now() < deadline) {
++        if (wl_event_loop_dispatch(wl_display_get_event_loop(server.display), 10) < 0) return false;
++        gamescope::IBackend::Get()->PollState(); wl_display_flush_clients(server.display);
++    }
++    if (!server.x11Ready) std::fputs("Mali Steam Xwayland readiness failed/timed out before client launch\n", stderr);
++    return server.x11Ready && !stopped && !failed;
++}
++static void X11Presented() {
++    for (auto w : xWindows) {
++        auto surface = w->window->surface;
++        if (surface == server.surface && !w->presented) {
++            w->presented = true;
++            std::printf("Mali Steam X11 client surface presented: window=0x%x client-pid=%d; Steam UI/sign-in needs visual confirmation\n",
++                w->window->window_id, int(w->window->pid));
++        }
++        if (surface == server.surface) w->dirty = false;
++    }
++}
++static void X11IdleCallbacks() {
++    // A hidden bootstrap/helper window must not stall when the focused UI is idle.
++    // This acknowledges client callbacks only; it does not publish/render output.
++    static std::chrono::steady_clock::time_point next{};
++    auto now = std::chrono::steady_clock::now();
++    if (now < next) return;
++    next = now + std::chrono::nanoseconds(1000000000000ull / g_nOutputRefresh);
++    timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time);
++    for (auto w : xWindows) {
++        auto surface = w->window->surface;
++        if (surface && surface != server.surface && w->dirty) {
++            wlr_surface_send_frame_done(surface, &time); w->dirty = false;
++        }
++    }
++    wl_display_flush_clients(server.display);
++}
++static void StopX11() {
++    x11Stopping = true;
++    X11Unlisten(server.x11ReadyListener); X11Unlisten(server.x11Created);
++    if (server.xwayland) wlr_xwayland_destroy(server.xwayland);
++    server.xwayland = nullptr;
++    // XWM destruction emits surface destroy; defensively detach remaining listeners.
++    while (!xWindows.empty()) X11Destroy(&xWindows.back()->destroy, nullptr);
++    if (server.x11Backend) wlr_backend_destroy(server.x11Backend);
++    server.x11Backend = nullptr; server.x11Output = nullptr;
++}

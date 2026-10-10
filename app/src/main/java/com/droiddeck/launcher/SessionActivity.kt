@@ -389,7 +389,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             val needRuntime = com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.installedVersion(this) == null
             val needDesktop = intent.getStringExtra(SessionService.EXTRA_MODE) == SessionService.MODE_DESKTOP &&
                 !com.droiddeck.launcher.runtime.DesktopCatalog.desktopInstalled(this)
-            val needProton = (intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM) == SessionService.MODE_STEAM &&
+            val needProton = !loadingMali() && (intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM) == SessionService.MODE_STEAM &&
                 com.droiddeck.launcher.runtime.DesktopCatalog.protonSeedNeeded(this)
             if (needRuntime || needDesktop || needProton) installThenStart(needRuntime, needDesktop, needProton)
         }
@@ -733,6 +733,14 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (SessionState.running) SessionState.mode
         else intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM
 
+    private fun loadingMali(): Boolean = if (SessionState.running) SessionState.maliBackend
+        else intent.getBooleanExtra(SessionService.EXTRA_MALI_BACKEND, false) ||
+            loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE ||
+            (loadingMode() == SessionService.MODE_STEAM &&
+                com.droiddeck.launcher.gpu.VulkanInfo.cachedOrNull()?.let {
+                    com.droiddeck.launcher.gpu.MaliSessionSelection.supported(it)
+                } == true)
+
     private fun pausedTitle(): String = when (SessionState.mode) {
         com.droiddeck.launcher.gpu.MaliSessionSelection.MODE -> getString(R.string.session_mali_paused)
         SessionService.MODE_DESKTOP -> getString(R.string.session_desktop_paused)
@@ -956,7 +964,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         // Turnip, not the system Adreno driver: importing the dma-bufs gamescope commits needs
         // VK_EXT_image_drm_format_modifier, which the system driver does not implement.
         val turnip = TurnipDriver(this)
-        val maliSession = loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE
+        val maliSession = loadingMali()
         if (!CompositorHost.isStarted) android.system.Os.setenv("DROIDDECK_MALI_NORMAL_SESSION", if (maliSession) "1" else "0", true)
         val driverId = if (CompositorHost.isStarted || maliSession) null else turnip.install()
 
@@ -1036,6 +1044,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 intent.getStringExtra(SessionService.EXTRA_STEAM_UI),
                 intent.getStringExtra(SessionService.EXTRA_STEAM_URL),
                 intent.getStringArrayExtra(SessionService.EXTRA_PROGRAM_ARGS),
+                maliBackend = loadingMali(),
             )
         }
         applyFrameGen()
@@ -1104,7 +1113,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
      * first use translates the shader chain out of Lossless.dll, which takes seconds.
      */
     private fun applyFrameGen() {
-        if (loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE) {
+        if (loadingMali()) {
             WaylandCompositor.nativeSetFrameGenArmed(false, 0, 0)
             return
         }
@@ -2041,7 +2050,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val endListener: (Int) -> Unit = { status -> onSessionEnded(status) }
     private val firstFrameListener = Runnable {
         SessionEvents.firstFrame()
-        if (SessionState.mode == SessionService.MODE_STEAM) SteamRepair.clientShown(this)
+        if (SessionState.mode == SessionService.MODE_STEAM && !SessionState.maliBackend) SteamRepair.clientShown(this)
         runOnUiThread {
             loading.visible = false
             hud.start()

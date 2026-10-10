@@ -1562,12 +1562,18 @@ class MainActivity : ComponentActivity() {
         val mali = com.droiddeck.launcher.gpu.MaliSessionSelection.supported(gpu)
         if (mali) {
             if (!SessionState.running && SessionState.phase !in setOf(SessionPhase.IDLE, SessionPhase.FAILED)) return false
-            intent.putExtra(SessionService.EXTRA_MODE, com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
-            intent.removeExtra(SessionService.EXTRA_STEAM_UI)
-            intent.removeExtra(SessionService.EXTRA_STEAM_URL)
+            if (steamSession) {
+                // Keep Steam semantics (loading, controller and shutdown), select its backend separately.
+                intent.putExtra(SessionService.EXTRA_MODE, SessionService.MODE_STEAM)
+                intent.putExtra(SessionService.EXTRA_MALI_BACKEND, true)
+            } else {
+                intent.putExtra(SessionService.EXTRA_MODE, com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
+                intent.removeExtra(SessionService.EXTRA_STEAM_UI)
+                intent.removeExtra(SessionService.EXTRA_STEAM_URL)
+            }
         }
         refreshPhantomStatus()
-        if (steamSession && !mali && PhantomProcessLimit.blocksSteam(phantomProcessStatus)) {
+        if (steamSession && PhantomProcessLimit.blocksSteam(phantomProcessStatus)) {
             showPhantomGate = true
             return false
         }

@@ -89,6 +89,9 @@ object SessionState {
     @Volatile
     var mode = "steam"
 
+    /** Backend selection is independent of Steam/desktop UI semantics. */
+    @Volatile var maliBackend = false
+
     /** The size gamescope was told to render at; set by the activity before the service starts. */
     @Volatile
     var outputSize: Pair<Int, Int> = Pair(1920, 1080)
