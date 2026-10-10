@@ -73,6 +73,8 @@ struct vk_session {
             struct dd_perf_rpc perf;
             uint64_t native_ns[4], native_calls[4]; /* submit, timeline, export, sync wait */
             uint64_t cpu_start_ns;
+            struct dd_wait_producer wait_history[DD_WAIT_HISTORY];
+            unsigned wait_history_cursor;
             struct mb_normal_timing previous_android;
         } normal;
         VkDevice handle;
@@ -208,6 +210,7 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 #include "capability_queries.h"
 #include "interop_commands.h"
 #include "submit_commands.h"
+#include "normal_wait_native.h"
 #include "renderer_commands.h"
 #include "session_commands.h"
 #include "normal_commands.h"

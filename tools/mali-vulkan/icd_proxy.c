@@ -112,6 +112,10 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
         dd_perf_add(&s->perf, op, dd_perf_now() - start);
         if (r == VK_SUCCESS && request_bytes >= 20 && op == MB_MEMORY_WRITE) s->perf.upload_bytes += mb_get_u32(request + 16);
         if (r == VK_SUCCESS && request_bytes >= 20 && op == MB_MEMORY_READ) s->perf.download_bytes += mb_get_u32(request + 16);
+        if (r == VK_SUCCESS && request_bytes == 12 && op == MB_RENDERER_DESTROY) {
+            uint32_t kind = mb_get_u32(request + 4);
+            if (kind < DD_PERF_DESTROY_KINDS) ++s->perf.renderer_destroy_kind[kind];
+        }
     }
     return r;
 }
@@ -373,6 +377,8 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
         if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
         if (!strcmp(name, "vkDroidDeckWaylandMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckWaylandMALI;
         if (!strcmp(name, "vkDroidDeckPerformanceMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformanceMALI;
+        if (!strcmp(name, "vkDroidDeckPerformance2MALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformance2MALI;
+        if (!strcmp(name, "vkDroidDeckProfiledWaitMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckProfiledWaitMALI;
         if (!strcmp(name, "vkDroidDeckSessionTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckSessionTEST;
     }
     if (((struct proxy_instance *)instance)->wire_version == MB_RENDERER_VERSION) {

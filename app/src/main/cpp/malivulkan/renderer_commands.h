@@ -137,7 +137,9 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         renderer_destroy_object(d, o); o = NULL; break;
     }
     case MB_RENDERER_COUNTER: case MB_RENDERER_WAIT: {
-        SIZE(op == MB_RENDERER_COUNTER ? 8 : 24);
+        int profiled = op == MB_RENDERER_WAIT && bytes == DD_WAIT_REQUEST_BYTES;
+        SIZE(op == MB_RENDERER_COUNTER ? 8 : profiled ? DD_WAIT_REQUEST_BYTES : 24);
+        if (profiled) REQUIRE(d->normal.enabled && s->wire_version == MB_RENDERER_VERSION && mb_get_u32(w + 24) < DD_WAIT_REASONS);
         struct native_renderer_object *sem = renderer_find(d, id, MB_R_SEMAPHORE); REQUIRE(sem);
         uint64_t value = 0;
         if (op == MB_RENDERER_COUNTER) {
@@ -146,9 +148,26 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         } else {
             value = mb_get_u64(w + 8); uint64_t timeout = mb_get_u64(w + 16); REQUIRE(timeout <= MB_SUBMIT_TIMEOUT_NS);
             VkSemaphoreWaitInfoKHR info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR, .semaphoreCount = 1, .pSemaphores = &sem->handle.semaphore, .pValues = &value};
-            uint64_t perf_start = native_perf_start(d);
-            *result = v->WaitSemaphoresKHR(d->handle, &info, timeout);
-            native_perf_end(d, 1, perf_start);
+            if (profiled) {
+                uint32_t reason = mb_get_u32(w + 24), detail = mb_get_u32(w + 28);
+                if (reason == DD_WAIT_SHM_STAGING_DESTROY) REQUIRE(interop_find_buffer(d, detail));
+                struct dd_wait_sample sample = {0}; sample.last_signal = sem->last_signal;
+                for (unsigned i = 0; i < DD_WAIT_HISTORY; ++i) {
+                    const struct dd_wait_producer *p = &d->normal.wait_history[i];
+                    if (p->semaphore != id || p->value != value) continue;
+                    sample.producer_found = 1; sample.command = p->command; sample.image = p->image;
+                    sample.buffer = p->buffer; sample.memory = p->memory;
+                    sample.descriptor_set = p->descriptor_set; sample.fence = p->fence; break;
+                }
+                *result = native_profiled_wait(v->GetSemaphoreCounterValueKHR, v->WaitSemaphoresKHR, d->handle, &info, timeout, &sample);
+                d->normal.native_ns[1] += sample.wall_ns; ++d->normal.native_calls[1];
+                /* Negative Vulkan errors retain the existing prefix-only reply. */
+                if (*result >= VK_SUCCESS) { dd_wait_encode(reply, &sample); *extra = DD_WAIT_SAMPLE_BYTES; *count = 1; }
+            } else {
+                uint64_t perf_start = native_perf_start(d);
+                *result = v->WaitSemaphoresKHR(d->handle, &info, timeout);
+                native_perf_end(d, 1, perf_start);
+            }
         }
         if (*result == VK_SUCCESS) for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
             struct native_command *c = &d->submit.commands[i];
@@ -322,6 +341,16 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         *result = d->submit.QueueSubmit(queue, 1, &si, f ? f->handle : VK_NULL_HANDLE);
         native_perf_end(d, 0, perf_start);
         if (*result == VK_SUCCESS) { c->state = 3; c->semaphore = sem->id; c->signal_value = value; sem->last_signal = value; c->fence = fid; if (f) f->submitted = 1; }
+        if (*result == VK_SUCCESS && d->normal.enabled) {
+            struct dd_wait_producer *p = &d->normal.wait_history[d->normal.wait_history_cursor++ % DD_WAIT_HISTORY];
+            memset(p, 0, sizeof(*p)); p->value = value; p->semaphore = sem->id; p->command = c->id;
+            p->image = c->image_id ? c->image_id : c->renderer_image_count ? c->renderer_images[0].id : 0;
+            p->descriptor_set = c->descriptor_set; p->fence = fid;
+            for (unsigned i = 0; i < c->ref_count; ++i) {
+                struct native_buffer *b = interop_find_buffer(d, c->refs[i]);
+                if (b) { p->buffer = b->id; p->memory = b->memory; break; }
+            }
+        }
         break;
     }
     case MB_RENDERER_RESET_COMMAND: {

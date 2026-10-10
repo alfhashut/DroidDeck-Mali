@@ -180,4 +180,35 @@ static inline void dd_perf_report_opcodes(FILE *out, const struct dd_perf_rpc *f
         most_category < DD_PERF_CATEGORIES ? dd_perf_category_names[most_category] : "none",
         dd_perf_percent(categories[DD_PERF_RECORDING].ns, total.ns));
 }
+/* These are source resources, not AHB outputs. Requirements queries are
+ * management calls too. MB_RENDERER_DESTROY is split by its successful kind. */
+static inline void dd_perf_report_resources(FILE *out, const struct dd_perf_rpc *frame,
+        const struct dd_perf_rpc *outside, unsigned frames) {
+    const char *names[] = {"SHM-staging-buffer", "memory", "source-image", "image-view", "producer-fence"};
+    uint64_t typed[2] = {0, 0};
+    for (unsigned kind = 0; kind < 5; ++kind) {
+        uint64_t counts[2][3] = {{0, 0, 0}, {0, 0, 0}};
+        for (unsigned phase = 0; phase < 2; ++phase) {
+            const struct dd_perf_rpc *p = phase ? outside : frame;
+            switch (kind) {
+            case 0: counts[phase][0] = p->op[32].count; counts[phase][1] = p->op[34].count; counts[phase][2] = p->op[33].count; break;
+            case 1: counts[phase][0] = p->op[35].count; counts[phase][2] = p->op[36].count; break;
+            case 2: counts[phase][0] = p->op[44].count + p->op[78].count; counts[phase][1] = p->op[46].count; counts[phase][2] = p->op[45].count; break;
+            case 3: counts[phase][0] = p->op[64].count; counts[phase][2] = p->renderer_destroy_kind[2]; break;
+            case 4: counts[phase][0] = p->op[27].count + p->op[54].count; counts[phase][2] = p->op[28].count; break;
+            }
+            typed[phase] += counts[phase][0] + counts[phase][1] + counts[phase][2];
+        }
+        fprintf(out, "MaliPerf resource: type=%s frame-create/query/destroy=%llu/%llu/%llu outside-create/query/destroy=%llu/%llu/%llu frame-management-RPCs/frame=%.2f\n",
+            names[kind], (unsigned long long)counts[0][0], (unsigned long long)counts[0][1], (unsigned long long)counts[0][2],
+            (unsigned long long)counts[1][0], (unsigned long long)counts[1][1], (unsigned long long)counts[1][2],
+            (counts[0][0] + counts[0][1] + counts[0][2]) / (double)(frames ? frames : 1));
+    }
+    struct dd_perf_op categories[DD_PERF_CATEGORIES];
+    dd_perf_categories(frame, categories); uint64_t frame_count = categories[DD_PERF_RESOURCES].count;
+    dd_perf_categories(outside, categories); uint64_t outside_count = categories[DD_PERF_RESOURCES].count;
+    fprintf(out, "MaliPerf resource coverage: typed-frame=%llu other-management-frame=%llu typed-outside=%llu other-management-outside=%llu (memory includes staging and source allocations; outside includes FrameInfo source destruction)\n",
+        (unsigned long long)typed[0], (unsigned long long)(frame_count - typed[0]),
+        (unsigned long long)typed[1], (unsigned long long)(outside_count - typed[1]));
+}
 #endif

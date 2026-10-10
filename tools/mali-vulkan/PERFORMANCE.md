@@ -317,9 +317,14 @@ Check balanced FD/resources, no release timeout and no output read/idle/AHB
 creation in steady windows before interpreting performance.
 For bulk reads, verify opcode/category counts and RTT sums, opcode 40 near
 two calls/frame, in-frame calls near 47/frame, and separate outside-frame STATS.
-Compare mapped/total client RTT per frame, opcode 63 RTT, broker service/CPU
-and FPS across several steady windows. The profiler is phone-validated; this
-bulk-read change still requires CI/phone A/B validation.
+Bulk reads are now phone-validated: **47 in-frame RPCs/frame**, two reads/frame
+and seven mapped-transfer calls/frame. Phone FPS was 26.2/25.2, with later
+steady windows at 23.4/22.6; zero-copy and ~1 ms compositor work remained intact
+with no pool drops. Opcode 63 is now the dominant RTT concern: four calls/frame,
+~2.0–2.3 ms average RTT with occasional ~11 ms spikes. Synchronization accounts
+for ~39–42% of client RTT. These are client RTT observations, not native blocked
+durations. The next change adds attribution only; see
+[wait sites, resource lifetimes and measurement limits](WAIT_ATTRIBUTION.md).
 
 For an instrumented baseline using the original pacing/upload ordering, add
 this line to the existing `/sdcard/Download/droiddeck-env` settings file:
@@ -339,7 +344,7 @@ Cheap local checks, with no project compilation:
 
 ```sh
 cd tools/mali-vulkan
-python3 -B -m unittest -v test_bulk test_perf test_normal.NormalOwnershipTests.test_android_owned_release_timeout_and_restart
+python3 -B -m unittest -v test_wait test_bulk test_perf test_normal.NormalOwnershipTests.test_android_owned_release_timeout_and_restart
 ```
 
 These build only a tiny mocked-clock metric harness and the standalone ownership

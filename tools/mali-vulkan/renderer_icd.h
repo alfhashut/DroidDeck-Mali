@@ -61,6 +61,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_WaitSemaphoresKHR(VkDevice device, c
     uint8_t args[20]; mb_put_u32(args, s->id); mb_put_u64(args + 4, info->pValues[0]); mb_put_u64(args + 12, timeout);
     return renderer_rpc(d, MB_RENDERER_WAIT, args, 20, NULL, 0);
 }
+/* Private normal-session entrypoint. Legacy Vulkan waits retain their exact
+ * 24-byte request and empty reply; profiling only adds reason/sample metadata. */
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckProfiledWaitMALI(VkDevice device,
+        const VkSemaphoreWaitInfoKHR *info, uint64_t timeout, uint32_t reason, uint64_t resource) {
+    if (!device || !info || info->sType != VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR || info->pNext || info->flags || info->semaphoreCount != 1 || !info->pSemaphores || !info->pValues || timeout > MB_SUBMIT_TIMEOUT_NS) return VK_ERROR_FEATURE_NOT_PRESENT;
+    struct proxy_logical *d = (struct proxy_logical *)device; struct proxy_instance *s = d->owner;
+    if (!s->perf_enabled || s->wire_version != MB_RENDERER_VERSION || reason >= DD_WAIT_REASONS) return VK_ERROR_FEATURE_NOT_PRESENT;
+    struct proxy_resource *sem = submit_find(d, (uintptr_t)info->pSemaphores[0], PROXY_SEMAPHORE);
+    if (!sem) return VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t detail = (uint32_t)resource;
+    if (reason == DD_WAIT_SHM_STAGING_DESTROY) {
+        struct proxy_resource *buffer = submit_find(d, (uintptr_t)resource, PROXY_BUFFER);
+        if (!buffer) return VK_ERROR_INITIALIZATION_FAILED;
+        detail = buffer->id;
+    } else if (resource > UINT32_MAX) return VK_ERROR_INITIALIZATION_FAILED;
+    uint8_t request[DD_WAIT_REQUEST_BYTES], reply[MB_PREFIX_BYTES + DD_WAIT_SAMPLE_BYTES]; uint32_t bytes = 0;
+    mb_put_u32(request, d->id); mb_put_u32(request + 4, sem->id); mb_put_u64(request + 8, info->pValues[0]);
+    mb_put_u64(request + 16, timeout); mb_put_u32(request + 24, reason); mb_put_u32(request + 28, detail);
+    pthread_mutex_lock(&s->lock);
+    uint64_t before_rpc = s->perf.op[MB_RENDERER_WAIT].ns;
+    VkResult r = rpc(s, MB_RENDERER_WAIT, request, sizeof(request), reply, &bytes, sizeof(reply));
+    uint64_t rtt = s->perf.op[MB_RENDERER_WAIT].ns - before_rpc;
+    struct dd_wait_sample sample; int available = 0;
+    if (r >= VK_SUCCESS && bytes == sizeof(reply) && mb_get_u32(reply + 8) == 1) {
+        dd_wait_decode(reply + MB_PREFIX_BYTES, &sample); available = 1;
+    } else if (r >= VK_SUCCESS || (bytes && (bytes != MB_PREFIX_BYTES || mb_get_u32(reply + 8) != 0))) {
+        shutdown(s->fd, SHUT_RDWR); r = VK_ERROR_INITIALIZATION_FAILED;
+    }
+    dd_wait_add(&s->perf.wait[reason], rtt, sem->id, info->pValues[0], detail, (uint32_t)r, available ? &sample : NULL);
+    pthread_mutex_unlock(&s->lock);
+    return r;
+}
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateSampler(VkDevice device, const VkSamplerCreateInfo *ci, const VkAllocationCallbacks *a, VkSampler *out) {
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
     *out = VK_NULL_HANDLE;

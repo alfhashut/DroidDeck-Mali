@@ -21,7 +21,7 @@ def added_file(patch, name):
 
 class PerformanceTests(unittest.TestCase):
     def test_header_copies_and_wire_unchanged(self):
-        for name in ('normal_api.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_protocol.h', 'renderer_protocol.h', 'interop_protocol.h'):
+        for name in ('normal_api.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'mali_wait_profile.hpp', 'normal_protocol.h', 'renderer_protocol.h', 'interop_protocol.h'):
             self.assertEqual(added_file(PATCH, name), (ROOT / name).read_text(), name)
         self.assertNotIn('Performance', (ROOT / 'normal_protocol.h').read_text())
         local = (ROOT / 'interop_icd.h').read_text().split('proxy_DroidDeckPerformanceMALI', 1)[1].split('proxy_DroidDeckWaylandMALI', 1)[0]
@@ -55,6 +55,61 @@ class PerformanceTests(unittest.TestCase):
         for category, expected in categories.items():
             self.assertEqual({int(number) for _, c, number in table if c == category}, expected, category)
 
+    def test_snapshot_legacy_size_and_extended_attribution(self):
+        with tempfile.TemporaryDirectory(prefix='mali-snapshot-') as directory:
+            root = Path(directory)
+            functions = (ROOT / 'interop_icd.h').read_text().split(
+                'static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckPerformanceMALI', 1)[1].split(
+                'static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckWaylandMALI', 1)[0]
+            (root / 'snapshot.inc').write_text(
+                'static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckPerformanceMALI' + functions)
+            (root / 'snapshot.c').write_text(r'''
+#include <assert.h>
+#include <string.h>
+#include <pthread.h>
+#include "normal_perf.h"
+#define VKAPI_ATTR
+#define VKAPI_CALL
+#define VK_SUCCESS 0
+#define VK_ERROR_INITIALIZATION_FAILED -3
+#define VK_ERROR_FEATURE_NOT_PRESENT -8
+#define MB_RENDERER_VERSION 7
+typedef int VkResult;
+typedef unsigned VkBool32;
+typedef void *VkDevice;
+struct proxy_instance { int perf_enabled, wire_version; pthread_mutex_t lock; struct dd_perf_rpc perf; };
+struct proxy_logical { struct proxy_instance *owner; };
+#include "snapshot.inc"
+int main(void) {
+    struct proxy_instance s = {.perf_enabled = 1, .wire_version = 7, .lock = PTHREAD_MUTEX_INITIALIZER};
+    struct proxy_logical d = {&s};
+    struct { struct dd_perf_op op[DD_PERF_OPS]; uint64_t upload_bytes, download_bytes, canary; } old = {0};
+    assert(offsetof(struct dd_perf_rpc, wait) == offsetof(__typeof__(old), canary));
+    old.canary = UINT64_C(0x123456789abcdef0);
+    s.perf.upload_bytes = 100; s.perf.wait[1].count = 4; s.perf.renderer_destroy_kind[2] = 2;
+    assert(proxy_DroidDeckPerformanceMALI(&d, (struct dd_perf_rpc *)&old, 0) == VK_SUCCESS);
+    assert(old.upload_bytes == 100 && old.canary == UINT64_C(0x123456789abcdef0));
+    struct dd_perf_rpc out = {0};
+    assert(proxy_DroidDeckPerformance2MALI(&d, &out, 1) == VK_SUCCESS);
+    assert(out.upload_bytes == 100 && out.wait[1].count == 4 && out.renderer_destroy_kind[2] == 2);
+    assert(!s.perf.upload_bytes && !s.perf.wait[1].count && !s.perf.renderer_destroy_kind[2]);
+    s.perf.wait[2].count = 1;
+    assert(proxy_DroidDeckPerformanceMALI(&d, (struct dd_perf_rpc *)&old, 1) == VK_SUCCESS);
+    assert(!s.perf.wait[2].count && old.canary == UINT64_C(0x123456789abcdef0));
+    assert(proxy_DroidDeckPerformance2MALI(0, &out, 0) == VK_ERROR_INITIALIZATION_FAILED);
+    s.perf_enabled = 0;
+    assert(proxy_DroidDeckPerformance2MALI(&d, &out, 0) == VK_ERROR_FEATURE_NOT_PRESENT);
+}
+''')
+            binary = root / 'snapshot'
+            subprocess.run(shlex.split(os.environ.get('HOST_CC', 'cc')) + [
+                '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-O0', '-Wall', '-Wextra', '-Werror',
+                '-I' + str(root), '-I' + str(ROOT), str(root / 'snapshot.c'),
+                '-pthread', '-o', str(binary)], check=True, timeout=15)
+            subprocess.run([str(binary)], check=True, timeout=2)
+        normal = added_file(PATCH, 'mali_normal.inc')
+        self.assertLess(normal.index('"vkDroidDeckPerformance2MALI"'), normal.index('"vkDroidDeckPerformanceMALI"'))
+
     def test_normal_frame_scope_and_safe_optimizations(self):
         main = added_file(PATCH, 'mali_normal.cpp')
         frame = main.split('if (server.pending && server.surface', 1)[1].split('if (now - progress', 1)[0]
@@ -79,7 +134,7 @@ class PerformanceTests(unittest.TestCase):
         # includes rendervulkan.cpp, Vulkan headers, the ICD, or native broker.
         with tempfile.TemporaryDirectory(prefix='mali-perf-') as directory:
             root = Path(directory)
-            for name in ('mali_normal_perf.inc', 'normal_perf.h', 'normal_opcode_perf.h', 'renderer_protocol.h', 'interop_protocol.h'):
+            for name in ('mali_normal_perf.inc', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'renderer_protocol.h', 'interop_protocol.h'):
                 (root / name).write_text(added_file(PATCH, name))
             wrapper = (ROOT / 'icd_proxy.c').read_text().split('static VkResult rpc(struct proxy_instance *s,', 1)[1].split('static void proxy_free_logical', 1)[0]
             (root / 'rpc_metric.inc').write_text('static VkResult rpc(struct proxy_instance *s,' + wrapper)
@@ -99,6 +154,7 @@ static int fake_clock_gettime(clockid_t clock, timespec *t) {
 #include "normal_perf.h"
 #include "mali_output_pool.hpp"
 #include "interop_protocol.h"
+#include "renderer_protocol.h"
 using VkResult = int;
 static constexpr int VK_SUCCESS = 0;
 struct proxy_instance { int perf_enabled = 1; dd_perf_rpc perf{}; };
@@ -112,6 +168,7 @@ static uint32_t mb_get_u32(const uint8_t *p) { return p[0] | uint32_t(p[1]) << 8
 #define MB_NORMAL_STATS 91u
 #define MB_NORMAL_PUBLISH 89u
 static dd_perf_rpc pending;
+static bool maliWaitProfilingActive;
 static int snapshot(int, dd_perf_rpc *out, int reset) { *out = pending; if (reset) pending = {}; return 0; }
 static struct { int device() { return 1; } } g_device;
 static struct { MaliOutputPool ownership; unsigned late = 0; decltype(&snapshot) performance = snapshot; } normalOutput;

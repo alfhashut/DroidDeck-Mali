@@ -343,6 +343,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckPerformanceMALI(VkDevice de
     struct proxy_instance *s = ((struct proxy_logical *)device)->owner;
     if (!s->perf_enabled || s->wire_version != MB_RENDERER_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     pthread_mutex_lock(&s->lock);
+    /* Preserve the original snapshot ABI for older Gamescope assets. */
+    memcpy(out, &s->perf, offsetof(struct dd_perf_rpc, wait));
+    if (reset) memset(&s->perf, 0, sizeof(s->perf));
+    pthread_mutex_unlock(&s->lock);
+    return VK_SUCCESS;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckPerformance2MALI(VkDevice device, struct dd_perf_rpc *out, VkBool32 reset) {
+    if (!device || !out) return VK_ERROR_INITIALIZATION_FAILED;
+    struct proxy_instance *s = ((struct proxy_logical *)device)->owner;
+    if (!s->perf_enabled || s->wire_version != MB_RENDERER_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
+    pthread_mutex_lock(&s->lock);
     *out = s->perf;
     if (reset) memset(&s->perf, 0, sizeof(s->perf));
     pthread_mutex_unlock(&s->lock);

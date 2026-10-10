@@ -170,6 +170,8 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL proxy_GetDeviceProcAddr(VkDevice
 #undef MB_INTEROP_ENTRY
         if (!strcmp(name, "vkDroidDeckWaylandMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckWaylandMALI;
         if (!strcmp(name, "vkDroidDeckPerformanceMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformanceMALI;
+        if (!strcmp(name, "vkDroidDeckPerformance2MALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformance2MALI;
+        if (!strcmp(name, "vkDroidDeckProfiledWaitMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckProfiledWaitMALI;
         if (!strcmp(name, "vkDroidDeckInteropTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckInteropTEST;
         if (!strcmp(name, "vkDroidDeckSessionTEST")) return (PFN_vkVoidFunction)proxy_DroidDeckSessionTEST;
     }
