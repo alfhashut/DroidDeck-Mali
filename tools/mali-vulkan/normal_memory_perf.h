@@ -18,6 +18,7 @@ struct dd_write_row {
 };
 struct dd_memory_profile {
     uint64_t report, lookups, visited, max_visit, submit_nodes, submit_live, submit_mapped, submits;
+    uint64_t owned_records, live_index, active_records, retired_records;
     struct dd_write_row row[DD_WRITE_ROLES][DD_WRITE_PHASES];
 };
 static inline void dd_memory_write(struct dd_memory_profile *p, unsigned role, uint32_t id,
@@ -50,11 +51,13 @@ static inline void dd_memory_report(struct dd_memory_profile *p, FILE *out, uint
             (unsigned long long)r->offset, (unsigned long long)r->length,
             (unsigned long long)r->min_length, (unsigned long long)r->max_length, (unsigned long long)r->full);
     }
-    fprintf(out, "MaliPerf proxy-lifetime: write-calls=%llu requested-data-bytes=%llu handle-lookups=%llu nodes-visited=%llu lookup-avg/max=%.2f/%llu last-submit-nodes/live/mapped=%llu/%llu/%llu submits=%llu (existing traversals only; dead records retained until device cleanup; independent 2s proxy window)\n",
+    fprintf(out, "MaliPerf proxy-lifetime: write-calls=%llu requested-data-bytes=%llu handle-lookups=%llu nodes-visited=%llu lookup-avg/max=%.2f/%llu last-submit-nodes/live/mapped=%llu/%llu/%llu submits=%llu owned-records=%llu live-index=%llu active-traversal=%llu retired-records=%llu (lookups probe live hash entries; submit visits active nodes only; retired storage retained until device cleanup; registry gauges for snapshot device; independent 2s proxy window)\n",
         (unsigned long long)calls, (unsigned long long)bytes, (unsigned long long)p->lookups,
         (unsigned long long)p->visited, p->lookups ? p->visited / (double)p->lookups : 0, (unsigned long long)p->max_visit,
         (unsigned long long)p->submit_nodes, (unsigned long long)p->submit_live,
-        (unsigned long long)p->submit_mapped, (unsigned long long)p->submits);
+        (unsigned long long)p->submit_mapped, (unsigned long long)p->submits,
+        (unsigned long long)p->owned_records, (unsigned long long)p->live_index,
+        (unsigned long long)p->active_records, (unsigned long long)p->retired_records);
     memset(p, 0, sizeof(*p)); p->report = now;
 }
 #endif

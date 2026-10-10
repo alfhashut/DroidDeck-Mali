@@ -69,6 +69,8 @@ class PerformanceTests(unittest.TestCase):
 #include <pthread.h>
 #include "normal_perf.h"
 #include "normal_memory_perf.h"
+typedef uintptr_t VK_LOADER_DATA;
+#include "resource_registry.h"
 #define VKAPI_ATTR
 #define VKAPI_CALL
 #define VK_SUCCESS 0
@@ -79,11 +81,12 @@ typedef int VkResult;
 typedef unsigned VkBool32;
 typedef void *VkDevice;
 struct proxy_instance { int perf_enabled, wire_version; pthread_mutex_t lock; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; };
-struct proxy_logical { struct proxy_instance *owner; };
+struct proxy_logical { struct proxy_instance *owner; struct proxy_registry registry; };
 #include "snapshot.inc"
 int main(void) {
     struct proxy_instance s = {.perf_enabled = 1, .wire_version = 7, .lock = PTHREAD_MUTEX_INITIALIZER};
-    struct proxy_logical d = {&s};
+    struct proxy_logical d = {.owner = &s};
+    d.registry.owned_count = 100; d.registry.indexed_count = d.registry.active_count = 76;
     struct { struct dd_perf_op op[DD_PERF_OPS]; uint64_t upload_bytes, download_bytes, canary; } old = {0};
     assert(offsetof(struct dd_perf_rpc, wait) == offsetof(__typeof__(old), canary));
     old.canary = UINT64_C(0x123456789abcdef0);
@@ -93,6 +96,8 @@ int main(void) {
     struct dd_perf_rpc out = {0};
     assert(proxy_DroidDeckPerformance2MALI(&d, &out, 1) == VK_SUCCESS);
     assert(out.upload_bytes == 100 && out.wait[1].count == 4 && out.renderer_destroy_kind[2] == 2);
+    assert(s.memory_perf.owned_records == 100 && s.memory_perf.live_index == 76);
+    assert(s.memory_perf.active_records == 76 && s.memory_perf.retired_records == 24);
     assert(!s.perf.upload_bytes && !s.perf.wait[1].count && !s.perf.renderer_destroy_kind[2]);
     s.perf.wait[2].count = 1;
     assert(proxy_DroidDeckPerformanceMALI(&d, (struct dd_perf_rpc *)&old, 1) == VK_SUCCESS);

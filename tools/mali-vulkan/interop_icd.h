@@ -16,7 +16,7 @@ static VkResult interop_rpc(struct proxy_logical *d, uint32_t op, const uint8_t 
 }
 static void interop_publish(struct proxy_logical *d, struct proxy_resource *o, enum proxy_resource_kind kind, uint32_t id) {
     set_loader_magic_value(o); o->owner = d; o->kind = kind; o->id = id; o->live = 1;
-    pthread_mutex_lock(&d->owner->lock); o->next = d->resources; d->resources = o; pthread_mutex_unlock(&d->owner->lock);
+    pthread_mutex_lock(&d->owner->lock); proxy_registry_insert(&d->registry, o); pthread_mutex_unlock(&d->owner->lock);
 }
 static VkResult interop_new(struct proxy_logical *d, uint32_t op, enum proxy_resource_kind kind, const uint8_t *args, uint32_t n, struct proxy_resource **out) {
     *out = NULL; struct proxy_resource *o = calloc(1, sizeof(*o)); if (!o) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -52,7 +52,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_Destroy##Name(VkDevice device, Type hand
     struct proxy_logical *d = (struct proxy_logical *)device; struct proxy_resource *o = submit_find(d, (uintptr_t)handle, KIND); \
     uint8_t args[4]; VkResult r = VK_ERROR_INITIALIZATION_FAILED; \
     if (o && !a) { mb_put_u32(args, o->id); r = interop_rpc(d, OP, args, 4, NULL, 0); } \
-    if (r == VK_SUCCESS) { o->live = 0; } submit_void_error(d, "vkDestroy" #Name, r); \
+    if (r == VK_SUCCESS) { submit_retire(d, o); } submit_void_error(d, "vkDestroy" #Name, r); \
 }
 INTEROP_DESTROY(Buffer, VkBuffer, PROXY_BUFFER, MB_BUFFER_DESTROY)
 INTEROP_DESTROY(Image, VkImage, PROXY_IMAGE, MB_IMAGE_DESTROY)
@@ -81,7 +81,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_FreeMemory(VkDevice device, VkDeviceMemo
     if (!device || !memory) return;
     struct proxy_logical *d = (struct proxy_logical *)device; struct proxy_resource *o = submit_find(d, (uintptr_t)memory, PROXY_MEMORY); VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (o && !a && !o->mirror) { uint8_t args[4]; mb_put_u32(args, o->id); r = interop_rpc(d, MB_MEMORY_FREE, args, 4, NULL, 0); }
-    if (r == VK_SUCCESS) { o->live = 0; } submit_void_error(d, "vkFreeMemory", r);
+    if (r == VK_SUCCESS) { submit_retire(d, o); } submit_void_error(d, "vkFreeMemory", r);
 }
 static VkResult interop_bind(VkDevice device, uintptr_t handle, enum proxy_resource_kind kind, uint32_t op, VkDeviceMemory memory, VkDeviceSize offset) {
     if (!device) return VK_ERROR_INITIALIZATION_FAILED;
@@ -96,15 +96,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_BindBufferMemory(VkDevice d, VkBuffe
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_BindImageMemory(VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize o) { return interop_bind(d, (uintptr_t)im, PROXY_IMAGE, MB_IMAGE_BIND, m, o); }
 /* Keep the connection locked until every chunk has an exact success/error ACK.
  * QueueSubmit is sent only after this returns success for every coherent map.
+ * Caller holds the lock; the ordinary mapping wrapper acquires it below.
  * Reuse one bounded request buffer; no large stack buffer or per-chunk malloc. */
-static VkResult interop_upload_mapping(struct proxy_resource *m, uint64_t offset, uint64_t size) {
+static VkResult interop_upload_mapping_locked(struct proxy_resource *m, uint64_t offset, uint64_t size) {
     struct proxy_logical *d = m->owner;
     if (!d || d->owner->wire_version < MB_INTEROP_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     struct proxy_instance *s = d->owner;
     uint32_t limit = mb_interop_write_limit(s->wire_version);
     uint32_t capacity = MB_MEMORY_WRITE_HEADER + (size > limit ? limit : (uint32_t)size);
     VkResult r = VK_SUCCESS;
-    pthread_mutex_lock(&s->lock);
     if (d->write_capacity < capacity) {
         uint8_t *request = realloc(d->write_request, capacity);
         if (!request) { r = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
@@ -131,7 +131,6 @@ static VkResult interop_upload_mapping(struct proxy_resource *m, uint64_t offset
         n += length;
     }
 done:
-    pthread_mutex_unlock(&s->lock);
     return r;
 }
 /* Stage each complete reply before changing the mirror. A malformed/truncated
@@ -168,9 +167,18 @@ done:
     pthread_mutex_unlock(&s->lock);
     return r;
 }
+static VkResult interop_copy_upload_locked(struct proxy_resource *m, uint64_t offset, uint64_t size) {
+    if (!m || !m->mirror || !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, offset, size)) return VK_ERROR_INITIALIZATION_FAILED;
+    return interop_upload_mapping_locked(m, offset, size);
+}
 static VkResult interop_copy_mapping(struct proxy_resource *m, uint64_t offset, uint64_t size, int upload) {
     if (!m || !m->mirror || !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, offset, size)) return VK_ERROR_INITIALIZATION_FAILED;
-    return upload ? interop_upload_mapping(m, offset, size) : interop_download_mapping(m, offset, size);
+    if (!upload) return interop_download_mapping(m, offset, size);
+    if (!m->owner) return VK_ERROR_FEATURE_NOT_PRESENT;
+    pthread_mutex_lock(&m->owner->owner->lock);
+    VkResult result = interop_copy_upload_locked(m, offset, size);
+    pthread_mutex_unlock(&m->owner->owner->lock);
+    return result;
 }
 /* Only the private upload-only staging API may suppress the initial download. */
 static VkResult interop_map_memory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void **out, int download) {
@@ -304,7 +312,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckInteropTEST(VkDevice device
     }
     struct proxy_resource *a = NULL, *sync = NULL;
     pthread_mutex_lock(&d->owner->lock);
-    for (struct proxy_resource *o = d->resources; o; o = o->next) if (o->live) {
+    for (struct proxy_resource *o = d->registry.active; o; o = o->active_next) {
         if (o->kind == PROXY_AHB && o->id == in->token) a = o;
         if (o->kind == PROXY_SYNC && o->id == in->sync) sync = o;
     }
@@ -313,10 +321,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckInteropTEST(VkDevice device
         if (!sync) return VK_ERROR_INITIALIZATION_FAILED;
         mb_put_u32(args, sync->id); mb_put_u32(args + 4, 5000);
         r = interop_rpc(d, op == DD_SYNC_WAIT ? MB_SYNC_WAIT : MB_SYNC_CLOSE, args, op == DD_SYNC_WAIT ? 8 : 4, NULL, 0);
-        if (r == VK_SUCCESS && op == DD_SYNC_CLOSE) sync->live = 0;
+        if (r == VK_SUCCESS && op == DD_SYNC_CLOSE) submit_retire(d, sync);
     } else if (op == DD_AHB_RELEASE) {
         if (!a) return VK_ERROR_INITIALIZATION_FAILED;
-        mb_put_u32(args, a->id); r = interop_rpc(d, MB_AHB_RELEASE, args, 4, NULL, 0); if (r == VK_SUCCESS) a->live = 0;
+        mb_put_u32(args, a->id); r = interop_rpc(d, MB_AHB_RELEASE, args, 4, NULL, 0); if (r == VK_SUCCESS) submit_retire(d, a);
     } else if (op == DD_AHB_INSPECT || op == DD_AHB_PRESENT) {
         if (!a || !sync) return VK_ERROR_INITIALIZATION_FAILED;
         mb_put_u32(args, a->id); mb_put_u32(args + 4, sync->id); mb_put_u32(args + 8, in->pattern);
@@ -367,6 +375,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckPerformance2MALI(VkDevice d
     struct proxy_instance *s = ((struct proxy_logical *)device)->owner;
     if (!s->perf_enabled || s->wire_version != MB_RENDERER_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     pthread_mutex_lock(&s->lock);
+    const struct proxy_registry *registry = &((struct proxy_logical *)device)->registry;
+    s->memory_perf.owned_records = registry->owned_count;
+    s->memory_perf.live_index = registry->indexed_count;
+    s->memory_perf.active_records = registry->active_count;
+    s->memory_perf.retired_records = registry->owned_count - registry->active_count;
     dd_memory_report(&s->memory_perf, stderr, dd_perf_now());
     *out = s->perf;
     if (reset) memset(&s->perf, 0, sizeof(s->perf));

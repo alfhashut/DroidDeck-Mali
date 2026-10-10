@@ -1,33 +1,14 @@
 /* Local opaque resources and a loader-dispatchable primary command buffer. */
-enum proxy_resource_kind { PROXY_POOL, PROXY_COMMAND, PROXY_EVENT, PROXY_FENCE, PROXY_BUFFER, PROXY_MEMORY, PROXY_IMAGE, PROXY_AHB, PROXY_SYNC, PROXY_SEMAPHORE, PROXY_VIEW, PROXY_SAMPLER, PROXY_SET_LAYOUT, PROXY_PIPELINE_LAYOUT, PROXY_DESCRIPTOR_POOL, PROXY_DESCRIPTOR_SET, PROXY_SHADER, PROXY_PIPELINE };
-struct proxy_resource {
-    VK_LOADER_DATA loader;
-    struct proxy_logical *owner;
-    struct proxy_resource *next;
-    uint32_t id, pool, image_id; /* image_id is view metadata for diagnostic logs */
-    enum proxy_resource_kind kind;
-    atomic_int live;
-    uint8_t *mirror;
-    uint64_t allocation, map_offset, map_size;
-    /* Explicit normal staging opt-in; ordinary coherent mappings are unchanged. */
-    uint32_t staging_managed, staging_command;
-    /* Profiling metadata only; never used for validation or memory transport. */
-    uint32_t profile_usage, profile_upload;
-};
-_Static_assert(offsetof(struct proxy_resource, loader) == 0, "command buffer dispatch word");
 static void proxy_free_resources(struct proxy_logical *d) {
     free(d->write_request); d->write_request = NULL; d->write_capacity = 0;
     free(d->read_reply); d->read_reply = NULL; d->read_capacity = 0;
-    while (d->resources) { struct proxy_resource *next = d->resources->next; free(d->resources->mirror); free(d->resources); d->resources = next; }
+    proxy_registry_cleanup(&d->registry);
 }
 static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t handle, enum proxy_resource_kind kind) {
     struct proxy_resource *found = NULL;
     pthread_mutex_lock(&d->owner->lock);
     uint64_t visited = 0;
-    for (struct proxy_resource *o = d->resources; o; o = o->next) {
-        if (d->owner->perf_enabled) ++visited;
-        if ((uintptr_t)o == handle && o->kind == kind && o->live) { found = o; break; }
-    }
+    found = proxy_registry_find(&d->registry, handle, kind, &visited);
     if (d->owner->perf_enabled) {
         struct dd_memory_profile *p = &d->owner->memory_perf;
         ++p->lookups; p->visited += visited;
@@ -35,6 +16,12 @@ static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t han
     }
     pthread_mutex_unlock(&d->owner->lock);
     return found;
+}
+/* Logical retirement occurs only after the existing successful native ACK. */
+static void submit_retire(struct proxy_logical *d, struct proxy_resource *o) {
+    pthread_mutex_lock(&d->owner->lock);
+    proxy_registry_retire(&d->registry, o);
+    pthread_mutex_unlock(&d->owner->lock);
 }
 static VkResult submit_rpc(struct proxy_logical *d, uint32_t op, const uint32_t *args, unsigned n,
         uint64_t timeout, uint32_t *id) {
@@ -66,7 +53,7 @@ static VkResult submit_new(struct proxy_logical *d, uint32_t op, enum proxy_reso
     set_loader_magic_value(o); o->owner = d; o->kind = kind; o->live = 1;
     if (kind == PROXY_COMMAND) o->pool = args[0];
     pthread_mutex_lock(&d->owner->lock);
-    o->next = d->resources; d->resources = o; *out = o;
+    proxy_registry_insert(&d->registry, o); *out = o;
     pthread_mutex_unlock(&d->owner->lock);
     return VK_SUCCESS;
 }
@@ -93,10 +80,8 @@ static VKAPI_ATTR void VKAPI_CALL proxy_DestroyCommandPool(VkDevice device, VkCo
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (o && !a) { uint32_t args[] = {o->id}; r = submit_rpc(d, MB_POOL_DESTROY, args, 1, 0, NULL); }
     if (r == VK_SUCCESS) {
-        o->live = 0;
         pthread_mutex_lock(&d->owner->lock);
-        for (struct proxy_resource *c = d->resources; c; c = c->next)
-            if (c->kind == PROXY_COMMAND && c->pool == o->id) c->live = 0;
+        proxy_registry_retire_children(&d->registry, o, PROXY_COMMAND);
         pthread_mutex_unlock(&d->owner->lock);
     }
     submit_void_error(d, "vkDestroyCommandPool", r);
@@ -121,7 +106,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_FreeCommandBuffers(VkDevice device, VkCo
     struct proxy_resource *c = count == 1 && buffers ? submit_find(d, (uintptr_t)buffers[0], PROXY_COMMAND) : NULL;
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (p && c && c->pool == p->id) { uint32_t args[] = {p->id, c->id}; r = submit_rpc(d, MB_COMMAND_FREE, args, 2, 0, NULL); }
-    if (r == VK_SUCCESS) c->live = 0;
+    if (r == VK_SUCCESS) submit_retire(d, c);
     submit_void_error(d, "vkFreeCommandBuffers", r);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_BeginCommandBuffer(VkCommandBuffer command, const VkCommandBufferBeginInfo *bi) {
@@ -170,7 +155,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_Destroy##Name(VkDevice device, Vk##Name 
     struct proxy_logical *d = (struct proxy_logical *)device; \
     struct proxy_resource *o = submit_find(d, (uintptr_t)handle, KIND); VkResult r = VK_ERROR_INITIALIZATION_FAILED; \
     if (o && !a) { uint32_t args[] = {o->id}; r = submit_rpc(d, DESTROY, args, 1, 0, NULL); } \
-    if (r == VK_SUCCESS) o->live = 0; \
+    if (r == VK_SUCCESS) submit_retire(d, o); \
     submit_void_error(d, "vkDestroy" #Name, r); \
 } \
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_Get##Name##Status(VkDevice device, Vk##Name handle) { \

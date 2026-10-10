@@ -74,7 +74,7 @@ int main() {
 
     def test_actual_handle_lookup_traversal_and_disabled_path(self):
         source = (ROOT / 'submit_icd.h').read_text()
-        finder = 'static struct proxy_resource *submit_find' + source.split('static struct proxy_resource *submit_find', 1)[1].split('static VkResult submit_rpc', 1)[0]
+        finder = 'static struct proxy_resource *submit_find' + source.split('static struct proxy_resource *submit_find', 1)[1].split('/* Logical retirement', 1)[0]
         with tempfile.TemporaryDirectory(prefix='mali-lookup-') as directory:
             root = Path(directory)
             (root / 'finder.inc').write_text(finder)
@@ -82,20 +82,23 @@ int main() {
 #include <assert.h>
 #include <pthread.h>
 #include "normal_memory_perf.h"
-enum proxy_resource_kind { PROXY_MEMORY };
-struct proxy_resource { struct proxy_resource *next; enum proxy_resource_kind kind; int live; };
+typedef uintptr_t VK_LOADER_DATA;
+#include "resource_registry.h"
 struct proxy_instance { pthread_mutex_t lock; int perf_enabled; struct dd_memory_profile memory_perf; };
-struct proxy_logical { struct proxy_instance *owner; struct proxy_resource *resources; };
+struct proxy_logical { struct proxy_instance *owner; struct proxy_registry registry; };
 #include "finder.inc"
 int main(void) {
     struct proxy_instance s = {.lock=PTHREAD_MUTEX_INITIALIZER,.perf_enabled=1};
-    struct proxy_resource tail={.live=1}, dead={.next=&tail};
-    struct proxy_logical d={&s,&dead};
+    struct proxy_resource tail={.kind=PROXY_MEMORY}, dead={.kind=PROXY_MEMORY};
+    struct proxy_logical d={.owner=&s};
+    proxy_registry_insert(&d.registry, &tail); proxy_registry_insert(&d.registry, &dead);
+    proxy_registry_retire(&d.registry, &dead);
     assert(submit_find(&d,(uintptr_t)&tail,PROXY_MEMORY)==&tail);
     assert(!submit_find(&d,(uintptr_t)&dead,PROXY_MEMORY));
-    assert(s.memory_perf.lookups==2 && s.memory_perf.visited==4 && s.memory_perf.max_visit==2);
+    assert(s.memory_perf.lookups==2 && s.memory_perf.visited<=2 && s.memory_perf.max_visit<=1);
+    uint64_t visited=s.memory_perf.visited;
     s.perf_enabled=0; assert(submit_find(&d,(uintptr_t)&tail,PROXY_MEMORY)==&tail);
-    assert(s.memory_perf.lookups==2 && s.memory_perf.visited==4);
+    assert(s.memory_perf.lookups==2 && s.memory_perf.visited==visited);
     pthread_mutex_destroy(&s.lock);
 }
 ''')

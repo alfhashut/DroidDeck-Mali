@@ -1,5 +1,6 @@
 /* Opt-in lifecycle subset. Local dispatchable objects contain broker IDs only. */
 #include <stdatomic.h>
+#include "resource_registry.h"
 struct proxy_queue {
     VK_LOADER_DATA loader;
     uint32_t id;
@@ -12,7 +13,7 @@ struct proxy_logical {
     struct proxy_logical *next;
     uint32_t id, family, count;
     struct proxy_queue queues[MB_DEVICE_MAX_QUEUES];
-    struct proxy_resource *resources;
+    struct proxy_registry registry;
     uint8_t *write_request; /* connection-lock protected, reused by mapped uploads */
     uint32_t write_capacity;
     uint8_t *read_reply; /* connection-lock protected, reused by mapped reads */

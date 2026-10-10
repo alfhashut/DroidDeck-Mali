@@ -40,15 +40,9 @@ typedef struct { int sType; const void *pNext; unsigned waitSemaphoreValueCount,
 typedef struct { int sType; const void *pNext; unsigned waitSemaphoreCount, commandBufferCount, signalSemaphoreCount; void **pCommandBuffers, **pSignalSemaphores; } VkSubmitInfo;
 typedef struct { int sType; void *memory; uint64_t offset, size; } VkMappedMemoryRange;
 struct proxy_instance { pthread_mutex_t lock; uint32_t wire_version; int fd, perf_enabled; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; } connection;
-enum proxy_resource_kind { PROXY_MEMORY, PROXY_COMMAND, PROXY_SEMAPHORE, PROXY_FENCE, PROXY_BUFFER };
-struct proxy_logical;
-struct proxy_resource {
-    struct proxy_logical *owner; struct proxy_resource *next;
-    uint32_t id, pool; enum proxy_resource_kind kind; int live;
-    uint8_t *mirror; uint64_t allocation, map_offset, map_size;
-    uint32_t staging_managed, staging_command, profile_usage, profile_upload;
-};
-struct proxy_logical { struct proxy_instance *owner; uint32_t id; struct proxy_resource *resources; uint8_t *write_request, *read_reply; uint32_t write_capacity, read_capacity; uint64_t map_alignment; atomic_int submit_failed; } device;
+typedef uintptr_t VK_LOADER_DATA;
+#include "resource_registry.h"
+struct proxy_logical { struct proxy_instance *owner; uint32_t id; struct proxy_registry registry; uint8_t *write_request, *read_reply; uint32_t write_capacity, read_capacity; uint64_t map_alignment; atomic_int submit_failed; } device;
 struct proxy_queue { uint32_t id; struct proxy_logical *owner; } queue;
 struct native_memory { uint32_t id, ahb, type; uint64_t size, map_offset, map_size; void *map, *handle; } memories[3];
 struct native_interop {
@@ -63,7 +57,7 @@ struct native_device { void *handle; struct native_interop interop; } native;
 static int pending, fail_write, fail_read, bad_ack, bad_read, fail_alloc, disconnects;
 static uint32_t pending_memory;
 static unsigned writes, reads, submits, allocations, memory_maps, memory_unmaps;
-static struct proxy_resource command, semaphore;
+static struct proxy_resource *command_ptr, *semaphore_ptr;
 static struct native_memory *interop_find_memory(struct native_device *d, uint32_t id) {
     (void)d; for (unsigned i = 0; i < 3; ++i) if (memories[i].id == id && id) return &memories[i]; return NULL;
 }
@@ -90,7 +84,7 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
         memset(reply, 0, MB_PREFIX_BYTES); *reply_bytes = MB_PREFIX_BYTES; return VK_SUCCESS;
     }
     if (op == MB_RENDERER_SUBMIT) {
-        for (struct proxy_resource *m = device.resources; m; m = m->next) if ((m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && (!m->staging_managed || m->staging_command == command.id)) {
+        for (struct proxy_resource *m = device.registry.active; m; m = m->active_next) if ((m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && (!m->staging_managed || m->staging_command == command_ptr->id)) {
             struct native_memory *n = interop_find_memory(&native, m->id);
             assert(n && !memcmp(n->map, m->mirror, (size_t)m->map_size));
         }
@@ -133,9 +127,7 @@ static void *test_realloc(void *ptr, size_t size) { ++allocations; return fail_a
 #include "upload.inc"
 #undef realloc
 #undef shutdown
-static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t handle, enum proxy_resource_kind kind) {
-    struct proxy_resource *r = (struct proxy_resource *)handle; return r && r->owner == d && r->live && r->kind == kind ? r : NULL;
-}
+#include "finder.inc"
 static VkResult renderer_rpc(struct proxy_logical *d, uint32_t op, const uint8_t *args, uint32_t n, uint8_t *out, uint32_t expected) {
     (void)args; (void)n; (void)out; (void)expected; uint8_t reply[MB_PREFIX_BYTES]; uint32_t bytes = 0;
     pthread_mutex_lock(&d->owner->lock); VkResult r = rpc(d->owner, op, NULL, 0, reply, &bytes, sizeof(reply));
@@ -154,27 +146,30 @@ static void setup(uint32_t version) {
     connection.wire_version = version; connection.perf_enabled = 1; assert(!pthread_mutex_init(&connection.lock, NULL));
     device.owner = &connection; device.id = 1; queue.owner = &device; queue.id = 1;
     native.interop.properties.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-    command.id = 10; command.kind = PROXY_COMMAND; command.owner = &device; command.live = 1;
-    semaphore.id = 11; semaphore.kind = PROXY_SEMAPHORE; semaphore.owner = &device; semaphore.live = 1;
+    command_ptr = calloc(1, sizeof(*command_ptr)); semaphore_ptr = calloc(1, sizeof(*semaphore_ptr));
+    assert(command_ptr && semaphore_ptr);
+    command_ptr->id = 10; command_ptr->kind = PROXY_COMMAND; command_ptr->owner = &device; command_ptr->live = 1;
+    semaphore_ptr->id = 11; semaphore_ptr->kind = PROXY_SEMAPHORE; semaphore_ptr->owner = &device; semaphore_ptr->live = 1;
+    proxy_registry_insert(&device.registry, command_ptr); proxy_registry_insert(&device.registry, semaphore_ptr);
 }
 static struct proxy_resource *mapping(unsigned i, uint64_t size, uint64_t base) {
     struct proxy_resource *m = calloc(1, sizeof(*m)); assert(m);
     m->owner = &device; m->id = i + 1; m->kind = PROXY_MEMORY; m->live = 1; m->pool = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     m->allocation = base + size + 64; m->map_offset = base; m->map_size = size; m->mirror = malloc((size_t)size); assert(m->mirror);
     for (uint64_t n = 0; n < size; ++n) m->mirror[n] = (uint8_t)(n * 31 + i);
-    m->next = device.resources; device.resources = m;
+    proxy_registry_insert(&device.registry, m);
     memories[i] = (struct native_memory){.id = m->id, .size = m->allocation, .map_offset = base, .map_size = size, .map = calloc(1, (size_t)size)};
     assert(memories[i].map); return m;
 }
 static VkResult submit_with_fence(VkFence fence) {
-    uint64_t value = submits + 1; void *c = &command, *s = &semaphore;
+    uint64_t value = submits + 1; void *c = command_ptr, *s = semaphore_ptr;
     VkTimelineSemaphoreSubmitInfoKHR timeline = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &value};
     VkSubmitInfo info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &timeline, .commandBufferCount = 1, .pCommandBuffers = &c, .signalSemaphoreCount = 1, .pSignalSemaphores = &s};
     return renderer_QueueSubmit(&queue, 1, &info, fence);
 }
 static VkResult submit(void) { return submit_with_fence(NULL); }
 static void finish(void) {
-    proxy_free_resources(&device); assert(!device.resources && !device.write_request && !device.write_capacity);
+    proxy_free_resources(&device); assert(!device.registry.owned && !device.write_request && !device.write_capacity);
     assert(!device.read_reply && !device.read_capacity);
     proxy_free_resources(&device); // Repeated cleanup also leaves no scratch buffer.
     for (unsigned i = 0; i < 3; ++i) free(memories[i].handle ? memories[i].handle : memories[i].map);
@@ -220,12 +215,12 @@ static void persistent_staging(void) {
     stage->pool = 0;
     assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_ERROR_INITIALIZATION_FAILED);
     stage->pool = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_ERROR_INITIALIZATION_FAILED);
+    assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_ERROR_INITIALIZATION_FAILED);
     assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_SUCCESS);
     assert(proxy_DroidDeckStagingMALI(&device, idle, NULL) == VK_SUCCESS);
     assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_ERROR_INITIALIZATION_FAILED);
-    assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_SUCCESS);
-    assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_ERROR_INITIALIZATION_FAILED);
+    assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_SUCCESS);
+    assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_ERROR_INITIALIZATION_FAILED);
     assert(submit() == VK_SUCCESS && submits == 1 && writes == 2 && !stage->staging_command);
     assert(!memcmp(stage->mirror, memories[1].map, stage->map_size));
     // R must not upload either staging map, especially its pending predecessor U.
@@ -234,11 +229,11 @@ static void persistent_staging(void) {
     assert(submit() == VK_SUCCESS && submits == 2 && writes == 3 && !reads);
     assert(!memcmp(stage->mirror, memories[1].map, stage->map_size));
     pending_memory = 0; stage->mirror[stage->map_size - 1] ^= 0xff;
-    assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_SUCCESS);
+    assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_SUCCESS);
     assert(submit() == VK_SUCCESS && submits == 3 && writes == 5);
     // Faulty arming cannot bypass the unchanged broker pending-memory guard.
     pending_memory = stage->id;
-    assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_SUCCESS);
+    assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_SUCCESS);
     assert(submit() == VK_ERROR_INITIALIZATION_FAILED && submits == 3 && stage->staging_command);
     pending_memory = 0; bad_ack = 3;
     assert(submit() == VK_ERROR_INITIALIZATION_FAILED && submits == 3 && stage->staging_command);
@@ -279,7 +274,7 @@ static void persistent_map_case(int staging) {
         // The caller's pool proved the previous U complete before this full copy.
         assert(!pending_memory);
         memset(pointer, (int)frame, 230400);
-        assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_SUCCESS);
+        assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_SUCCESS);
         assert(submit() == VK_SUCCESS);
         assert(!memcmp(pointer, memories[1].map, 230400));
         pending_memory = stage->id;
@@ -325,17 +320,21 @@ static void write_profile(void) {
     setup(7);
     struct proxy_resource *uniform = mapping(0, 524288, 0), *stage = mapping(1, 230400, 0);
     uniform->allocation = uniform->map_size; stage->allocation = stage->map_size;
-    struct proxy_resource buffer = {.id=20, .kind=PROXY_BUFFER, .owner=&device, .live=1, .profile_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
-    assert(interop_bind(&device, (uintptr_t)&buffer, PROXY_BUFFER, MB_BUFFER_BIND, uniform, 0) == VK_SUCCESS);
+    struct proxy_resource *buffer = calloc(1, sizeof(*buffer)); assert(buffer);
+    buffer->id=20; buffer->kind=PROXY_BUFFER; buffer->owner=&device; buffer->profile_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    proxy_registry_insert(&device.registry, buffer);
+    assert(interop_bind(&device, (uintptr_t)buffer, PROXY_BUFFER, MB_BUFFER_BIND, uniform, 0) == VK_SUCCESS);
     assert(uniform->profile_usage == VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    struct proxy_resource fence = {.id=21, .kind=PROXY_FENCE, .owner=&device, .live=1};
+    struct proxy_resource *fence = calloc(1, sizeof(*fence)); assert(fence);
+    fence->id=21; fence->kind=PROXY_FENCE; fence->owner=&device;
+    proxy_registry_insert(&device.registry, fence);
     assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_SUCCESS);
     for (unsigned frame=0; frame<40; ++frame) {
         memset(stage->mirror, (int)frame, (size_t)stage->map_size);
-        assert(proxy_DroidDeckStagingMALI(&device, stage, &command) == VK_SUCCESS);
+        assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_SUCCESS);
         assert(submit() == VK_SUCCESS);
         pending_memory = stage->id;
-        assert(submit_with_fence(&fence) == VK_SUCCESS); pending_memory = 0;
+        assert(submit_with_fence(fence) == VK_SUCCESS); pending_memory = 0;
     }
     struct dd_memory_profile *p = &connection.memory_perf;
     struct dd_write_row *shm = &p->row[DD_WRITE_STAGING][DD_WRITE_U];
@@ -366,6 +365,40 @@ static void profile_disabled(void) {
     assert(submit() == VK_SUCCESS && writes == 1 && submits == 1);
     assert(!memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
     assert(!connection.perf.upload_bytes && !connection.memory_perf.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].calls);
+    finish();
+}
+/* 5000 simulated frames: actual registry/find/upload/submit helpers, tiny
+ * payloads. Retired coherent mappings would fail native lookup if visited. */
+static void registry_submit(void) {
+    setup(7);
+    struct proxy_resource *uniform = mapping(0, 64, 0), *stage = mapping(1, 64, 0), *idle = mapping(2, 64, 0);
+    stage->allocation=stage->map_size; idle->allocation=idle->map_size;
+    assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_SUCCESS);
+    assert(proxy_DroidDeckStagingMALI(&device, idle, NULL) == VK_SUCCESS);
+    for (unsigned frame=0; frame<5000; ++frame) {
+        for (unsigned i=0; i<4; ++i) {
+            struct proxy_resource *dead = calloc(1, sizeof(*dead)); assert(dead);
+            dead->owner=&device; dead->kind=i ? PROXY_IMAGE : PROXY_MEMORY; dead->id=99;
+            if (!i) { dead->pool=VK_MEMORY_PROPERTY_HOST_COHERENT_BIT; dead->allocation=dead->map_size=8; dead->mirror=calloc(1, 8); assert(dead->mirror); }
+            pthread_mutex_lock(&connection.lock);
+            proxy_registry_insert(&device.registry, dead); proxy_registry_retire(&device.registry, dead);
+            pthread_mutex_unlock(&connection.lock);
+            assert(!submit_find(&device, (uintptr_t)dead, dead->kind));
+            assert(dead->id==99 && !dead->live); // Storage remains safe for retained references.
+        }
+        assert(device.registry.active_count==5 && device.registry.indexed_count==5);
+        assert(submit_find(&device, (uintptr_t)uniform, PROXY_MEMORY)==uniform);
+        assert(submit_find(&device, (uintptr_t)idle, PROXY_MEMORY)==idle);
+        assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr)==VK_SUCCESS);
+        memset(stage->mirror, (int)frame, 64);
+        assert(submit()==VK_SUCCESS);
+        pending_memory=stage->id; assert(submit()==VK_SUCCESS); pending_memory=0;
+        assert(connection.memory_perf.submit_nodes==5 && connection.memory_perf.submit_live==5 && connection.memory_perf.submit_mapped==3);
+        assert(connection.memory_perf.max_visit<=5);
+    }
+    assert(device.registry.owned_count==20005 && device.registry.active_count==5);
+    assert(writes==15000 && submits==10000 && !reads && !memory_maps && !memory_unmaps);
+    assert(connection.perf.op[MB_MEMORY_WRITE].count==15000 && connection.perf.op[MB_RENDERER_SUBMIT].count==10000);
     finish();
 }
 static void read_bulk(void) {
@@ -509,6 +542,7 @@ static void legacy(void) {
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strcmp(argv[1], "bulk")) bulk();
+    else if (!strcmp(argv[1], "registry_submit")) registry_submit();
     else if (!strcmp(argv[1], "read_bulk")) read_bulk();
     else if (!strcmp(argv[1], "read_errors")) read_errors();
     else if (!strcmp(argv[1], "ordering")) ordering();

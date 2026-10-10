@@ -5,6 +5,12 @@ The current instrumentation-only pass is documented in
 stages, all three mapped-write ranges, and context for the time-dependent
 slowdown. Its baseline is the phone-validated 60 Hz, 34-RPC/frame path.
 
+Phone attribution subsequently confirmed retained resource records in hot
+traversals as the sustained slowdown. The focused
+[live resource registry fix](RESOURCE_REGISTRY.md) separates retained ownership
+storage from live hash lookup and active traversal, keeping the same RPCs and
+Vulkan behavior. Its performance result awaits the next phone run.
+
 Phone profiling supplied for CP7P identifies mapped-memory RPC traffic as the
 first major bottleneck: **416 RPCs/frame**, two queue submissions/frame. The
 Android compositor reported 93 GPU/zero-copy frames in ten seconds (9.3 FPS),
@@ -41,9 +47,8 @@ this change leaves all waits and synchronization untouched. Source audit:
   are created/closed each frame. The three AHB outputs, connection, upload buffer,
   renderer, pipeline and descriptor infrastructure persist. Resource counts in
   the reports expose this churn; reuse needs a separate correctness review.
-  Freed proxy wrapper tombstones remain in the connection's resource list;
-  handle lookups/submission scan that list. Longer-run host CPU measurements
-  should check this cost before attempting safe wrapper reclamation.
+  Retired proxy wrapper storage remains until device cleanup; the new live
+  index and active list exclude it from handle lookup and submission scans.
 - Routine output readbacks, pixel checks, selected-frame hashes and command logs
   are already disabled in normal mode. Diagnostic paths retain them. The two
   timeline waits (completion and command retirement), real producer SYNC_FD wait,

@@ -102,12 +102,14 @@ The exclusive wall/thread-CPU rows distinguish growing local execution from
 off-CPU time, then locate the affected stage. Existing RTT and native wait
 reports remain intact to identify synchronous waits within those stages.
 
-`MaliPerf proxy-lifetime` counts existing `submit_find` lookups and nodes
-visited, average/max traversal length, and the last submit's total/live/mapped
-record counts. Destroyed proxy records remain linked until device cleanup;
-increasing traversal cost is a source-grounded candidate to measure, not a
-proven explanation. Counters piggyback existing walks and locks: no added
-resource scan, query RPC or mutex acquisition.
+`MaliPerf proxy-lifetime` counts `submit_find` lookups and nodes visited,
+average/max traversal length, and the last submit's active/live/mapped records.
+Phone results confirmed increasing historical-list traversal as the sustained
+slowdown. The subsequent [live registry fix](RESOURCE_REGISTRY.md) excludes
+retired records from hot lookup/submit walks, while retaining their storage
+until device cleanup. Owned/live-index/active/retired gauges distinguish those
+lifetimes. Counters piggyback existing walks and the local snapshot lock;
+there is no added resource scan or query RPC.
 
 At each report boundary, `MaliPerf host-context` samples process CPU delta,
 the current compositor core, and that core's `scaling_cur_freq` if readable.

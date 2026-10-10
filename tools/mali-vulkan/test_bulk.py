@@ -46,6 +46,8 @@ class BulkMemoryTests(unittest.TestCase):
         (build / 'metric.inc').write_text('static VkResult rpc(struct proxy_instance *s,' + metric)
         cleanup = (ROOT / 'submit_icd.h').read_text().split('static void proxy_free_resources', 1)[1].split('static struct proxy_resource *submit_find', 1)[0]
         (build / 'cleanup.inc').write_text('static void proxy_free_resources' + cleanup)
+        finder = (ROOT / 'submit_icd.h').read_text().split('static struct proxy_resource *submit_find', 1)[1].split('/* Logical retirement', 1)[0]
+        (build / 'finder.inc').write_text('static struct proxy_resource *submit_find' + finder)
         cls.binary = build / 'bulk'
         subprocess.run(shlex.split(os.environ.get('HOST_CC', 'cc')) + [
             '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-O0', '-Wall', '-Wextra', '-Werror',
@@ -80,6 +82,9 @@ class BulkMemoryTests(unittest.TestCase):
 
     def test_disabled_write_profiling_keeps_transport_identical(self):
         self.run_case('profile_disabled')
+
+    def test_5000_frames_submit_discovers_only_live_persistent_mappings(self):
+        self.run_case('registry_submit')
 
     def test_bulk_reads_exact_bytes_minimum_chunks_and_reply_reuse(self):
         self.run_case('read_bulk')

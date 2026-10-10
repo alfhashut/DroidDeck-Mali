@@ -23,7 +23,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_Destroy##Name(VkDevice device, Vk##Name 
     struct proxy_logical *d = (struct proxy_logical *)device; struct proxy_resource *o = submit_find(d, (uintptr_t)handle, KIND); \
     VkResult r = VK_ERROR_INITIALIZATION_FAILED; uint8_t args[8]; \
     if (o && !a) { mb_put_u32(args, RKIND); mb_put_u32(args + 4, o->id); r = renderer_rpc(d, MB_RENDERER_DESTROY, args, 8, NULL, 0); } \
-    if (r == VK_SUCCESS) { o->live = 0; if (RKIND == MB_R_POOL) { pthread_mutex_lock(&d->owner->lock); for (struct proxy_resource *set = d->resources; set; set = set->next) if (set->kind == PROXY_DESCRIPTOR_SET && set->pool == o->id) set->live = 0; pthread_mutex_unlock(&d->owner->lock); } } \
+    if (r == VK_SUCCESS) { pthread_mutex_lock(&d->owner->lock); if (RKIND == MB_R_POOL) proxy_registry_retire_children(&d->registry, o, PROXY_DESCRIPTOR_SET); else proxy_registry_retire(&d->registry, o); pthread_mutex_unlock(&d->owner->lock); } \
     submit_void_error(d, "vkDestroy" #Name, r); \
 }
 R_DESTROY(Semaphore, PROXY_SEMAPHORE, MB_R_SEMAPHORE)
@@ -252,7 +252,10 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
     if (d->submit_failed) return (VkResult)atomic_load(&d->submit_failed);
     /* Persistently mapped coherent upload data must reach the REAL mapped allocation. */
     uint64_t nodes = 0, live = 0, mapped = 0;
-    for (struct proxy_resource *m = d->resources; m; m = m->next) {
+    /* Active links mutate on retirement. Keep the connection lock throughout
+     * discovery/uploads; the locked helper uses the identical ACK/range path. */
+    pthread_mutex_lock(&d->owner->lock);
+    for (struct proxy_resource *m = d->registry.active; m; m = m->active_next) {
         int is_live = m->live;
         if (d->owner->perf_enabled) {
             ++nodes; live += !!is_live; mapped += is_live && m->kind == PROXY_MEMORY && m->mirror;
@@ -263,11 +266,12 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
             if (m->staging_managed && m->staging_command != c->id) continue;
             unsigned previous_phase = dd_memory_submit_phase;
             dd_memory_submit_phase = c->profile_upload ? DD_WRITE_U : f ? DD_WRITE_R : DD_WRITE_OUTSIDE;
-            VkResult r = interop_copy_mapping(m, m->map_offset, m->map_size, 1);
+            VkResult r = interop_copy_upload_locked(m, m->map_offset, m->map_size);
             dd_memory_submit_phase = previous_phase;
-            if (r != VK_SUCCESS) return r;
+            if (r != VK_SUCCESS) { pthread_mutex_unlock(&d->owner->lock); return r; }
         }
     }
+    pthread_mutex_unlock(&d->owner->lock);
     uint8_t args[24]; uint32_t fields[] = {q->id, c->id, f ? f->id : 0, s->id}; for (unsigned i = 0; i < 4; ++i) mb_put_u32(args + i * 4, fields[i]); mb_put_u64(args + 16, t->pSignalSemaphoreValues[0]);
     VkResult result = renderer_rpc(d, MB_RENDERER_SUBMIT, args, 24, NULL, 0);
     if (result == VK_SUCCESS) {
@@ -277,7 +281,7 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
             d->owner->memory_perf.submit_mapped = mapped; ++d->owner->memory_perf.submits;
         }
         c->profile_upload = 0;
-        for (struct proxy_resource *m = d->resources; m; m = m->next)
+        for (struct proxy_resource *m = d->registry.active; m; m = m->active_next)
             if (m->staging_managed && m->staging_command == c->id) m->staging_command = 0;
         pthread_mutex_unlock(&d->owner->lock);
     }
