@@ -12,13 +12,15 @@
 #define DD_PERF_DESTROY_KINDS 10u
 /* These names describe actual source actions, not guessed GPU dependencies. */
 enum dd_wait_reason {
-    DD_WAIT_UNATTRIBUTED, DD_WAIT_SHM_STAGING_DESTROY, DD_WAIT_DESCRIPTOR_REUSE,
+    DD_WAIT_UNATTRIBUTED, DD_WAIT_SHM_STAGING_REUSE, DD_WAIT_DESCRIPTOR_REUSE,
     DD_WAIT_OUTPUT_COMPLETION, DD_WAIT_OUTPUT_RETIRE, DD_WAIT_REASONS
 };
 static const char *const dd_wait_names[DD_WAIT_REASONS] = {
-    "unattributed-device-wait", "shm-upload-staging-destroy", "descriptor-set-reuse",
+    "unattributed-device-wait", "shm-staging-slot-reuse", "descriptor-set-reuse",
     "output-producer-completion", "output-command-retirement"
 };
+/* Preserve metadata reason ID 1 and snapshot layout for existing assets. */
+#define DD_WAIT_SHM_STAGING_DESTROY DD_WAIT_SHM_STAGING_REUSE
 struct dd_wait_sample {
     uint64_t before, wall_ns, cpu_ns, query_ns, last_signal;
     uint32_t command, image, buffer, memory, descriptor_set, fence, before_result, producer_found;

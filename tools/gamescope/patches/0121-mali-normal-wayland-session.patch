@@ -829,7 +829,7 @@
 +int mali_interactive_main();
 --- a/src/mali_normal.inc
 +++ b/src/mali_normal.inc
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,161 @@
 +/* Normal nested Wayland AHB output. Compiled in the real Gamescope renderer TU. */
 +#include "mali_normal.hpp"
 +#include "mali_output_pool.hpp"
@@ -869,6 +869,8 @@
 +}
 +#include "mali_normal_perf.inc"
 +bool vulkan_mali_normal_init(unsigned width, unsigned height) {
++    MaliRequire(maliStaging.live() == 0, "normal staging survived previous session");
++    maliCompletedTimeline.reset(); maliLocalWaits = {}; maliStaging.stats = {}; maliStaging.cursor = 0; maliWaitProfilingActive = false;
 +    normalOutput = {}; normalPerf = {}; normalOutput.width = width; normalOutput.height = height;
 +    if (!MaliInitializeRenderer(true)) return false;
 +    normalOutput.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
@@ -949,8 +951,13 @@
 +    return 0;
 +}
 +int vulkan_mali_normal_stop() {
-+    maliWaitProfilingActive = false;
 +    auto &s = normalOutput; s.stopping = true;
++    VkResult stagingDrain = (VkResult)maliStaging.shutdown();
++    if (stagingDrain != VK_SUCCESS) {
++        std::fprintf(stderr, "normal staging drain FAILED: retained slots=%u VkResult=%d; no PASS\n", maliStaging.live(), int(stagingDrain));
++        g_device.FailMaliDiagnostic("normal staging drain", stagingDrain);
++    }
++    maliWaitProfilingActive = false;
 +    if (!s.begun) { g_device.ShutdownMaliDiagnostic(); return 1; }
 +    mali_normal_detach_output();
 +    VkResult end = NormalRPC(MB_NORMAL_END);
@@ -979,6 +986,7 @@
 +        MaliRequire(count != 0, "normal physical inventory after device destruction");
 +        std::puts("normal native device/implicit queue destruction acknowledged; baseline devices=0 queues=0");
 +    };
++    maliCompletedTimeline.reset();
 +    g_device.ShutdownMaliDiagnostic(); s_maliSessionCheckCleanup = nullptr; s_maliSessionCheckDestroyed = nullptr;
 +    std::printf("normal session stopped: rendered=%u committed=%u released=%u release timeouts=%u; clean teardown\n", s.rendered, s.presented, s.released, s.timeouts);
 +    return 0;
@@ -1064,7 +1072,7 @@
 +#include "mali_normal.inc"
 --- a/src/mali_normal_perf.inc
 +++ b/src/mali_normal_perf.inc
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,143 @@
 +/* Normal session only. Fixed-size counters; formatting/sorting once per 2 s. */
 +#include <algorithm>
 +#include "renderer_protocol.h"
@@ -1191,6 +1199,17 @@
 +    std::printf("MaliPerf wait coverage: opcode63=%llu attributed=%llu (missing attribution is not assumed satisfied; native off-CPU is an estimate, not GPU execution)\n",
 +        (unsigned long long)(p.rpc.op[MB_RENDERER_WAIT].count + p.outside.op[MB_RENDERER_WAIT].count), (unsigned long long)attributed);
 +    dd_perf_report_resources(stdout, &p.rpc, &p.outside, p.frames);
++    for (unsigned i = 0; i < DD_WAIT_REASONS; ++i) {
++        std::printf("MaliPerf local-wait: wait-reason=%s requests=%llu locally-completed=%llu forwarded=%llu requests/frame=%.2f forwarded/frame=%.2f\n",
++            dd_wait_names[i], (unsigned long long)maliLocalWaits.requests[i], (unsigned long long)maliLocalWaits.skipped[i],
++            (unsigned long long)maliLocalWaits.forwarded[i], maliLocalWaits.requests[i] / double(p.frames ? p.frames : 1),
++            maliLocalWaits.forwarded[i] / double(p.frames ? p.frames : 1));
++    }
++    auto &staging = maliStaging.stats;
++    std::printf("MaliPerf staging: hits=%llu misses=%llu reuse-waits=%llu resources-created=%llu resized=%llu failures=%llu live=%u limit=3 (buffer+memory pairs; window totals)\n",
++        (unsigned long long)staging.hits, (unsigned long long)staging.misses, (unsigned long long)staging.waits,
++        (unsigned long long)staging.created, (unsigned long long)staging.resized, (unsigned long long)staging.failures, maliStaging.live());
++    maliLocalWaits = {}; staging = {};
 +    std::fflush(stdout); // Pipe-backed session logs must not hold a report until exit.
 +    unsigned previous = stats.presented; uint64_t lastEnd = p.lastEnd;
 +    bool waiting = p.waitingOutput;
@@ -1592,7 +1611,7 @@
 +#endif
 --- a/src/normal_wait_perf.h
 +++ b/src/normal_wait_perf.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,110 @@
 +/* Normal-only attribution. Optional metadata on opcode 63; no new opcode. */
 +#ifndef DD_NORMAL_WAIT_PERF_H
 +#define DD_NORMAL_WAIT_PERF_H
@@ -1607,13 +1626,15 @@
 +#define DD_PERF_DESTROY_KINDS 10u
 +/* These names describe actual source actions, not guessed GPU dependencies. */
 +enum dd_wait_reason {
-+    DD_WAIT_UNATTRIBUTED, DD_WAIT_SHM_STAGING_DESTROY, DD_WAIT_DESCRIPTOR_REUSE,
++    DD_WAIT_UNATTRIBUTED, DD_WAIT_SHM_STAGING_REUSE, DD_WAIT_DESCRIPTOR_REUSE,
 +    DD_WAIT_OUTPUT_COMPLETION, DD_WAIT_OUTPUT_RETIRE, DD_WAIT_REASONS
 +};
 +static const char *const dd_wait_names[DD_WAIT_REASONS] = {
-+    "unattributed-device-wait", "shm-upload-staging-destroy", "descriptor-set-reuse",
++    "unattributed-device-wait", "shm-staging-slot-reuse", "descriptor-set-reuse",
 +    "output-producer-completion", "output-command-retirement"
 +};
++/* Preserve metadata reason ID 1 and snapshot layout for existing assets. */
++#define DD_WAIT_SHM_STAGING_DESTROY DD_WAIT_SHM_STAGING_REUSE
 +struct dd_wait_sample {
 +    uint64_t before, wall_ns, cpu_ns, query_ns, last_signal;
 +    uint32_t command, image, buffer, memory, descriptor_set, fence, before_result, producer_found;
@@ -1703,12 +1724,34 @@
 +#endif
 --- a/src/mali_wait_profile.hpp
 +++ b/src/mali_wait_profile.hpp
-@@ -0,0 +1,21 @@
-+/* Included only by the renderer TU. Scopes annotate existing waits; they do
-+ * not acquire resources, alter values, wait, reset, or issue RPCs themselves. */
+@@ -0,0 +1,60 @@
++/* Included only by the renderer TU. Normal-only completion knowledge; never
++ * infer completion from submission, elapsed time or Android ownership. */
 +#pragma once
 +#include "normal_api.h"
-+static bool maliWaitProfilingActive = false;
++static thread_local bool maliWaitProfilingActive = false;
++struct MaliCompletedTimeline {
++    VkDevice device{}; VkSemaphore semaphore{}; uint64_t value = 0;
++    VkDevice producerDevice{}; VkSemaphore producerSemaphore{}; uint64_t producerValue = 0;
++    bool valid = false, producerSucceeded = false;
++    void reset() { *this = {}; }
++    bool covers(VkDevice d, VkSemaphore s, uint64_t v) const {
++        return valid && device == d && semaphore == s && v <= value;
++    }
++    void observe(VkDevice d, VkSemaphore s, uint64_t v, VkResult result) {
++        if (!d || !s || result != VK_SUCCESS) return;
++        if (!valid || device != d || semaphore != s) { device = d; semaphore = s; value = v; valid = true; }
++        else if (v > value) value = v;
++    }
++    bool producerCovers(VkDevice d, VkSemaphore s, uint64_t v) const {
++        return producerSucceeded && producerDevice == d && producerSemaphore == s && producerValue == v && covers(d, s, v);
++    }
++};
++static thread_local MaliCompletedTimeline maliCompletedTimeline;
++struct MaliLocalWaitCounters {
++    uint64_t requests[DD_WAIT_REASONS]{}, skipped[DD_WAIT_REASONS]{}, forwarded[DD_WAIT_REASONS]{};
++};
++static thread_local MaliLocalWaitCounters maliLocalWaits;
 +struct MaliWaitContext { uint32_t reason = DD_WAIT_UNATTRIBUTED; uint64_t resource = 0; };
 +static thread_local MaliWaitContext maliWaitContext;
 +struct MaliWaitScope {
@@ -1719,23 +1762,307 @@
 +static VkResult MaliProfiledWait(PFN_vkWaitSemaphores original, PFN_vkGetDeviceProcAddr lookup,
 +        VkDevice device, const VkSemaphoreWaitInfo *info, uint64_t timeout) {
 +    if (!maliWaitProfilingActive) return original(device, info, timeout);
++    const unsigned reason = maliWaitContext.reason;
++    const bool single = info && info->sType == VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO && !info->pNext && !info->flags && info->semaphoreCount == 1 && info->pSemaphores && info->pValues;
++    if (reason < DD_WAIT_REASONS) ++maliLocalWaits.requests[reason];
++    if (reason == DD_WAIT_OUTPUT_COMPLETION) maliCompletedTimeline.producerSucceeded = false;
++    const bool reusable = reason == DD_WAIT_DESCRIPTOR_REUSE || reason == DD_WAIT_SHM_STAGING_REUSE;
++    if (single && ((reusable && maliCompletedTimeline.covers(device, info->pSemaphores[0], info->pValues[0])) ||
++        (reason == DD_WAIT_OUTPUT_RETIRE && maliCompletedTimeline.producerCovers(device, info->pSemaphores[0], info->pValues[0])))) {
++        ++maliLocalWaits.skipped[reason]; return VK_SUCCESS;
++    }
++    if (reason < DD_WAIT_REASONS) ++maliLocalWaits.forwarded[reason];
 +    static auto profiled = reinterpret_cast<PFN_vkDroidDeckProfiledWaitMALI>(lookup(device, "vkDroidDeckProfiledWaitMALI"));
 +    // Mixed/older assets keep the real wait. The aggregate coverage reports
 +    // missing attribution instead of guessing a reason or claiming native data.
-+    if (!profiled) return original(device, info, timeout);
-+    return profiled(device, info, timeout, maliWaitContext.reason, maliWaitContext.resource);
++    VkResult result = profiled ? profiled(device, info, timeout, reason, maliWaitContext.resource) : original(device, info, timeout);
++    if (single) {
++        maliCompletedTimeline.observe(device, info->pSemaphores[0], info->pValues[0], result);
++        if (reason == DD_WAIT_OUTPUT_COMPLETION && result == VK_SUCCESS) {
++            maliCompletedTimeline.producerDevice = device; maliCompletedTimeline.producerSemaphore = info->pSemaphores[0];
++            maliCompletedTimeline.producerValue = info->pValues[0]; maliCompletedTimeline.producerSucceeded = true;
++        }
++    }
++    return result;
 +}
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
-@@ -16,0 +17 @@
+@@ -16,0 +17,2 @@
 +#include "mali_wait_profile.hpp"
-@@ -1436 +1437,2 @@
++#include "mali_staging_pool.hpp"
+@@ -1436 +1438,2 @@
 -		vk_check( vk.WaitSemaphores( device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
 +		MaliWaitScope site(DD_WAIT_DESCRIPTOR_REUSE, uIndex);
 +		vk_check( MaliProfiledWait( vk.WaitSemaphores, vk.GetDeviceProcAddr, device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
-@@ -1605 +1607 @@
+@@ -1453 +1456,3 @@
+-	vk_check( vk.GetSemaphoreCounterValue( device(), m_scratchTimelineSemaphore, &ulSeqNo ) );
++	VkResult result = vk.GetSemaphoreCounterValue( device(), m_scratchTimelineSemaphore, &ulSeqNo );
++	if (maliWaitProfilingActive) maliCompletedTimeline.observe(device(), m_scratchTimelineSemaphore, ulSeqNo, result);
++	vk_check( result );
+@@ -1605 +1610 @@
 -	vk_check( vk.WaitSemaphores( device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
 +	vk_check( MaliProfiledWait( vk.WaitSemaphores, vk.GetDeviceProcAddr, device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
-@@ -4927 +4929 @@
+@@ -2055 +2060 @@
+-			.dstAccessMask = flush ? 0u : (m_device->IsMaliDiagnostic() && !image->MaliStorageImage() ? read_bits | VK_ACCESS_TRANSFER_WRITE_BIT : read_bits | write_bits),
++			.dstAccessMask = maliStagingUploadRecording && flush && !image->externalImage() ? VK_ACCESS_SHADER_READ_BIT : flush ? 0u : (m_device->IsMaliDiagnostic() && !image->MaliStorageImage() ? read_bits | VK_ACCESS_TRANSFER_WRITE_BIT : read_bits | write_bits),
+@@ -4818,0 +4824,2 @@
++#include "mali_staging.inc"
++
+@@ -4841,46 +4848,63 @@
+-	VkBufferCreateInfo bufferCreateInfo = {
+-		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+-		.size = stride * height,
+-		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+-	};
+-	VkBuffer buffer;
+-	result = g_device.vk.CreateBuffer( g_device.device(), &bufferCreateInfo, nullptr, &buffer );
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkCreateBuffer SHM upload", result);
+-		return nullptr;
+-	}
+-
+-	VkMemoryRequirements memRequirements;
+-	g_device.vk.GetBufferMemoryRequirements(g_device.device(), buffer, &memRequirements);
+-
+-	uint32_t memTypeIndex =  g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
+-	if ( memTypeIndex == ~0u )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("SHM HOST_VISIBLE/COHERENT memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+-		return nullptr;
+-	}
+-
+-	VkMemoryAllocateInfo allocInfo = {
+-		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-		.allocationSize = memRequirements.size,
+-		.memoryTypeIndex = memTypeIndex,
+-	};
+-
+-	VkDeviceMemory bufferMemory;
+-	result = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &bufferMemory);
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkAllocateMemory SHM upload", result);
+-		return nullptr;
+-	}
+-
+-	result = g_device.vk.BindBufferMemory( g_device.device(), buffer, bufferMemory, 0 );
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkBindBufferMemory SHM upload", result);
+-		return nullptr;
++	MaliStagingPool<MaliStagingBackend>::Lease staging;
++	VkBuffer buffer = VK_NULL_HANDLE;
++	VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
++	if (maliWaitProfilingActive) {
++		if (!height || !stride || stride > UINT64_MAX / height) {
++			wlr_buffer_end_data_ptr_access(buf);
++			g_device.FailMaliDiagnostic("normal SHM staging range overflow", VK_ERROR_INITIALIZATION_FAILED);
++			return nullptr;
++		}
++		result = (VkResult)maliStaging.acquire(uint64_t(stride) * height, staging.slot);
++		if (result != VK_SUCCESS) {
++			wlr_buffer_end_data_ptr_access(buf);
++			g_device.FailMaliDiagnostic("normal SHM staging acquire", result);
++			return nullptr;
++		}
++		buffer = staging.slot->resource.buffer; bufferMemory = staging.slot->resource.memory;
++	} else {
++		VkBufferCreateInfo bufferCreateInfo = {
++			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++			.size = stride * height,
++			.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++		};
++		result = g_device.vk.CreateBuffer( g_device.device(), &bufferCreateInfo, nullptr, &buffer );
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkCreateBuffer SHM upload", result);
++			return nullptr;
++		}
++
++		VkMemoryRequirements memRequirements;
++		g_device.vk.GetBufferMemoryRequirements(g_device.device(), buffer, &memRequirements);
++
++		uint32_t memTypeIndex =  g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
++		if ( memTypeIndex == ~0u )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("SHM HOST_VISIBLE/COHERENT memory type", VK_ERROR_FEATURE_NOT_PRESENT);
++			return nullptr;
++		}
++
++		VkMemoryAllocateInfo allocInfo = {
++			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++			.allocationSize = memRequirements.size,
++			.memoryTypeIndex = memTypeIndex,
++		};
++
++		result = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &bufferMemory);
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkAllocateMemory SHM upload", result);
++			return nullptr;
++		}
++
++		result = g_device.vk.BindBufferMemory( g_device.device(), buffer, bufferMemory, 0 );
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkBindBufferMemory SHM upload", result);
++			return nullptr;
++		}
++
+@@ -4925,6 +4949,12 @@
+-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+-
 -	g_device.wait(sequence);
-+	{ MaliWaitScope site(DD_WAIT_SHM_STAGING_DESTROY, (uint64_t)(uintptr_t)buffer); g_device.wait(sequence); }
+-
+-	g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
+-	g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);
++	if (staging.slot) {
++		// The existing end-of-upload barrier makes transfer writes visible to
++		// later compute on this same queue; retaining storage removes the CPU wait.
++		MaliStagingUploadScope recording;
++		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
++		staging.submitted(sequence);
++	} else {
++		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
++		g_device.wait(sequence);
++		g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
++		g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);
++	}
+--- a/src/mali_staging_pool.hpp
++++ b/src/mali_staging_pool.hpp
+@@ -0,0 +1,74 @@
++/* Fixed slot count; completion knowledge is supplied by the real backend.
++ * No slot destructor frees Vulkan resources: shutdown must prove safety. */
++#pragma once
++#include <cstdint>
++inline thread_local bool maliStagingUploadRecording = false;
++struct MaliStagingUploadScope {
++    bool previous = maliStagingUploadRecording;
++    MaliStagingUploadScope() { maliStagingUploadRecording = true; }
++    ~MaliStagingUploadScope() { maliStagingUploadRecording = previous; }
++};
++template<class Backend> struct MaliStagingPool {
++    static constexpr unsigned limit = 3, preferred = 2;
++    using Resource = typename Backend::Resource;
++    struct Slot { Resource resource{}; uint64_t capacity = 0, sequence = 0; bool live = false, reserved = false; };
++    struct Counters { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0; } stats;
++    Backend backend;
++    Slot slots[limit]{};
++    unsigned cursor = 0;
++    unsigned live() const { unsigned n = 0; for (const auto &s : slots) n += s.live; return n; }
++    bool safe(const Slot &s) { return !s.sequence || backend.completed(s.sequence); }
++    int make(Slot &s, uint64_t bytes, Slot *&out) {
++        int result = backend.create(bytes, s.resource);
++        if (result) { ++stats.failures; return result; }
++        s.live = s.reserved = true; s.capacity = bytes; s.sequence = 0;
++        ++stats.created; out = &s; return 0;
++    }
++    int acquire(uint64_t bytes, Slot *&out) {
++        out = nullptr;
++        if (!bytes) return Backend::invalid;
++        // Warm up two slots, then prefer completed resources over growing.
++        if (live() < preferred) for (auto &s : slots) if (!s.live) {
++            ++stats.misses; return make(s, bytes, out);
++        }
++        for (unsigned i = 0; i < limit; ++i) {
++            unsigned index = (cursor + i) % limit; auto &s = slots[index];
++            if (!s.live || s.reserved || s.capacity < bytes || !safe(s)) continue;
++            ++stats.hits; s.reserved = true; cursor = (index + 1) % limit; out = &s; return 0;
++        }
++        ++stats.misses;
++        // Resize only a proven completed slot. Never destroy pending storage.
++        for (auto &s : slots) if (s.live && !s.reserved && safe(s)) {
++            backend.destroy(s.resource, s.sequence); s = {}; ++stats.resized; return make(s, bytes, out);
++        }
++        for (auto &s : slots) if (!s.live) return make(s, bytes, out);
++        Slot *oldest = nullptr;
++        for (auto &s : slots) if (!s.reserved && (!oldest || s.sequence < oldest->sequence)) oldest = &s;
++        if (!oldest) { ++stats.failures; return Backend::invalid; }
++        ++stats.waits;
++        int result = backend.wait(oldest->sequence, oldest->resource);
++        if (result || !safe(*oldest)) { ++stats.failures; return result ? result : Backend::invalid; }
++        if (oldest->capacity < bytes) {
++            backend.destroy(oldest->resource, oldest->sequence); *oldest = {}; ++stats.resized; return make(*oldest, bytes, out);
++        }
++        oldest->reserved = true; out = oldest; return 0;
++    }
++    struct Lease {
++        Slot *slot = nullptr;
++        Lease() = default;
++        Lease(const Lease &) = delete;
++        Lease &operator=(const Lease &) = delete;
++        ~Lease() { if (slot) slot->reserved = false; }
++        void submitted(uint64_t sequence) { slot->sequence = sequence; slot->reserved = false; slot = nullptr; }
++    };
++    int shutdown() {
++        int first = 0;
++        for (auto &s : slots) {
++            if (!s.live) continue;
++            int result = s.reserved ? Backend::invalid : safe(s) ? 0 : backend.wait(s.sequence, s.resource);
++            if (result || !safe(s)) { if (!first) first = result ? result : Backend::invalid; continue; }
++            backend.destroy(s.resource, s.sequence); s = {};
++        }
++        return first; // Failed/pending slots remain live, never assumed released.
++    }
++};
+--- a/src/mali_staging.inc
++++ b/src/mali_staging.inc
+@@ -0,0 +1,43 @@
++/* Normal renderer staging backend. Per-use Map/Unmap stays identical to SHM
++ * import; only buffer/allocation/binding lifetimes change. */
++struct MaliStagingBackend {
++    struct Resource { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; };
++    static constexpr int invalid = VK_ERROR_INITIALIZATION_FAILED;
++    bool completed(uint64_t value) {
++        return maliCompletedTimeline.covers(g_device.device(), g_device.maliScratchTimeline(), value);
++    }
++    int wait(uint64_t value, const Resource &r) {
++        VkSemaphore semaphore = g_device.maliScratchTimeline();
++        VkSemaphoreWaitInfo info{}; info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
++        info.semaphoreCount = 1; info.pSemaphores = &semaphore; info.pValues = &value;
++        MaliWaitScope reason(DD_WAIT_SHM_STAGING_REUSE, (uint64_t)(uintptr_t)r.buffer);
++        VkResult result = MaliProfiledWait(g_device.vk.WaitSemaphores, g_device.vk.GetDeviceProcAddr, g_device.device(), &info, 5000000000ull);
++        if (result == VK_SUCCESS) g_device.resetCmdBuffers(value);
++        return result;
++    }
++    void destroy(Resource &r, uint64_t completedSequence = 0) {
++        // Buffer destruction also requires recorded references to be retired.
++        // The pool only supplies a nonzero sequence after proving completion.
++        if (completedSequence) g_device.resetCmdBuffers(completedSequence);
++        if (r.buffer) g_device.vk.DestroyBuffer(g_device.device(), r.buffer, nullptr);
++        if (r.memory) g_device.vk.FreeMemory(g_device.device(), r.memory, nullptr);
++        r = {};
++    }
++    int create(uint64_t bytes, Resource &r) {
++        VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++        bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++        VkResult result = g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &r.buffer);
++        if (result != VK_SUCCESS) return result;
++        VkMemoryRequirements requirements{};
++        g_device.vk.GetBufferMemoryRequirements(g_device.device(), r.buffer, &requirements);
++        uint32_t type = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, requirements.memoryTypeBits);
++        if (type == ~0u || requirements.size < bytes) { destroy(r); return VK_ERROR_FEATURE_NOT_PRESENT; }
++        VkMemoryAllocateInfo allocation{}; allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
++        result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
++        if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
++        if (result != VK_SUCCESS) destroy(r);
++        return result;
++    }
++};
++static MaliStagingPool<MaliStagingBackend> maliStaging;
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -806 +806,2 @@
+-	uint64_t completedSeqNo();
++	uint64_t completedSeqNo();
++	inline VkSemaphore maliScratchTimeline() const { return m_scratchTimelineSemaphore; }

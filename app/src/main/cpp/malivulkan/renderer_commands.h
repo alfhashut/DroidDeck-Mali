@@ -5,6 +5,7 @@ static struct native_renderer_object *renderer_find(struct native_device *d, uin
         if (d->renderer.objects[i].id == id && d->renderer.objects[i].kind == kind) return &d->renderer.objects[i];
     return NULL;
 }
+#include "renderer_upload_dependency.h"
 static int native_renderer_init(struct native_device *d) {
 #define MB_RENDERER_ENTRY(n) d->renderer.n = (PFN_vk##n)d->gdpa(d->handle, "vk" #n); if (!d->renderer.n) return -1;
 #include "renderer_entries.def"
@@ -27,6 +28,12 @@ static int renderer_image_state(struct native_device *d, struct native_command *
     unsigned i = c->renderer_image_count++;
     c->renderer_images[i].id = id; c->renderer_images[i].initial = im->layout;
     c->renderer_images[i].final = im->layout; c->renderer_images[i].initial_foreign = im->foreign; c->renderer_images[i].foreign = im->foreign;
+    struct native_command *upload = renderer_pending_upload(d, id);
+    if (upload) {
+        /* Planned state of an ordered predecessor, not completed global state. */
+        c->renderer_images[i].initial = c->renderer_images[i].final = upload->renderer_images[0].final;
+        c->renderer_images[i].initial_foreign = c->renderer_images[i].foreign = upload->renderer_images[0].foreign;
+    }
     c->renderer = 1; return (int)i;
 }
 static void native_renderer_complete(struct native_device *d, struct native_command *c) {
@@ -57,7 +64,8 @@ static int renderer_has_children(struct native_device *d, struct native_renderer
     }
     return 0;
 }
-static int native_renderer_can_submit(struct native_device *d, struct native_command *c) {
+static int native_renderer_can_submit_ordered(struct native_device *d, struct native_command *c,
+        uint32_t queue, uint32_t semaphore, uint64_t value) {
     if (d->session.release_timeouts) return 0;
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
         if (d->interop.ahbs[i].id && interop_ahb_held(d, &d->interop.ahbs[i]))
@@ -66,17 +74,28 @@ static int native_renderer_can_submit(struct native_device *d, struct native_com
     if (!renderer_descriptors_live(d, c)) return 0;
     for (unsigned i = 0; i < c->renderer_image_count; ++i) {
         struct native_image *im = interop_find_image(d, c->renderer_images[i].id);
-        if (!im || im->layout != c->renderer_images[i].initial || im->foreign != c->renderer_images[i].initial_foreign) return 0;
+        if (!im) return 0;
+        struct native_command *upload = renderer_pending_upload(d, im->id);
+        int ordered = renderer_upload_consumer(d, c, upload, im->id, queue, semaphore, value);
+        VkImageLayout layout = ordered ? upload->renderer_images[0].final : im->layout;
+        uint32_t foreign = ordered ? upload->renderer_images[0].foreign : im->foreign;
+        if (layout != c->renderer_images[i].initial || foreign != c->renderer_images[i].initial_foreign) return 0;
     }
     for (unsigned i = 0; i < c->ref_count; ++i) {
         struct native_buffer *b = interop_find_buffer(d, c->refs[i]);
         struct native_image *im = interop_find_image(d, c->refs[i]);
         struct native_memory *m = interop_find_memory(d, b ? b->memory : im ? im->memory : 0);
-        if ((!b && !im) || !m || interop_referenced(d, c->refs[i], 1)) return 0;
+        if ((!b && !im) || !m) return 0;
+        if (interop_referenced(d, c->refs[i], 1) &&
+            (!im || !renderer_upload_consumer(d, c, renderer_pending_upload(d, im->id), im->id, queue, semaphore, value))) return 0;
         /* The ICD synchronously copies mapped coherent mirrors before submission. */
         if (m->map && !(d->interop.properties.memoryTypes[m->type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) return 0;
     }
     return 1;
+}
+/* Legacy submit paths retain the original no-overlap guard. */
+static int native_renderer_can_submit(struct native_device *d, struct native_command *c) {
+    return native_renderer_can_submit_ordered(d, c, 0, 0, 0);
 }
 static void renderer_destroy_object(struct native_device *d, struct native_renderer_object *o) {
     struct native_renderer *v = &d->renderer;
@@ -256,7 +275,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         *result = v->CreateComputePipelines(d->handle, VK_NULL_HANDLE, 1, &ci, NULL, &o->handle.pipeline); o->kind = MB_R_PIPELINE; o->parent = layout->id; break;
     }
     case MB_RENDERER_UPDATE: {
-        REQUIRE(bytes >= 8 && id == 7 && !native_pending(d, 0, 0, 0));
+        REQUIRE(bytes >= 8 && id == 7);
         VkWriteDescriptorSet writes[7] = {0}; VkDescriptorImageInfo images[64] = {0}; VkDescriptorBufferInfo buffer = {0};
         struct native_renderer_object staged = {0}, *set = NULL;
         unsigned at = 8, image_at = 0;
@@ -295,8 +314,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
                 }
             }
         }
-        REQUIRE(at == bytes && set && set->descriptor_revision != UINT64_MAX);
-        for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) REQUIRE(!d->submit.commands[i].id || d->submit.commands[i].descriptor_set != set->id || d->submit.commands[i].state == 0 || d->submit.commands[i].state == 4);
+        REQUIRE(at == bytes && set && set->descriptor_revision != UINT64_MAX && renderer_descriptor_update_allowed(d, set->id));
         v->UpdateDescriptorSets(d->handle, 7, writes, 0, NULL);
         memcpy(set->descriptors, staged.descriptors, sizeof(set->descriptors)); set->descriptor_count = staged.descriptor_count; ++set->descriptor_revision; break;
     }
@@ -334,13 +352,13 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         struct native_command *c = native_find_command(d, mb_get_u32(w + 8));
         uint32_t fid = mb_get_u32(w + 12); struct native_fence *f = native_find_fence(d, fid);
         struct native_renderer_object *sem = renderer_find(d, mb_get_u32(w + 16), MB_R_SEMAPHORE); uint64_t value = mb_get_u64(w + 20);
-        REQUIRE(queue && c && c->renderer && c->state == 2 && c->recorded && c->family == d->family && sem && value > sem->last_signal && (!fid || (f && !f->submitted)) && native_renderer_can_submit(d, c));
+        REQUIRE(queue && c && c->renderer && c->state == 2 && c->recorded && c->family == d->family && sem && value > sem->last_signal && (!fid || (f && !f->submitted)) && native_renderer_can_submit_ordered(d, c, id, sem->id, value));
         VkTimelineSemaphoreSubmitInfoKHR timeline = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &value};
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &timeline, .commandBufferCount = 1, .pCommandBuffers = &c->handle, .signalSemaphoreCount = 1, .pSignalSemaphores = &sem->handle.semaphore};
         uint64_t perf_start = native_perf_start(d);
         *result = d->submit.QueueSubmit(queue, 1, &si, f ? f->handle : VK_NULL_HANDLE);
         native_perf_end(d, 0, perf_start);
-        if (*result == VK_SUCCESS) { c->state = 3; c->semaphore = sem->id; c->signal_value = value; sem->last_signal = value; c->fence = fid; if (f) f->submitted = 1; }
+        if (*result == VK_SUCCESS) { c->state = 3; c->semaphore = sem->id; c->signal_value = value; sem->last_signal = value; c->fence = fid; c->renderer_submit_queue = id; if (f) f->submitted = 1; }
         if (*result == VK_SUCCESS && d->normal.enabled) {
             struct dd_wait_producer *p = &d->normal.wait_history[d->normal.wait_history_cursor++ % DD_WAIT_HISTORY];
             memset(p, 0, sizeof(*p)); p->value = value; p->semaphore = sem->id; p->command = c->id;
@@ -390,6 +408,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
             barriers[i] = (VkImageMemoryBarrier){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = sa, .dstAccessMask = da, .oldLayout = (VkImageLayout)old, .newLayout = (VkImageLayout)next, .srcQueueFamilyIndex = sf, .dstQueueFamilyIndex = df, .image = im->handle, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
             if (d->interop.ahb_enabled && native_verbose(d)) LOG("BLIT native image barrier: image broker ID=%u layout=%u->%u access=0x%x->0x%x queue=%u->%u stages=0x%x->0x%x", iid, old, next, sa, da, sf, df, src, dst);
             c->renderer_images[j].final = (VkImageLayout)next; c->renderer_images[j].foreign = release;
+            renderer_upload_barrier(d, c, im, old, next, sa, da, src, dst, acquire, release);
         }
         d->interop.CmdPipelineBarrier(c->handle, src, dst, 0, 0, NULL, 0, NULL, n, barriers); ++c->recorded; break;
     }
@@ -398,6 +417,8 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         uint32_t iid = mb_get_u32(w + 8); struct native_image *im = interop_find_image(d, iid); int j = renderer_image_state(d, c, iid); REQUIRE(im && j >= 0 && !c->renderer_images[j].foreign);
         uint32_t layout = mb_get_u32(w + (op == MB_RENDERER_COPY ? 16 : 12)); REQUIRE(layout == (uint32_t)c->renderer_images[j].final);
         if (op == MB_RENDERER_CLEAR) {
+            if (c->renderer_transfer_ops < 2) ++c->renderer_transfer_ops;
+            c->renderer_upload_image = c->renderer_upload_visible = 0;
             REQUIRE((im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && (layout == VK_IMAGE_LAYOUT_GENERAL || layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
             VkClearColorValue color; for (unsigned i = 0; i < 4; ++i) { uint32_t bits = mb_get_u32(w + 16 + i * 4); memcpy(&color.float32[i], &bits, 4); REQUIRE(isfinite(color.float32[i]) && color.float32[i] >= 0 && color.float32[i] <= 1); }
             VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; d->interop.CmdClearColorImage(c->handle, im->handle, (VkImageLayout)layout, &color, 1, &range);
@@ -409,6 +430,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
             VkBufferImageCopy region = {.bufferOffset = offset, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {width, height, depth}};
             if (d->interop.ahb_enabled && native_verbose(d)) LOG("BLIT native %s: image broker ID=%u buffer ID=%u offset=%llu extent=%ux%ux%u layout=%u", direction ? "source upload" : "image GPU readback", iid, bid, (unsigned long long)offset, width, height, depth, layout);
             if (direction) d->interop.CmdCopyBufferToImage(c->handle, b->handle, im->handle, (VkImageLayout)layout, 1, &region); else d->interop.CmdCopyImageToBuffer(c->handle, im->handle, (VkImageLayout)layout, b->handle, 1, &region);
+            renderer_upload_copy(c, im, direction);
         }
         ++c->recorded; break;
     }

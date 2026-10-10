@@ -21,7 +21,7 @@ def added_file(patch, name):
 
 class PerformanceTests(unittest.TestCase):
     def test_header_copies_and_wire_unchanged(self):
-        for name in ('normal_api.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'mali_wait_profile.hpp', 'normal_protocol.h', 'renderer_protocol.h', 'interop_protocol.h'):
+        for name in ('normal_api.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'mali_wait_profile.hpp', 'mali_staging_pool.hpp', 'mali_staging.inc', 'normal_protocol.h', 'renderer_protocol.h', 'interop_protocol.h'):
             self.assertEqual(added_file(PATCH, name), (ROOT / name).read_text(), name)
         self.assertNotIn('Performance', (ROOT / 'normal_protocol.h').read_text())
         local = (ROOT / 'interop_icd.h').read_text().split('proxy_DroidDeckPerformanceMALI', 1)[1].split('proxy_DroidDeckWaylandMALI', 1)[0]
@@ -169,6 +169,11 @@ static uint32_t mb_get_u32(const uint8_t *p) { return p[0] | uint32_t(p[1]) << 8
 #define MB_NORMAL_PUBLISH 89u
 static dd_perf_rpc pending;
 static bool maliWaitProfilingActive;
+static struct { uint64_t requests[DD_WAIT_REASONS]{}, skipped[DD_WAIT_REASONS]{}, forwarded[DD_WAIT_REASONS]{}; } maliLocalWaits;
+static struct {
+    struct { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0; } stats;
+    unsigned live() const { return 2; }
+} maliStaging;
 static int snapshot(int, dd_perf_rpc *out, int reset) { *out = pending; if (reset) pending = {}; return 0; }
 static struct { int device() { return 1; } } g_device;
 static struct { MaliOutputPool ownership; unsigned late = 0; decltype(&snapshot) performance = snapshot; } normalOutput;

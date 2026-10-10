@@ -10,6 +10,8 @@ struct native_submit {
         uint32_t renderer, semaphore, pipeline, descriptor_set; uint64_t signal_value;
         uint64_t descriptor_revision;
         uint32_t renderer_image_count;
+        /* Queued upload dependency metadata, never completion evidence. */
+        uint32_t renderer_upload_image, renderer_transfer_ops, renderer_upload_visible, renderer_submit_queue;
         struct { uint32_t id, initial_foreign, foreign; VkImageLayout initial, final; } renderer_images[16];
         uint32_t id, pool, family, event, fence;
         /* 0 initial, 1 recording, 2 executable, 3 pending, 4 completed, 5 invalid. */

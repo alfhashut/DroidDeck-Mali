@@ -1,10 +1,13 @@
 # CP7P: normal Mali waits and transient resource lifetimes
 
-This change measures and attributes existing work; it does not optimize it.
-The input phone measurements are 47 in-frame RPCs/frame, including four
-`MB_RENDERER_WAIT` calls and 12 resource-management calls. Native blocking
-times **by reason have not been measured on a phone yet**. The supplied
-2.0–2.3 ms/opcode RTT cannot establish those times or identify pure GPU stalls.
+This document records the attribution baseline, now phone-validated: 47
+in-frame RPCs/frame, four renderer waits and 12 resource-management calls.
+Native averages were 1.4–1.9 ms for SHM staging cleanup, 5.9–6.1 ms for output
+producer completion, 0.008–0.01 ms for descriptor reuse and ~0.01 ms for output
+retirement. The latter two were already satisfied in every steady sample;
+the first two materially blocked. Current optimizations and the async-fence
+audit are described in [NORMAL_REUSE.md](NORMAL_REUSE.md). Tables below describe
+the pre-optimization lifetimes and call counts, rather than current targets.
 
 The source audit uses Gamescope 3.16.29 `rendervulkan.cpp`/`rendervulkan.hpp`
 with this repository's patches applied in order. The renderer hunks apply
@@ -130,7 +133,7 @@ reused command buffers and persistent uniform upload buffer are not recreated
 each steady frame. Producer sync-token/FD operations belong to synchronization
 or presentation accounting, not the 12 management RPCs above.
 
-## Future reuse opportunities, not implemented here
+## Reuse opportunities identified by the attribution pass
 
 - **Staging buffer/memory:** pool by required size, usage and memory type;
   retain each entry until its real upload completion. Do not overwrite pending
@@ -152,11 +155,12 @@ or presentation accounting, not the 12 management RPCs above.
   resource-reference retirement and ownership checks. Pooling source images
   alone is not a sufficient justification to remove them.
 
-No pooling, fence reset, wait removal, polling, command batching or semaphore
-value changes are implemented. Timeline completion is never Android AHB release.
-Normal/diagnostic AHB ownership, SYNC_FD and release acknowledgments are unchanged.
+The attribution pass itself did not implement pooling or wait short-circuits.
+The subsequent [reuse pass](NORMAL_REUSE.md) implements staging pooling and
+proven-completion short-circuits. Timeline completion is never Android AHB
+release. AHB ownership, SYNC_FD and release acknowledgments remain unchanged.
 
-## Validation and next phone measurement
+## Historical attribution validation
 
 Cheap targeted checks compile only tiny fake-clock/Vulkan/transport helper
 harnesses, not the ICD, broker, renderer or dependencies:
@@ -173,11 +177,8 @@ scope restoration, frame/outside accounting, header/patch parity, bulk-transfer
 ordering and Android ownership. Renderer patch application is also checked as
 text against the pinned upstream source. Full build/integration remains for CI.
 
-On the next normal-Launch phone run, collect several steady two-second windows
-after 24-frame descriptor warm-up. Check four named waits/frame and full coverage,
-47 frame RPCs/frame, two bulk reads/frame, and intact zero-copy/releases. Compare
-native wait vs RTT and query overhead by reason. A retirement counter below `R`
-after an earlier successful wait would contradict the expected monotonic ordering
-and needs investigation, not a skipped wait. Use the same data to distinguish
-unfinished producers from already-complete driver/transport/lifetime costs.
-No per-reason phone timings or FPS improvement are claimed by this change.
+The attribution phone-validation run collected steady two-second windows after
+24-frame descriptor warm-up: four named waits/frame, 47 frame RPCs/frame, two
+bulk reads/frame and intact zero-copy/releases. Its per-reason results are
+recorded above. Reuse validation now follows the new expected counts and
+targeted tests in [NORMAL_REUSE.md](NORMAL_REUSE.md).

@@ -33,7 +33,7 @@ class WaitAttributionTests(unittest.TestCase):
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=2)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('wait attribution PASS', result.stdout)
-            self.assertIn('wait-reason=shm-upload-staging-destroy count=1 frame-count=1 outside-count=0 per-frame=1.00 RTT-total/avg/max=2.600/2.600/2.600ms native-wait-total/avg/max=2.000/2.000/2.000ms native-CPU=0.100ms native-off-CPU-est=1.900ms counter-query=0.100ms samples=1 already-satisfied=0 briefly-blocked=0 materially-blocked=1', result.stdout)
+            self.assertIn('wait-reason=shm-staging-slot-reuse count=1 frame-count=1 outside-count=0 per-frame=1.00 RTT-total/avg/max=2.600/2.600/2.600ms native-wait-total/avg/max=2.000/2.000/2.000ms native-CPU=0.100ms native-off-CPU-est=1.900ms counter-query=0.100ms samples=1 already-satisfied=0 briefly-blocked=0 materially-blocked=1', result.stdout)
             self.assertIn('last-target=42 before=41 before-result=0x0 semaphore=10 detail=20 latest-submitted=42 producer-found=1 command=8 image=30 buffer=20 memory=21 descriptor-set=31 fence=40', result.stdout)
             self.assertIn('wait-reason=descriptor-set-reuse', result.stdout)
             self.assertIn('already-satisfied=1', result.stdout)
@@ -52,7 +52,10 @@ class WaitAttributionTests(unittest.TestCase):
 #include <stdint.h>
 #define VKAPI_PTR
 using VkDevice = void *; using VkResult = int; using VkBool32 = uint32_t;
-struct VkSemaphoreWaitInfo { unsigned flags; }; using VkSemaphoreWaitInfoKHR = VkSemaphoreWaitInfo;
+using VkSemaphore = uint64_t;
+#define VK_SUCCESS 0
+#define VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO 1000207004
+struct VkSemaphoreWaitInfo { unsigned sType; const void *pNext; unsigned flags, semaphoreCount; const VkSemaphore *pSemaphores; const uint64_t *pValues; }; using VkSemaphoreWaitInfoKHR = VkSemaphoreWaitInfo;
 using PFN_vkVoidFunction = void (*)();
 using PFN_vkWaitSemaphores = VkResult (*)(VkDevice, const VkSemaphoreWaitInfo *, uint64_t);
 using PFN_vkGetDeviceProcAddr = PFN_vkVoidFunction (*)(VkDevice, const char *);
@@ -105,7 +108,8 @@ int main(int argc, char **) {
     def test_real_source_sites_and_normal_only_gate(self):
         patch = PATCH.read_text()
         self.assertIn('MaliWaitScope site(DD_WAIT_DESCRIPTOR_REUSE, uIndex)', patch)
-        self.assertIn('MaliWaitScope site(DD_WAIT_SHM_STAGING_DESTROY, (uint64_t)(uintptr_t)buffer)', patch)
+        self.assertIn('MaliStagingUploadScope recording;', patch)
+        self.assertIn('staging.submitted(sequence);', patch)
         normal = added_file(PATCH, 'mali_normal.inc')
         self.assertIn('{ MaliWaitScope site(DD_WAIT_OUTPUT_COMPLETION, index); g_device.wait(*sequence, false); }', normal)
         self.assertIn('{ MaliWaitScope site(DD_WAIT_OUTPUT_RETIRE, index); g_device.wait(*sequence, true); }', normal)

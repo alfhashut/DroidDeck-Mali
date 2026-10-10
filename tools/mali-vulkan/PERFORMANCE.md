@@ -323,8 +323,12 @@ steady windows at 23.4/22.6; zero-copy and ~1 ms compositor work remained intact
 with no pool drops. Opcode 63 is now the dominant RTT concern: four calls/frame,
 ~2.0–2.3 ms average RTT with occasional ~11 ms spikes. Synchronization accounts
 for ~39–42% of client RTT. These are client RTT observations, not native blocked
-durations. The next change adds attribution only; see
-[wait sites, resource lifetimes and measurement limits](WAIT_ATTRIBUTION.md).
+durations. [Wait attribution](WAIT_ATTRIBUTION.md) is now phone-validated:
+SHM cleanup costs ~1.4–1.9 ms native, output completion ~5.9–6.1 ms; descriptor
+reuse and output retirement are already satisfied. The current
+[completed-value/staging reuse pass and async-fence audit](NORMAL_REUSE.md)
+predict 38 in-frame RPCs/frame and one real renderer wait/frame after warm-up.
+Those new optimization results still require phone validation.
 
 For an instrumented baseline using the original pacing/upload ordering, add
 this line to the existing `/sdcard/Download/droiddeck-env` settings file:
@@ -344,7 +348,7 @@ Cheap local checks, with no project compilation:
 
 ```sh
 cd tools/mali-vulkan
-python3 -B -m unittest -v test_wait test_bulk test_perf test_normal.NormalOwnershipTests.test_android_owned_release_timeout_and_restart
+python3 -B -m unittest -v test_staging test_wait test_bulk test_perf test_normal.NormalOwnershipTests.test_android_owned_release_timeout_and_restart
 ```
 
 These build only a tiny mocked-clock metric harness and the standalone ownership
@@ -365,3 +369,7 @@ reuse/cleanup, OOM preserving old storage, native errors and partial failures,
 missing/short/oversized/count-invalid replies, no stale-copy success, v6 read
 compatibility and old small v7 read requests. Only extracted small helpers
 are compiled, with in-memory native/transport stubs.
+`test_staging` compiles the completion cache, staging pool/backend and extracted
+broker dependency guards with small Vulkan stubs. It covers bounded reuse,
+failed waits retaining resources, safe partial cleanup, strict producer proof,
+queued image visibility, descriptor-update protection and unchanged AHB guards.
