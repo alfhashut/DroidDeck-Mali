@@ -31,7 +31,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateBuffer(VkDevice device, const 
     if (!device || !ci || a || ci->sType != VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO || ci->pNext || ci->flags || ci->sharingMode != VK_SHARING_MODE_EXCLUSIVE || ci->queueFamilyIndexCount) return VK_ERROR_FEATURE_NOT_PRESENT;
     uint8_t args[12]; mb_put_u64(args, ci->size); mb_put_u32(args + 8, ci->usage); struct proxy_resource *o;
     VkResult r = interop_new((struct proxy_logical *)device, MB_BUFFER_CREATE, PROXY_BUFFER, args, sizeof(args), &o);
-    if (r == VK_SUCCESS) { *out = (VkBuffer)(uintptr_t)o; if (((struct proxy_logical *)device)->owner->perf_enabled) o->profile_usage = ci->usage; }
+    if (r == VK_SUCCESS) { *out = (VkBuffer)(uintptr_t)o; o->allocation = ci->size; o->profile_usage = ci->usage; }
     return r;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateImage(VkDevice device, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
@@ -89,6 +89,7 @@ static VkResult interop_bind(VkDevice device, uintptr_t handle, enum proxy_resou
     if (!o || !m) return VK_ERROR_INITIALIZATION_FAILED;
     uint8_t args[16]; mb_put_u32(args, o->id); mb_put_u32(args + 4, m->id); mb_put_u64(args + 8, offset);
     VkResult result = interop_rpc(d, op, args, 16, NULL, 0);
+    if (result == VK_SUCCESS && kind == PROXY_BUFFER) { o->bound_memory = (uintptr_t)m; o->bound_offset = offset; }
     if (result == VK_SUCCESS && d->owner->perf_enabled && kind == PROXY_BUFFER) m->profile_usage |= o->profile_usage;
     return result;
 }
@@ -171,6 +172,21 @@ static VkResult interop_copy_upload_locked(struct proxy_resource *m, uint64_t of
     if (!m || !m->mirror || !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, offset, size)) return VK_ERROR_INITIALIZATION_FAILED;
     return interop_upload_mapping_locked(m, offset, size);
 }
+static VkResult interop_upload_ring_locked(struct proxy_resource *m, uint32_t command) {
+    struct dd_upload_ring *ring = m->upload_ring;
+    unsigned fallback = dd_ring_fallback(ring, command);
+    uint64_t transmitted = fallback ? m->map_size : 0;
+    if (!fallback) for (unsigned i = 0; i < ring->count; ++i) transmitted += ring->ranges[i].length;
+    if (m->owner->owner->perf_enabled) dd_memory_ring(&m->owner->owner->memory_perf,
+        m->id, m->allocation, m->map_offset, m->map_size,
+        ring->modified, ring->marks, ring->count, transmitted, fallback);
+    VkResult result = VK_SUCCESS;
+    if (fallback) result = interop_copy_upload_locked(m, m->map_offset, m->map_size);
+    else for (unsigned i = 0; i < ring->count && result == VK_SUCCESS; ++i)
+        result = interop_copy_upload_locked(m, ring->ranges[i].offset, ring->ranges[i].length);
+    if (result == VK_SUCCESS) dd_ring_uploaded(ring, command);
+    return result;
+}
 static VkResult interop_copy_mapping(struct proxy_resource *m, uint64_t offset, uint64_t size, int upload) {
     if (!m || !m->mirror || !mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, offset, size)) return VK_ERROR_INITIALIZATION_FAILED;
     if (!upload) return interop_download_mapping(m, offset, size);
@@ -208,7 +224,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_UnmapMemory(VkDevice device, VkDeviceMem
     if (m && m->mirror) {
         r = m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? interop_copy_mapping(m, m->map_offset, m->map_size, 1) : VK_SUCCESS;
         if (r == VK_SUCCESS) { uint8_t args[4]; mb_put_u32(args, m->id); r = interop_rpc(d, MB_MEMORY_UNMAP, args, 4, NULL, 0); }
-        if (r == VK_SUCCESS) { free(m->mirror); m->mirror = NULL; m->map_size = 0; m->staging_managed = m->staging_command = 0; }
+        if (r == VK_SUCCESS) { free(m->upload_ring); m->upload_ring = NULL; free(m->mirror); m->mirror = NULL; m->map_size = 0; m->staging_managed = m->staging_command = 0; }
     }
     submit_void_error(d, "vkUnmapMemory", r);
 }

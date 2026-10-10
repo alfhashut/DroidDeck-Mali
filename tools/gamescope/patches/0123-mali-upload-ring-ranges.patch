@@ -1,0 +1,200 @@
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1048,6 +1048,7 @@
+ 
+ bool CVulkanDevice::createScratchResources()
+ {
++    m_uploadRingApi = nullptr;
+ 	std::vector<VkDescriptorSetLayout> descriptorSetLayouts(m_descriptorSets.size(), m_descriptorSetLayout);
+ 	
+ 	VkDescriptorSetAllocateInfo descriptorSetAllocateInfo = {
+@@ -1108,6 +1109,18 @@
+ 		vk_errorf( res, "vkMapMemory failed" );
+ 		return false;
+ 	}
++
++    if (m_maliDiagnostic && mali_normal_active()) {
++        auto api = (PFN_vkDroidDeckUploadRingMALI)vk.GetDeviceProcAddr(device(), "vkDroidDeckUploadRingMALI");
++        VkResult available = api ? api(device(), VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
++            DD_RING_PROBE, 0, 0) : VK_ERROR_FEATURE_NOT_PRESENT;
++        if (available == VK_SUCCESS)
++            available = api(device(), m_uploadBufferMemory, m_uploadBuffer, VK_NULL_HANDLE,
++                DD_RING_REGISTER, 0, bufferCreateInfo.size);
++        if (available == VK_SUCCESS) m_uploadRingApi = api;
++        std::printf("compositor upload-ring ranges: %s VkResult=%d (client-local; full-map fallback)\n",
++            m_uploadRingApi ? "available" : "unavailable", int(available));
++    }
+ 
+ 	VkSemaphoreTypeCreateInfo timelineCreateInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+@@ -1421,6 +1434,8 @@
+ 		.pSignalSemaphores = pSignalSemaphores.data(),
+ 	};
+ 
++    // Explicitly seals even an empty epoch (normal SHM U has no ring stores).
++    uploadRingOperation(DD_RING_SEAL, 0, 0, rawCmdBuffer);
+ 	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, m_maliDiagnostic ? m_maliProducerFence : VK_NULL_HANDLE ) );
+ 
+ 	return nextSeqNo;
+@@ -1761,6 +1776,7 @@
+ 	m_renderBufferOffset = offset;
+     m_renderBufferSize = sizeof(data);
+ 	memcpy(ptr, &data, sizeof(data));
++    m_device->uploadRingOperation(DD_RING_MODIFIED, offset, sizeof(data));
+     if (maliCpuDetail.active) {
+         maliCpuDetail.uniformBytes += sizeof(data); ++maliCpuDetail.uniformWrites;
+         maliCpuDetail.uniformOffset = offset; maliCpuDetail.uniformSize = sizeof(data);
+@@ -3257,6 +3273,7 @@
+ 	void *lut3d_dst = ((uint8_t*)base_dst) + lut1d_size;
+ 	memcpy(lut1d_dst, lut1d_data, lut1d_size);
+ 	memcpy(lut3d_dst, lut3d_data, lut3d_size);
++    g_device.uploadRingOperation(DD_RING_MODIFIED, base_offset, lut1d_size + lut3d_size);
+ 
+ 	auto cmdBuffer = g_device.commandBuffer();
+ 	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset, 0, lut1d);
+@@ -3290,6 +3307,7 @@
+ 		dst[i + 2] = r;
+ 		dst[i + 3] = a;
+ 	}
++    g_device.uploadRingOperation(DD_RING_MODIFIED, offset, uint64_t(width) * height * 4);
+ 
+ 	auto cmdBuffer = g_device.commandBuffer();
+ 	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), offset, 0, texture.get());
+@@ -3814,6 +3832,7 @@
+ 	size_t size = width * height * DRMFormatGetBPP(drmFormat);
+ 	auto [ dst, offset ] = g_device.uploadBufferData(size);
+ 	memcpy( dst, bits, size );
++    g_device.uploadRingOperation(DD_RING_MODIFIED, offset, size);
+ 
+ 	auto cmdBuffer = g_device.commandBuffer();
+ 
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -17,6 +17,7 @@
+ 
+ #include "gamescope_shared.h"
+ #include "backend.h"
++#include "upload_ring_api.h"
+ 
+ #include "shaders/descriptor_set_constants.h"
+ 
+@@ -897,8 +898,19 @@
+ 
+ 		uint8_t *ptr = ((uint8_t*)m_uploadBufferData) + uOffset;
+ 		m_uploadBufferOffset += size;
++        uploadRingOperation(DD_RING_RESERVE, uOffset, size);
+ 		return std::make_pair( ptr, uOffset );
+ 	}
++
++    // Only the explicitly registered normal-Mali ring participates.
++    void uploadRingOperation(uint32_t operation, uint64_t offset, uint64_t length,
++                             VkCommandBuffer command = VK_NULL_HANDLE)
++    {
++        if (m_uploadRingApi)
++            (void)m_uploadRingApi(device(), m_uploadBufferMemory, VK_NULL_HANDLE,
++                                  command, operation, offset, length);
++        // Marker failure latches full-upload fallback in the proxy.
++    }
+ 
+ 	#define VK_FUNC(x) PFN_vk##x x = nullptr;
+ 	struct
+@@ -948,6 +960,7 @@
+ 	bool m_bInitialized = false;
+     bool m_maliDiagnostic = false;
+     uint32_t m_maliUniformAlignment = 16;
++    PFN_vkDroidDeckUploadRingMALI m_uploadRingApi = nullptr;
+     std::array<gamescope::OwningRc<CVulkanTexture>, 4> m_maliDummies;
+ 
+ 
+--- /dev/null
++++ b/src/upload_ring.h
+@@ -0,0 +1,76 @@
++/* Explicit compositor-writer contract, NOT generic Vulkan dirty tracking.
++ * All functions run under the proxy connection lock. Storage is bounded;
++ * bookkeeping overflow selects a full upload, never rejects a valid buffer. */
++#ifndef DD_UPLOAD_RING_H
++#define DD_UPLOAD_RING_H
++#include <stdint.h>
++#include <string.h>
++enum { DD_RING_PROBE, DD_RING_REGISTER, DD_RING_RESERVE, DD_RING_MODIFIED, DD_RING_SEAL };
++enum { DD_RING_BASELINE = 1, DD_RING_BOUNDS = 2, DD_RING_CAPACITY = 4,
++       DD_RING_UNFINISHED = 8, DD_RING_UNSEALED = 16 };
++#define DD_RING_RANGES 32u
++struct dd_ring_range { uint64_t offset, length; };
++struct dd_upload_ring {
++    uint64_t size, generation, sealed_generation, flight_generation, marks, modified;
++    uint32_t count, pending_count, uncertain, sealed_command, flight_command;
++    struct dd_ring_range ranges[DD_RING_RANGES], pending[DD_RING_RANGES];
++};
++static inline int dd_ring_valid(const struct dd_upload_ring *r, uint64_t offset, uint64_t length) {
++    return length && offset < r->size && length <= r->size - offset;
++}
++static inline void dd_ring_init(struct dd_upload_ring *r, uint64_t size) {
++    memset(r, 0, sizeof(*r)); r->size = size; r->uncertain = DD_RING_BASELINE;
++}
++static inline void dd_ring_change(struct dd_upload_ring *r) {
++    if (r->generation != UINT64_MAX) ++r->generation;
++    else r->uncertain |= DD_RING_UNSEALED; /* saturated: retain full fallback */
++}
++static inline int dd_ring_reserve(struct dd_upload_ring *r, uint64_t offset, uint64_t length) {
++    dd_ring_change(r);
++    if (!dd_ring_valid(r, offset, length)) { r->uncertain |= DD_RING_BOUNDS; return 0; }
++    if (r->pending_count == DD_RING_RANGES) { r->uncertain |= DD_RING_CAPACITY; return 0; }
++    struct dd_ring_range range = {offset, length};
++    r->pending[r->pending_count++] = range; return 1;
++}
++static inline int dd_ring_modified(struct dd_upload_ring *r, uint64_t offset, uint64_t length) {
++    dd_ring_change(r);
++    if (!dd_ring_valid(r, offset, length)) { r->uncertain |= DD_RING_BOUNDS; return 0; }
++    unsigned i;
++    for (i = 0; i < r->pending_count; ++i)
++        if (r->pending[i].offset == offset && r->pending[i].length == length) break;
++    if (i == r->pending_count) { r->uncertain |= DD_RING_UNFINISHED; return 0; }
++    r->pending[i] = r->pending[--r->pending_count];
++    ++r->marks; r->modified += length;
++    uint64_t end = offset + length;
++    /* Unsorted bounded set: restarting after a merge handles bridging ranges. */
++    for (i = 0; i < r->count;) {
++        uint64_t a = r->ranges[i].offset, b = a + r->ranges[i].length;
++        if (end < a || offset > b) { ++i; continue; }
++        if (a < offset) offset = a;
++        if (b > end) end = b;
++        r->ranges[i] = r->ranges[--r->count]; i = 0;
++    }
++    if (r->count == DD_RING_RANGES) { r->uncertain |= DD_RING_CAPACITY; return 0; }
++    struct dd_ring_range range = {offset, end - offset};
++    r->ranges[r->count++] = range; return 1;
++}
++static inline void dd_ring_seal(struct dd_upload_ring *r, uint32_t command) {
++    r->sealed_command = command; r->sealed_generation = r->generation;
++}
++static inline unsigned dd_ring_fallback(const struct dd_upload_ring *r, uint32_t command) {
++    return r->uncertain | (r->pending_count ? DD_RING_UNFINISHED : 0) |
++        ((r->sealed_command != command || r->sealed_generation != r->generation) ? DD_RING_UNSEALED : 0);
++}
++static inline void dd_ring_uploaded(struct dd_upload_ring *r, uint32_t command) {
++    r->flight_command = command; r->flight_generation = r->generation;
++}
++static inline void dd_ring_submitted(struct dd_upload_ring *r, uint32_t command) {
++    /* Called ONLY after every upload ACK AND real QueueSubmit success. A newer
++     * store/seal must survive; conservatively retain the entire older set too. */
++    if (r->flight_command != command) return;
++    if (r->generation != UINT64_MAX && r->generation == r->flight_generation && r->sealed_command == command && !r->pending_count) {
++        r->count = 0; r->marks = r->modified = 0; r->uncertain = 0;
++    }
++    r->flight_command = 0; r->sealed_command = 0;
++}
++#endif
+--- /dev/null
++++ b/src/upload_ring_api.h
+@@ -0,0 +1,10 @@
++/* Client-local private opt-in for Gamescope's exclusively instrumented ring.
++ * RESERVE precedes CPU access, MODIFIED follows the complete store, SEAL covers
++ * all stores before one command submission. No new wire opcode or broker ABI. */
++#ifndef DD_UPLOAD_RING_API_H
++#define DD_UPLOAD_RING_API_H
++#include <vulkan/vulkan.h>
++#include "upload_ring.h"
++typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckUploadRingMALI)(VkDevice, VkDeviceMemory,
++    VkBuffer, VkCommandBuffer, uint32_t operation, VkDeviceSize offset, VkDeviceSize length);
++#endif

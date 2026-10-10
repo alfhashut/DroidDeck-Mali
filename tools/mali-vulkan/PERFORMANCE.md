@@ -1,5 +1,11 @@
 # Checkpoint 7P: normal Mali session measurements
 
+The next focused optimization uses [explicit compositor upload-ring ranges](UPLOAD_RING.md).
+Source proves steady-state U makes no ring stores and R stores one actual
+`BlitPushData_t`. Expected traffic becomes 230,984 bytes/frame and 33 frame RPCs
+after warm-up; CI/phone measurement is pending. Ordinary coherent mappings and
+all synchronization remain unchanged.
+
 The current instrumentation-only pass is documented in
 [normal-frame cost attribution](FRAME_COST.md): exclusive compositor/SHM/output
 stages, all three mapped-write ranges, and context for the time-dependent

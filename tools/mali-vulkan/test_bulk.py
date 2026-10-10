@@ -38,7 +38,7 @@ class BulkMemoryTests(unittest.TestCase):
         names.update(re.findall(r'DEVICE_ENTRY\((\w+)\)', dispatch))
         for table in ('submit_entries.def', 'interop_entries.def', 'renderer_entries.def'):
             names.update(re.findall(r'ENTRY\((\w+)\)', (ROOT / table).read_text()))
-        real = {'n', 'GetDeviceProcAddr', 'logical', 'MapMemory', 'UnmapMemory', 'DroidDeckStagingMALI', 'DroidDeckMapStagingMALI'}
+        real = {'n', 'GetDeviceProcAddr', 'logical', 'MapMemory', 'UnmapMemory', 'DroidDeckStagingMALI', 'DroidDeckMapStagingMALI', 'DroidDeckUploadRingMALI'}
         stubs = ''.join('static void proxy_' + name + '(void) {}\n' for name in sorted(names - real))
         version = next(line for line in (ROOT / 'submit_protocol.h').read_text().splitlines() if line.startswith('#define MB_SUBMIT_VERSION '))
         (build / 'device_dispatch.inc').write_text(version + '\n' + stubs + dispatch)
@@ -58,6 +58,15 @@ class BulkMemoryTests(unittest.TestCase):
         result = subprocess.run([str(self.binary), name], capture_output=True, text=True, timeout=3)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(name + ' PASS', result.stdout)
+
+    def test_precise_ring_empty_U_small_R_and_unchanged_SHM(self):
+        self.run_case('ring_frame')
+
+    def test_ring_U_R_epochs_merging_gaps_wrap_and_bounds_fallback(self):
+        self.run_case('ring_ranges')
+
+    def test_ring_write_ACK_submit_failures_and_newer_epoch_survive(self):
+        self.run_case('ring_failures')
 
     def test_bulk_counts_bytes_large_ranges_and_request_reuse(self):
         self.run_case('bulk')

@@ -15,6 +15,7 @@ typedef int VkResult;
 typedef void *VkQueue;
 typedef void *VkFence;
 typedef void *VkDevice;
+typedef void *VkBuffer;
 typedef void *VkDeviceMemory;
 typedef void *VkCommandBuffer;
 typedef uint64_t VkDeviceSize;
@@ -33,6 +34,7 @@ typedef void (*PFN_vkVoidFunction)(void);
 #define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT 1u
 #define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT 2u
 #define VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT 16u
+#define VK_BUFFER_USAGE_TRANSFER_SRC_BIT 1u
 #define VK_STRUCTURE_TYPE_SUBMIT_INFO 1
 #define VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR 2
 #define VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE 3
@@ -54,7 +56,7 @@ struct native_interop {
     VkResult (*InvalidateMappedMemoryRanges)(void *, unsigned, const VkMappedMemoryRange *);
 };
 struct native_device { void *handle; struct native_interop interop; } native;
-static int pending, fail_write, fail_read, bad_ack, bad_read, fail_alloc, disconnects;
+static int pending, fail_submit, fail_write, fail_read, bad_ack, bad_read, fail_alloc, disconnects;
 static uint32_t pending_memory;
 static unsigned writes, reads, submits, allocations, memory_maps, memory_unmaps;
 static struct proxy_resource *command_ptr, *semaphore_ptr;
@@ -88,6 +90,7 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
             struct native_memory *n = interop_find_memory(&native, m->id);
             assert(n && !memcmp(n->map, m->mirror, (size_t)m->map_size));
         }
+        if (fail_submit) return VK_ERROR_DEVICE_LOST;
         ++submits; memset(reply, 0, MB_PREFIX_BYTES); *reply_bytes = MB_PREFIX_BYTES; return VK_SUCCESS;
     }
     assert(op == MB_MEMORY_WRITE || op == MB_MEMORY_READ || op == MB_MEMORY_MAP || op == MB_MEMORY_UNMAP);
@@ -359,6 +362,153 @@ static void write_profile(void) {
     assert(failure.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].bytes == 1024);
     assert(!failure.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].ok && !failure.row[DD_WRITE_OTHER][DD_WRITE_OUTSIDE].acknowledged_bytes);
 }
+static VkResult ring_op(struct proxy_resource *m, unsigned op, uint64_t offset, uint64_t length) {
+    return proxy_DroidDeckUploadRingMALI(&device, m, NULL, op == DD_RING_SEAL ? command_ptr : NULL, op, offset, length);
+}
+static void ring_store(struct proxy_resource *m, uint64_t offset, uint64_t length, int byte) {
+    assert(ring_op(m, DD_RING_RESERVE, offset, length) == VK_SUCCESS);
+    memset(m->mirror + offset, byte, (size_t)length);
+    assert(ring_op(m, DD_RING_MODIFIED, offset, length) == VK_SUCCESS);
+}
+static struct proxy_resource *known_ring(void) {
+    struct proxy_resource *m = mapping(0, 524288, 0);
+    m->allocation = m->map_size;
+    struct proxy_resource *b = calloc(1, sizeof(*b)); assert(b);
+    b->owner = &device; b->kind = PROXY_BUFFER; b->id = 22; b->allocation = m->map_size;
+    b->profile_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    proxy_registry_insert(&device.registry, b);
+    typedef VkResult (*Api)(VkDevice, VkDeviceMemory, VkBuffer, VkCommandBuffer, uint32_t, uint64_t, uint64_t);
+    Api api = (Api)proxy_GetDeviceProcAddr(&device, "vkDroidDeckUploadRingMALI");
+    assert(api == proxy_DroidDeckUploadRingMALI);
+    assert(api(&device, NULL, NULL, NULL, DD_RING_PROBE, 0, 0) == VK_SUCCESS);
+    connection.wire_version = 6;
+    assert(api(&device, NULL, NULL, NULL, DD_RING_PROBE, 0, 0) == VK_ERROR_FEATURE_NOT_PRESENT);
+    connection.wire_version = 7; connection.perf_enabled = 0;
+    assert(api(&device, NULL, NULL, NULL, DD_RING_PROBE, 0, 0) == VK_ERROR_FEATURE_NOT_PRESENT);
+    connection.perf_enabled = 1;
+    assert(api(&device, m, b, NULL, DD_RING_REGISTER, 0, b->allocation) != VK_SUCCESS);
+    assert(interop_bind(&device, (uintptr_t)b, PROXY_BUFFER, MB_BUFFER_BIND, m, 0) == VK_SUCCESS);
+    b->bound_offset = 16;
+    assert(api(&device, m, b, NULL, DD_RING_REGISTER, 0, b->allocation) != VK_SUCCESS); b->bound_offset = 0;
+    b->profile_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    assert(api(&device, m, b, NULL, DD_RING_REGISTER, 0, b->allocation) != VK_SUCCESS);
+    b->profile_usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    m->map_size -= 16;
+    assert(api(&device, m, b, NULL, DD_RING_REGISTER, 0, b->allocation) != VK_SUCCESS); m->map_size += 16;
+    m->staging_managed = 1;
+    assert(api(&device, m, b, NULL, DD_RING_REGISTER, 0, b->allocation) != VK_SUCCESS); m->staging_managed = 0;
+    assert(api(&device, m, b, NULL, DD_RING_REGISTER, 0, b->allocation - 1) != VK_SUCCESS);
+    assert(api(&device, m, b, NULL, DD_RING_REGISTER, 0, b->allocation) == VK_SUCCESS);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS);
+    assert(submit() == VK_SUCCESS && writes == 1); // full initial baseline
+    assert(!m->upload_ring->uncertain && !m->upload_ring->count);
+    writes = submits = 0;
+    memset(&connection.perf, 0, sizeof(connection.perf));
+    memset(&connection.memory_perf, 0, sizeof(connection.memory_perf));
+    return m;
+}
+static void ring_frame(void) {
+    setup(7); struct proxy_resource *ring = known_ring(), *stage = mapping(1, 230400, 0);
+    stage->allocation = stage->map_size;
+    assert(proxy_DroidDeckStagingMALI(&device, stage, NULL) == VK_SUCCESS);
+    struct proxy_resource *f = calloc(1, sizeof(*f)); assert(f);
+    f->kind = PROXY_FENCE; f->id = 23; f->owner = &device; proxy_registry_insert(&device.registry, f);
+    for (unsigned frame = 0; frame < 40; ++frame) {
+        memset(stage->mirror, (int)frame, 230400);
+        assert(proxy_DroidDeckStagingMALI(&device, stage, command_ptr) == VK_SUCCESS);
+        assert(ring_op(ring, DD_RING_SEAL, 0, 0) == VK_SUCCESS);
+        assert(submit() == VK_SUCCESS);
+        pending_memory = stage->id;
+        ring_store(ring, 0, 584, (int)frame);
+        assert(ring_op(ring, DD_RING_SEAL, 0, 0) == VK_SUCCESS);
+        assert(submit_with_fence(f) == VK_SUCCESS);
+        pending_memory = 0;
+    }
+    const struct dd_write_row *u = &connection.memory_perf.row[DD_WRITE_UNIFORM][DD_WRITE_U];
+    const struct dd_write_row *r = &connection.memory_perf.row[DD_WRITE_UNIFORM][DD_WRITE_R];
+    const struct dd_write_row *shm = &connection.memory_perf.row[DD_WRITE_STAGING][DD_WRITE_U];
+    assert(writes == 80 && submits == 80 && !reads && !memory_maps && !memory_unmaps);
+    assert(!u->calls && !u->modified && u->precise == 40 && !u->fallback && u->avoided == 40u * 524288u);
+    assert(r->calls == 40 && r->modified == 40u * 584u && r->marked == 40 && r->merged == 40);
+    assert(r->precise == 40 && !r->fallback && !r->offset && r->length == 584);
+    assert(shm->calls == 40 && shm->bytes == 40u * 230400u && shm->full == 40);
+    assert(connection.perf.upload_bytes == 40u * 230984u);
+    FILE *log = tmpfile(); assert(log); dd_memory_report(&connection.memory_perf, log, 1);
+    dd_memory_report(&connection.memory_perf, log, 2000000001); rewind(log);
+    char output[12000]; size_t size = fread(output, 1, sizeof(output)-1, log); output[size] = 0;
+    assert(strstr(output, "submission=U logical-modified=0 transmitted=0 marked=0 merged=0 precise=40 full-map-fallback=0"));
+    assert(strstr(output, "submission=R logical-modified=23360 transmitted=23360 marked=40 merged=40 precise=40"));
+    fclose(log); finish();
+}
+static void ring_ranges(void) {
+    setup(7); struct proxy_resource *m = known_ring();
+    ring_store(m, 128, 16, 1); assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS);
+    command_ptr->profile_upload = 1;
+    assert(submit() == VK_SUCCESS && writes == 1 && !m->upload_ring->count);
+    ring_store(m, 256, 32, 2); assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS);
+    assert(submit() == VK_SUCCESS && writes == 2);
+    assert(connection.perf.upload_bytes == 48); // U range not resent at R
+    ring_store(m, 8, 8, 3); ring_store(m, 16, 8, 4); ring_store(m, 4, 8, 5);
+    assert(m->upload_ring->count == 1 && m->upload_ring->ranges[0].offset == 4 && m->upload_ring->ranges[0].length == 20);
+    ring_store(m, 128, 8, 6); assert(m->upload_ring->count == 2);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS); assert(submit() == VK_SUCCESS && writes == 4);
+    ring_store(m, 524280, 8, 7); ring_store(m, 0, 8, 8);
+    assert(m->upload_ring->count == 2);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS); assert(submit() == VK_SUCCESS && writes == 6);
+    uint64_t bad[][2] = {{0,0}, {524288,1}, {524287,2}, {UINT64_MAX,2}, {1,UINT64_MAX}};
+    for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) {
+        assert(ring_op(m, DD_RING_RESERVE, bad[i][0], bad[i][1]) != VK_SUCCESS);
+        assert(m->upload_ring->uncertain & DD_RING_BOUNDS);
+        assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS); assert(submit() == VK_SUCCESS);
+        assert(!m->upload_ring->uncertain);
+    }
+    memset(m->mirror + 900, 9, 3); // unknown/unsealed store => full map
+    unsigned before = writes; assert(submit() == VK_SUCCESS && writes == before + 1);
+    assert(!memcmp(memories[0].map, m->mirror, 524288));
+    assert(ring_op(m, DD_RING_RESERVE, 1024, 16) == VK_SUCCESS); memset(m->mirror + 1024, 10, 16);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS); assert(submit() == VK_SUCCESS);
+    assert(m->upload_ring->pending_count == 1);
+    assert(ring_op(m, DD_RING_MODIFIED, 1024, 16) == VK_SUCCESS);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS); assert(submit() == VK_SUCCESS);
+    assert(!m->upload_ring->pending_count && !m->upload_ring->count);
+    for (unsigned i = 0; i <= DD_RING_RANGES; ++i) {
+        assert(ring_op(m, DD_RING_RESERVE, 4096 + i*4, 1) == VK_SUCCESS);
+        m->mirror[4096 + i*4] = 11;
+        VkResult result = ring_op(m, DD_RING_MODIFIED, 4096 + i*4, 1);
+        assert((result == VK_SUCCESS) == (i < DD_RING_RANGES));
+    }
+    assert(m->upload_ring->uncertain & DD_RING_CAPACITY);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS); assert(submit() == VK_SUCCESS);
+    assert(!m->upload_ring->uncertain);
+    finish();
+}
+static void ring_unmap_native(void *d, void *handle) { (void)d; assert(handle == memories[0].handle && !pending_memory); }
+static void ring_failures(void) {
+    setup(7); struct proxy_resource *m = known_ring();
+    ring_store(m, 16, 8, 1); ring_store(m, 128, 8, 2);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS);
+    fail_write = 2; assert(submit() == VK_ERROR_DEVICE_LOST && !submits && m->upload_ring->count == 2);
+    fail_write = 0;
+    for (bad_ack = 1; bad_ack <= 3; ++bad_ack) {
+        assert(submit() == VK_ERROR_INITIALIZATION_FAILED && !submits && m->upload_ring->count == 2);
+    }
+    bad_ack = 0; fail_submit = 1;
+    assert(submit() == VK_ERROR_DEVICE_LOST && !submits && m->upload_ring->count == 2);
+    fail_submit = 0; assert(submit() == VK_SUCCESS && m->upload_ring->count == 0);
+    ring_store(m, 256, 8, 3); dd_ring_seal(m->upload_ring, command_ptr->id);
+    dd_ring_uploaded(m->upload_ring, command_ptr->id);
+    ring_store(m, 512, 8, 4); dd_ring_submitted(m->upload_ring, command_ptr->id);
+    assert(m->upload_ring->count == 2 && m->upload_ring->marks == 2);
+    assert(ring_op(m, DD_RING_SEAL, 0, 0) == VK_SUCCESS); assert(submit() == VK_SUCCESS);
+    assert(!m->upload_ring->count && !m->upload_ring->marks);
+    memories[0].handle = memories[0].map;
+    native.interop.UnmapMemory = ring_unmap_native;
+    bad_ack = 1;
+    proxy_UnmapMemory(&device, m); assert(m->upload_ring && m->mirror && !memory_unmaps);
+    bad_ack = 0; atomic_store(&device.submit_failed, 0);
+    proxy_UnmapMemory(&device, m); assert(!m->upload_ring && !m->mirror);
+    finish();
+}
 static void profile_disabled(void) {
     setup(7); struct proxy_resource *m = mapping(0, 524288, 0);
     connection.perf_enabled = 0;
@@ -542,6 +692,9 @@ static void legacy(void) {
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strcmp(argv[1], "bulk")) bulk();
+    else if (!strcmp(argv[1], "ring_frame")) ring_frame();
+    else if (!strcmp(argv[1], "ring_ranges")) ring_ranges();
+    else if (!strcmp(argv[1], "ring_failures")) ring_failures();
     else if (!strcmp(argv[1], "registry_submit")) registry_submit();
     else if (!strcmp(argv[1], "read_bulk")) read_bulk();
     else if (!strcmp(argv[1], "read_errors")) read_errors();

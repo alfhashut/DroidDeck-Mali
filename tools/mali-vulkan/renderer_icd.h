@@ -266,7 +266,8 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
             if (m->staging_managed && m->staging_command != c->id) continue;
             unsigned previous_phase = dd_memory_submit_phase;
             dd_memory_submit_phase = c->profile_upload ? DD_WRITE_U : f ? DD_WRITE_R : DD_WRITE_OUTSIDE;
-            VkResult r = interop_copy_upload_locked(m, m->map_offset, m->map_size);
+            VkResult r = m->upload_ring ? interop_upload_ring_locked(m, c->id) :
+                interop_copy_upload_locked(m, m->map_offset, m->map_size);
             dd_memory_submit_phase = previous_phase;
             if (r != VK_SUCCESS) { pthread_mutex_unlock(&d->owner->lock); return r; }
         }
@@ -281,10 +282,52 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
             d->owner->memory_perf.submit_mapped = mapped; ++d->owner->memory_perf.submits;
         }
         c->profile_upload = 0;
-        for (struct proxy_resource *m = d->registry.active; m; m = m->active_next)
+        for (struct proxy_resource *m = d->registry.active; m; m = m->active_next) {
+            if (m->upload_ring) dd_ring_submitted(m->upload_ring, c->id);
             if (m->staging_managed && m->staging_command == c->id) m->staging_command = 0;
+        }
         pthread_mutex_unlock(&d->owner->lock);
     }
+    return result;
+}
+/* Private, local known-writer contract. Neither discovery nor any marker sends
+ * an RPC. Device+instance dispatch expose this explicitly like staging APIs. */
+static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckUploadRingMALI(VkDevice device,
+        VkDeviceMemory memory, VkBuffer buffer, VkCommandBuffer command,
+        uint32_t operation, VkDeviceSize offset, VkDeviceSize length) {
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    struct proxy_logical *d = (struct proxy_logical *)device;
+    if (d->owner->wire_version != MB_RENDERER_VERSION || !d->owner->perf_enabled) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (operation == DD_RING_PROBE) return !memory && !buffer && !command && !offset && !length ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
+    struct proxy_resource *m = submit_find(d, (uintptr_t)memory, PROXY_MEMORY);
+    struct proxy_resource *b = buffer ? submit_find(d, (uintptr_t)buffer, PROXY_BUFFER) : NULL;
+    struct proxy_resource *c = command ? submit_find(d, (uintptr_t)command, PROXY_COMMAND) : NULL;
+    if (!m || m->owner != d) return VK_ERROR_INITIALIZATION_FAILED;
+    pthread_mutex_lock(&d->owner->lock);
+    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+    if (operation == DD_RING_REGISTER) {
+        uint32_t usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        if (!command && !offset && b && b->owner == d && b->bound_memory == (uintptr_t)m && !b->bound_offset &&
+            (b->profile_usage & usage) == usage && length == b->allocation && !m->upload_ring &&
+            !m->staging_managed && m->mirror &&
+            (m->pool & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            mb_interop_mapped_range(m->allocation, m->map_offset, m->map_size, 0, m->allocation) &&
+            length && length <= m->allocation) {
+            m->upload_ring = calloc(1, sizeof(*m->upload_ring));
+            if (m->upload_ring) { dd_ring_init(m->upload_ring, length); result = VK_SUCCESS; }
+            else result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    } else if (m->upload_ring) {
+        if (buffer || (command && operation != DD_RING_SEAL)) {
+            dd_ring_change(m->upload_ring); m->upload_ring->uncertain |= DD_RING_UNSEALED;
+        }
+        else if (operation == DD_RING_RESERVE) result = dd_ring_reserve(m->upload_ring, offset, length) ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
+        else if (operation == DD_RING_MODIFIED) result = dd_ring_modified(m->upload_ring, offset, length) ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
+        else if (operation == DD_RING_SEAL && c && !offset && !length) { dd_ring_seal(m->upload_ring, c->id); result = VK_SUCCESS; }
+        else { dd_ring_change(m->upload_ring); m->upload_ring->uncertain |= DD_RING_UNSEALED; }
+    }
+    pthread_mutex_unlock(&d->owner->lock);
     return result;
 }
 /* Local capability probe. Guards are also enforced on every private operation. */

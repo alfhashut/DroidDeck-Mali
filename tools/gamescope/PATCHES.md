@@ -65,3 +65,8 @@ app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the
   records one core vkCmdSetEvent, submits with a normal fence, waits five seconds
   and checks the real event SET result. Standalone/parser returns precede backend
   initialization. No renderer changes. See [SUBMIT_TEST.md](../mali-vulkan/SUBMIT_TEST.md).
+
+- `0123-mali-upload-ring-ranges.patch` - normal Mali only: explicit local
+  reservation/store/submission markers for the compositor upload ring. Reuses
+  bulk writes for merged modified extents with full-map fallback; rendering,
+  staging and synchronization stay unchanged. See [UPLOAD_RING.md](../mali-vulkan/UPLOAD_RING.md).

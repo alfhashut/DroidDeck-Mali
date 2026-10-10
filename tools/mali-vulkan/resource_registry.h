@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include "upload_ring.h"
 enum proxy_resource_kind { PROXY_POOL, PROXY_COMMAND, PROXY_EVENT, PROXY_FENCE, PROXY_BUFFER, PROXY_MEMORY, PROXY_IMAGE, PROXY_AHB, PROXY_SYNC, PROXY_SEMAPHORE, PROXY_VIEW, PROXY_SAMPLER, PROXY_SET_LAYOUT, PROXY_PIPELINE_LAYOUT, PROXY_DESCRIPTOR_POOL, PROXY_DESCRIPTOR_SET, PROXY_SHADER, PROXY_PIPELINE };
 struct proxy_resource {
     VK_LOADER_DATA loader;
@@ -22,7 +23,12 @@ struct proxy_resource {
     uint64_t allocation, map_offset, map_size;
     /* Explicit normal staging opt-in; ordinary coherent mappings are unchanged. */
     uint32_t staging_managed, staging_command;
-    /* Profiling metadata only; never used for validation or memory transport. */
+    /* Explicit ring opt-in; allocated only for the one known compositor map. */
+    struct dd_upload_ring *upload_ring;
+    uintptr_t bound_memory;
+    uint64_t bound_offset;
+    /* Real buffer usage also validates explicit ring registration; upload is
+     * profiling attribution only. Ordinary mapping transport is unchanged. */
     uint32_t profile_usage, profile_upload;
 };
 _Static_assert(offsetof(struct proxy_resource, loader) == 0, "command buffer dispatch word");
@@ -85,7 +91,7 @@ static inline void proxy_registry_retire_children(struct proxy_registry *r,
 }
 static inline void proxy_registry_cleanup(struct proxy_registry *r) {
     for (struct proxy_resource *o = r->owned, *next; o; o = next) {
-        next = o->next; free(o->mirror); free(o);
+        next = o->next; free(o->upload_ring); free(o->mirror); free(o);
     }
     memset(r, 0, sizeof(*r));
 }
