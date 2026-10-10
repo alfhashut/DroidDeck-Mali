@@ -121,6 +121,7 @@ int main(void) {
         service = (ROOT.parents[1] / 'app/src/main/java/com/droiddeck/launcher/session/SessionService.kt').read_text()
         normal = service.split('private fun runMaliSession', 1)[1].split('private fun stopMaliGuest', 1)[0]
         self.assertIn('extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_BASELINE=0" || it == "MALI_VULKAN_PERF_BASELINE=1" }', normal)
+        self.assertIn('extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_HZ=30" || it == "MALI_VULKAN_PERF_HZ=60" }', normal)
         self.assertNotIn('guest.addAll(extraEnv())', normal)
         present = added_file(PATCH, 'mali_normal.inc').split('int vulkan_mali_normal_present', 1)[1].split('int vulkan_mali_normal_stop', 1)[0]
         for required in ('ownership.acquire', 'ownership.ready', 'ownership.presented', 'DD_SYNC_EXPORT', 'DD_SYNC_WAIT', 'MB_NORMAL_PUBLISH', 'g_device.wait(*sequence, false)', 'g_device.wait(*sequence, true)'):
@@ -128,6 +129,37 @@ int main(void) {
         self.assertIn('m_maliReadbackBuffer = VK_NULL_HANDLE', present)
         for forbidden in ('DD_AHB_INSPECT', 'DD_AHB_CREATE', 'DeviceWaitIdle', 'QueueWaitIdle'):
             self.assertNotIn(forbidden, present)
+
+    def test_diagnostic_pacing_parser_default_and_rejected_values(self):
+        with tempfile.TemporaryDirectory(prefix='mali-pacing-') as directory:
+            root = Path(directory)
+            (root / 'mali_normal.hpp').write_text(added_file(PATCH, 'mali_normal.hpp'))
+            (root / 'test.cpp').write_text('''
+#include <cassert>
+#include <initializer_list>
+#include "mali_normal.hpp"
+int main() {
+    assert(mali_normal_parse_pacing(nullptr) == 30);
+    assert(mali_normal_parse_pacing("") == 30);
+    assert(mali_normal_parse_pacing("30") == 30);
+    assert(mali_normal_parse_pacing("60") == 60);
+    for (const char *bad : {"0", "-1", "120", "uncapped", "60x", " 60", "60 "})
+        assert(!mali_normal_parse_pacing(bad));
+}
+''')
+            binary = root / 'test'
+            subprocess.run(shlex.split(os.environ.get('HOST_CXX', 'c++')) + [
+                '-std=c++17', '-O0', '-Wall', '-Wextra', '-Werror', str(root / 'test.cpp'),
+                '-o', str(binary)], check=True, timeout=10)
+            subprocess.run([str(binary)], check=True, timeout=2)
+        main = added_file(PATCH, 'mali_normal.cpp').split('int mali_normal_main', 1)[1]
+        self.assertLess(main.index('mali_normal_parse_pacing'), main.index('vulkan_mali_normal_init'))
+        self.assertIn('std::chrono::nanoseconds(1000000000ull / normalPacingHz)', main)
+        self.assertIn('g_nNestedRefresh = g_nOutputRefresh = normalPacingHz * 1000', main)
+        self.assertIn('next = (perfBaseline ? std::chrono::steady_clock::now() : now) + framePeriod', main)
+        self.assertIn('std::this_thread::sleep_for(std::chrono::milliseconds(2))', main)
+        self.assertIn('target=%uHz period=%.3fms mode=%s event-loop-yield=2ms', main)
+        self.assertIn('now >= next && (perfBaseline || vulkan_mali_normal_available())', main)
 
     def test_real_aggregator_with_mock_clock_and_rpc_snapshots(self):
         # Compile only the ~150-line metric helper with tiny stubs. This never
@@ -146,6 +178,8 @@ int main(void) {
 #include <ctime>
 #include <cstdint>
 static uint64_t fakeNow = 1000000000;
+static unsigned testPacingHz = 30;
+unsigned mali_normal_pacing_hz() { return testPacingHz; }
 static int fake_clock_gettime(clockid_t clock, timespec *t) {
     uint64_t time = clock == CLOCK_THREAD_CPUTIME_ID ? fakeNow / 4 : fakeNow;
     t->tv_sec = time / 1000000000; t->tv_nsec = time % 1000000000; return 0;
@@ -256,6 +290,16 @@ int main() {
     dd_perf_rpc empty{};
     dd_perf_report_opcodes(stdout, &empty, &empty, 0, 0);
     maliStaging.backend.maps.unmaps = 2; NormalStagingMapReport("teardown");
+    // Identical 20 ms work is within the default budget, over the 60 Hz budget.
+    // Pacing changes attribution only; snapshots introduce no broker wait/work.
+    for (unsigned hz : {30u, 60u}) {
+        testPacingHz = hz; normalPerf = {};
+        vulkan_mali_normal_frame_begin(); fakeNow += 20000000;
+        vulkan_mali_normal_frame_end(true);
+        assert(normalPerf.frames == 1 && normalPerf.frameNs == 20000000);
+        assert(normalPerf.missed == (hz == 60));
+        assert(normalPerf.rpc.op[MB_RENDERER_WAIT].count == 0);
+    }
 }
 ''')
             binary = root / 'test'
@@ -263,9 +307,11 @@ int main() {
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=2)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('committed-FPS=1.00 Android-FPS=0.50 frames=2', result.stdout)
+            self.assertIn('opcode=63 target=30Hz', result.stdout)
             self.assertIn('work-avg/p95=35.000/50.000ms', result.stdout)
             self.assertIn('per-frame=5.00 total=10 total=16.000ms', result.stdout)
             self.assertIn('uploads/frame=8192bytes write-RPCs/frame=2.00', result.stdout)
+            self.assertIn('client-RTT/frame=8.000ms', result.stdout)
             self.assertIn('main-thread-CPU=17.500ms off-CPU=52.500ms', result.stdout)
             self.assertEqual(result.stdout.count('MaliPerf frame:'), 3)
             self.assertIn('MaliPerf staging-map: phase=window persistent-maps-created=2 persistent-map-reuse-hits=38 unmaps=0 map-failures=1 mapped-slots-live=2', result.stdout)

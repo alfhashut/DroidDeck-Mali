@@ -580,6 +580,9 @@ class SessionService : Service() {
             // isolated from arbitrary overrides in the existing droiddeck-env file.
             extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_BASELINE=0" || it == "MALI_VULKAN_PERF_BASELINE=1" }
                 ?.let { guest.add(it) }
+            // Diagnostic pacing only; normal Launch remains 30 Hz by default.
+            extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_HZ=30" || it == "MALI_VULKAN_PERF_HZ=60" }
+                ?.let { guest.add(it) }
             guest.add(LinuxRuntime.SESSION_SCRIPT); guest.add(com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
             val command = LinuxRuntime.command(this, sessionRoot, runtimeDir, Environment.getExternalStorageDirectory(), guest)
             val hostEnv = HostEnvironment()

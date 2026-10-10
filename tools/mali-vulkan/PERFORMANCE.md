@@ -340,12 +340,63 @@ this line to the existing `/sdcard/Download/droiddeck-env` settings file:
 MALI_VULKAN_PERF_BASELINE=1
 ```
 
-Only this key with value 0 or 1 is accepted into the isolated Mali environment.
+This baseline key accepts only 0 or 1 in the isolated Mali environment.
 Restart through normal Launch. Remove that line or set it to 0, then repeat
 under the same conditions for the two safe optimizations. The `MaliPerf mode`
 line confirms the mode. This flag does not change synchronization, ownership,
 capability reporting or diagnostics, and does not revert bulk mapped writes.
 No device file was modified by this work.
+
+### Diagnostic 60 Hz pacing comparison
+
+Persistent staging mappings are now phone-validated: 34.00 frame RPCs/frame,
+zero steady-state read/map/unmap calls, three writes/frame, two mapped slots,
+100% warmed pool hits, no reuse waits or map failures. The supplied 30 Hz run
+measured 28.5 FPS, 285 GPU/zero-copy frames, ~1.04 ms Android `render_scene`,
+and zero pool drops. Only output-producer-completion remains forwarded once/frame.
+
+To compare the same normal Launch workload at 60 Hz, add this line to
+`/sdcard/Download/droiddeck-env`, then stop and restart through normal Launch:
+
+```text
+MALI_VULKAN_PERF_HZ=60
+```
+
+Remove the line or set `MALI_VULKAN_PERF_HZ=30` for the baseline. Remove the old
+`MALI_VULKAN_PERF_BASELINE=1` setting (or set it to 0) for both runs so only the
+pacing target differs. Only exact 30/60 values pass the Android service's Mali
+allowlist; other overrides remain excluded. A directly launched Gamescope rejects
+an invalid pacing value before renderer initialization. No UI preference changes.
+
+Startup confirms `MaliPerf pacing: target=60Hz period=16.667ms mode=diagnostic
+event-loop-yield=2ms`; periodic frame rows also identify `target=60Hz`.
+Default pacing remains 30 Hz / 33.333 ms. Both the software deadline and nominal
+nested/output refresh follow the selected target. The existing 2 ms event-loop
+yield, frame callbacks, pool availability gate, Vulkan work and synchronization
+remain unchanged. This is a 60 Hz diagnostic, not an uncapped mode. Missed-frame
+accounting uses the selected budget with the same 1 ms cadence tolerance. The
+fixed 256-sample p95 buffer accommodates a two-second window at either target.
+
+Collect comparable warmed windows at the same resolution/client, preferably in
+30 → 60 → 30 order to expose thermal variation:
+
+| Comparison | Existing/new log field |
+| --- | --- |
+| FPS, target, work/cadence average and p95 | `MaliPerf frame` |
+| Frame RPCs and total client RTT/frame | `MaliPerf RPC: per-frame=... client-RTT/frame=...` |
+| Output completion RTT and native wait | `MaliPerf wait: wait-reason=output-producer-completion` |
+| Queue submit RTT | `MaliPerf opcode: name=MB_RENDERER_SUBMIT` |
+| Broker CPU/service | `MaliPerf native: ... service=... broker-thread-CPU=...` (window totals) |
+| Zero-copy and pool drops | Existing Android compositor frame/zero-copy/drop reports |
+
+Client RTT/frame includes in-frame synchronous calls; outside-frame traffic
+remains reported separately. Existing wait, opcode/category, staging-map,
+resource and ownership counters remain enabled. No extra per-frame RPCs or logs.
+
+FPS materially above 30 demonstrates headroom hidden by the former target.
+If it remains around 28–30, compare output completion, queue submit and total
+client RTT against the frame budget before choosing a synchronization change.
+The 60 Hz result is pending phone measurement; no FPS improvement is promised.
 
 Cheap local checks, with no project compilation:
 

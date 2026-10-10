@@ -514,7 +514,7 @@
 +}
 --- a/src/mali_normal.cpp
 +++ b/src/mali_normal.cpp
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,285 @@
 +/* Experimental normal single-client session. Output is the actual CWaylandBackend,
 + * input uses its existing seat listeners, SHM imports use Gamescope's renderer.
 + * The application is an argv child, with no diagnostic frame limit/injection. */
@@ -713,6 +713,8 @@
 +    for (auto &b : host.buffers) { if (b.buffer) wl_buffer_destroy(b.buffer); b = {}; }
 +    if (host.display) wl_display_flush(host.display);
 +}
++static unsigned normalPacingHz = 30;
++unsigned mali_normal_pacing_hz() { return normalPacingHz; }
 +int mali_normal_main(int argc, char **argv) {
 +    std::setvbuf(stdout, nullptr, _IOLBF, 0);
 +    const char *enabled = getenv("MALI_VULKAN_NORMAL_SESSION"), *outer = getenv("WAYLAND_DISPLAY");
@@ -732,10 +734,15 @@
 +        std::fprintf(stderr, "unsupported normal Mali option: %s\n", argv[i]); return 1;
 +    }
 +    if (!width || !height || !command || !wayland) { std::fputs("normal Mali session needs --backend wayland -W width -H height -- client\n", stderr); return 1; }
++    normalPacingHz = mali_normal_parse_pacing(getenv("MALI_VULKAN_PERF_HZ"));
++    if (!normalPacingHz) { std::fputs("invalid diagnostic Mali pacing: MALI_VULKAN_PERF_HZ must be 30 or 60\n", stderr); return 1; }
++    const auto framePeriod = std::chrono::nanoseconds(1000000000ull / normalPacingHz);
++    std::printf("MaliPerf pacing: target=%uHz period=%.3fms mode=%s event-loop-yield=2ms\n",
++        normalPacingHz, framePeriod.count() / 1e6, normalPacingHz == 30 ? "normal/default" : "diagnostic");
 +    g_maliNormalSessionActive = true; failed = false; stopped = 0;
 +    std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
 +    g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
-+    g_nNestedRefresh = g_nOutputRefresh = 30000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
++    g_nNestedRefresh = g_nOutputRefresh = normalPacingHz * 1000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
 +    bool renderer = vulkan_mali_normal_init(width, height);
 +    bool backend = renderer && gamescope::IBackend::Set<gamescope::CWaylandBackend>();
 +    auto connector = backend ? gamescope::IBackend::Get()->CreateVirtualConnector(0) : nullptr;
@@ -744,7 +751,7 @@
 +    // with identical counters, without changing any ownership/sync checks.
 +    const char *baselineEnv = getenv("MALI_VULKAN_PERF_BASELINE");
 +    bool perfBaseline = baselineEnv && !strcmp(baselineEnv, "1");
-+    std::printf("MaliPerf mode: %s; aggregate interval=2s target=30Hz\n", perfBaseline ? "baseline (old pacing, upload before pool check)" : "paced from frame start, pre-upload pool check");
++    std::printf("MaliPerf mode: %s; aggregate interval=2s target=%uHz\n", perfBaseline ? "baseline (old pacing, upload before pool check)" : "paced from frame start, pre-upload pool check", normalPacingHz);
 +    auto next = std::chrono::steady_clock::now(); auto progress = next;
 +    int childStatus = 0;
 +    while (ok && !stopped && !failed) {
@@ -776,9 +783,9 @@
 +                timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time); wlr_surface_send_frame_done(server.surface, &time);
 +                server.pending = false; ++server.frames; wl_display_flush_clients(server.display); progress = now;
 +            } else if (result != EAGAIN) { ok = false; break; }
-+            // Pace from frame start: a slow render must not pay another 33 ms.
++            // Pace from frame start: a slow render must not pay another target period.
 +            // No catch-up burst: the next iteration starts a fresh deadline.
-+            next = (perfBaseline ? std::chrono::steady_clock::now() : now) + std::chrono::nanoseconds(33333333);
++            next = (perfBaseline ? std::chrono::steady_clock::now() : now) + framePeriod;
 +        }
 +        if (now - progress > std::chrono::seconds(15)) { mali_normal_failure("normal session made no frame progress for 15 seconds"); break; }
 +        std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -795,7 +802,7 @@
 +}
 --- a/src/mali_normal.hpp
 +++ b/src/mali_normal.hpp
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,38 @@
 +#pragma once
 +#include <cstdint>
 +#include <cstdlib>
@@ -807,6 +814,13 @@
 +extern bool g_maliNormalSessionActive;
 +inline bool mali_normal_active() { return g_maliNormalSessionActive; }
 +inline bool mali_normal_verbose() { const char *v = getenv("MALI_VULKAN_VERBOSE"); return v && !strcmp(v, "1"); }
++// Local diagnostic control only; no Vulkan/broker protocol changes.
++inline unsigned mali_normal_parse_pacing(const char *value) {
++    if (!value || !*value || !strcmp(value, "30")) return 30;
++    if (!strcmp(value, "60")) return 60;
++    return 0;
++}
++unsigned mali_normal_pacing_hz();
 +void mali_normal_input(unsigned type, double x, double y, uint32_t code, uint32_t state);
 +void mali_normal_failure(const char *reason);
 +bool mali_normal_bind(wl_display *, wl_surface *, banner_ahb_v1 *);
@@ -1074,7 +1088,7 @@
 +#include "mali_normal.inc"
 --- a/src/mali_normal_perf.inc
 +++ b/src/mali_normal_perf.inc
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,152 @@
 +/* Normal session only. Fixed-size counters; formatting/sorting once per 2 s. */
 +#include <algorithm>
 +#include "renderer_protocol.h"
@@ -1124,8 +1138,9 @@
 +        if (p.frames < DD_PERF_SAMPLES) p.cadence[p.frames] = cadence;
 +        ++p.frames; p.cadenceNs += cadence; p.lastEnd = now;
 +        /* Work over budget, or a missed completion-to-completion deadline.
-+         * A 1 ms tolerance avoids counting clock/scheduler jitter at 30 Hz. */
-+        if (work > DD_PERF_TARGET_NS || cadence > DD_PERF_TARGET_NS + 1000000u) { ++p.missed; ++normalOutput.late; }
++         * Keep the same 1 ms scheduler tolerance for either pacing target. */
++        uint64_t target = 1000000000ull / mali_normal_pacing_hz();
++        if (work > target || cadence > target + 1000000u) { ++p.missed; ++normalOutput.late; }
 +    }
 +    p.lastFrameNs = work; p.lastRpcNs = p.lastRpcCount = p.lastWorst = 0; p.lastWorstOp = 0;
 +    for (unsigned i = 0; i < DD_PERF_OPS; ++i) {
@@ -1173,18 +1188,18 @@
 +    uint64_t syncWait = p.rpc.op[MB_RENDERER_WAIT].ns + p.rpc.op[MB_SYNC_WAIT].ns;
 +    uint64_t nonRpc = p.frameNs > rpcNs ? p.frameNs - rpcNs : 0;
 +    uint64_t outsideFrames = uint64_t(window) > p.frameNs ? uint64_t(window) - p.frameNs : 0;
-+    std::printf("MaliPerf frame: committed-FPS=%.2f Android-FPS=%.2f frames=%u attempts=%u work-avg/p95=%.3f/%.3fms cadence-avg/p95=%.3f/%.3fms missed=%u last-work=%.3fms last-RPCs=%llu last-RPC=%.3fms last-worst=%.3fms opcode=%u\n",
++    std::printf("MaliPerf frame: committed-FPS=%.2f Android-FPS=%.2f frames=%u attempts=%u work-avg/p95=%.3f/%.3fms cadence-avg/p95=%.3f/%.3fms missed=%u last-work=%.3fms last-RPCs=%llu last-RPC=%.3fms last-worst=%.3fms opcode=%u target=%uHz\n",
 +        p.frames * 1e9 / window, (stats.presented - p.previousPresented) * 1e9 / window, p.frames, p.attempts,
 +        p.frameNs / attempts / 1e6, dd_perf_p95(p.samples, p.attempts) / 1e6, p.cadenceNs / frames / 1e6,
 +        dd_perf_p95(p.cadence, p.frames) / 1e6, p.missed, p.lastFrameNs / 1e6,
-+        (unsigned long long)p.lastRpcCount, p.lastRpcNs / 1e6, p.lastWorst / 1e6, p.lastWorstOp);
++        (unsigned long long)p.lastRpcCount, p.lastRpcNs / 1e6, p.lastWorst / 1e6, p.lastWorstOp, mali_normal_pacing_hz());
 +    std::printf("MaliPerf stages ms/attempt: SHM-import-upload=%.3f compositor-CPU=%.3f pool-acquire=%.3f queue-submit-RPC=%.3f timeline-RPC=%.3f SYNC_FD-export-RPC=%.3f sync-wait-RPC=%.3f publish-RPC=%.3f Wayland-commit-CPU=%.3f release-ack-lifetime=%.3fms/%llu (CPU stages include nested RPCs; no GPU timestamps)\n",
 +        p.uploadNs / attempts / 1e6, p.compositeNs / attempts / 1e6, p.acquireNs / attempts / 1e6,
 +        p.rpc.op[MB_RENDERER_SUBMIT].ns / attempts / 1e6, p.rpc.op[MB_RENDERER_WAIT].ns / attempts / 1e6,
 +        p.rpc.op[MB_SYNC_EXPORT].ns / attempts / 1e6, p.rpc.op[MB_SYNC_WAIT].ns / attempts / 1e6,
 +        p.rpc.op[MB_NORMAL_PUBLISH].ns / attempts / 1e6, p.commitNs / attempts / 1e6,
 +        p.ackCount ? p.ackNs / double(p.ackCount) / 1e6 : 0, (unsigned long long)p.ackCount);
-+    std::printf("MaliPerf RPC: per-frame=%.2f total=%llu total=%.3fms latency-avg=%.3fms worst=%.3fms opcode=%u uploads/frame=%.0fbytes write-RPCs/frame=%.2f copies/frame=%.2f compute-blits/frame=%.2f read-RPCs=%llu AHB-creates=%llu idle-RPCs=%llu fence-creates=%llu image-creates=%llu allocations=%llu\n",
++    std::printf("MaliPerf RPC: per-frame=%.2f total=%llu total=%.3fms latency-avg=%.3fms worst=%.3fms opcode=%u uploads/frame=%.0fbytes write-RPCs/frame=%.2f copies/frame=%.2f compute-blits/frame=%.2f read-RPCs=%llu AHB-creates=%llu idle-RPCs=%llu fence-creates=%llu image-creates=%llu allocations=%llu client-RTT/frame=%.3fms\n",
 +        count / frames, (unsigned long long)count, rpcNs / 1e6, count ? rpcNs / double(count) / 1e6 : 0,
 +        worst / 1e6, worstOp, p.rpc.upload_bytes / frames, p.rpc.op[MB_MEMORY_WRITE].count / frames,
 +        (p.rpc.op[MB_RENDERER_COPY].count + p.rpc.op[MB_COMMAND_COPY].count) / frames,
@@ -1192,7 +1207,7 @@
 +        (unsigned long long)p.rpc.op[MB_AHB_CREATE].count, (unsigned long long)p.rpc.op[MB_RENDERER_IDLE].count,
 +        (unsigned long long)p.rpc.op[MB_SYNC_FENCE_CREATE].count,
 +        (unsigned long long)(p.rpc.op[MB_IMAGE_CREATE].count + p.rpc.op[MB_RENDERER_IMAGE].count),
-+        (unsigned long long)p.rpc.op[MB_MEMORY_ALLOCATE].count);
++        (unsigned long long)p.rpc.op[MB_MEMORY_ALLOCATE].count, rpcNs / frames / 1e6);
 +    std::printf("MaliPerf budget window: main-thread-CPU=%.3fms off-CPU=%.3fms RPC-sync-wait=%.3fms other-RPC=%.3fms host-non-RPC=%.3fms outside-frames=%.3fms output-backpressure=%.3fms pool-occupied-avg=%.2f/3 guest-Android-owned-avg/max=%.2f/%u native-owned-current=%u pending-GPU=%u open-FDs=%u top-RPC=%u:%.3fms,%u:%.3fms,%u:%.3fms (CPU/off-CPU partitions frame work and overlaps RPC buckets; off-CPU includes waits/scheduling/other processes; other-RPC includes native execution/transport/scheduling; outside includes client/pacing/events; backpressure overlaps outside)\n",
 +        p.cpuNs / 1e6, (p.frameNs > p.cpuNs ? p.frameNs - p.cpuNs : 0) / 1e6,
 +        syncWait / 1e6, (rpcNs - syncWait) / 1e6, nonRpc / 1e6, outsideFrames / 1e6,
