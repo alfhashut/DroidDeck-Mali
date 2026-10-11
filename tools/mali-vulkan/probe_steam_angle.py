@@ -67,11 +67,12 @@ def verify_loaded_libraries(args):
     print('loaded graphics libraries:\n' + '\n'.join(graphics), flush=True)
 
 
-def prepare(args):
-    require(not any(os.environ.get(key) for key in
+def prepare(args, environment=None):
+    source_env = os.environ if environment is None else environment
+    require(not any(source_env.get(key) for key in
                     ('MALI_VULKAN_NORMAL_SESSION', 'MALI_VULKAN_BROKER_SOCKET')),
             'run inside the isolated Xwayland CLIENT environment, not Gamescope environment')
-    require(os.environ.get('DISPLAY'), 'client DISPLAY required')
+    require(source_env.get('DISPLAY'), 'client DISPLAY required')
     root = Path(args.steam_root).resolve(strict=True)
     egl, gles = (Path(p).resolve(strict=True) for p in (args.egl, args.gles))
     require(egl.is_relative_to(root) and gles.is_relative_to(root) and egl.parent == gles.parent,
@@ -92,7 +93,7 @@ def prepare(args):
             and '.so' in driver.name, 'manifest does not resolve to the explicit PanVK library')
     for path in (egl, gles, driver):
         native_elf(path)
-    env = dict(os.environ)
+    env = dict(source_env)
     for key in list(env):
         if key.startswith(('PANVK_', 'MALI_VULKAN_', 'ANGLE_', 'VK_LOADER_')) or key in (
                 'LIBGL_ALWAYS_SOFTWARE', 'MESA_LOADER_DRIVER_OVERRIDE', 'GALLIUM_DRIVER',

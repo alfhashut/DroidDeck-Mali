@@ -33,6 +33,26 @@ object SessionTerminal {
         ).also { it.mSessionName = "DroidDeck Linux shell" }
     }
 
+    /** ADB-only PanVK proof: reuse the prepared runtime view, never a compositor command. */
+    fun panvkProbeBuilder(guestScript: String): ProcessBuilder {
+        val current = checkNotNull(launch) { "Start normal Mali Steam Launch first" }
+        check(SessionState.running && SessionState.maliBackend && SessionState.mode == SessionService.MODE_STEAM) {
+            "PanVK client proof requires a running normal Mali Steam session"
+        }
+        check(current.command.takeLast(3).take(2) == listOf("/bin/bash", "-c")) {
+            "Unexpected prepared runtime terminal command"
+        }
+        return ProcessBuilder(current.command.dropLast(3) + listOf("/usr/bin/python3", "-B", guestScript)).apply {
+            directory(File(current.workingDirectory))
+            environment().clear()
+            current.hostEnvironment.forEach { entry ->
+                val separator = entry.indexOf('=')
+                if (separator > 0) environment()[entry.substring(0, separator)] = entry.substring(separator + 1)
+            }
+            redirectErrorStream(true)
+        }
+    }
+
     fun clear(generation: Int? = null) {
         val current = launch ?: return
         if (generation == null || current.generation == generation) launch = null

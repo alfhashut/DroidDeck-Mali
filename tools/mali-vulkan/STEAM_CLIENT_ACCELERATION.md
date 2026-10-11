@@ -612,6 +612,75 @@ a failed build/package step produces no successful runtime artifact.
 
 ### Phase B1 preparation and phone commands
 
+#### Quick phone proof (development-only ADB trigger)
+
+The raw CI artifact **droiddeck-panvk-raw-test-arm64** is now reported green
+and available. Polished B0 packaging remains deferred. Download its Actions ZIP
+on the laptop. Install a **CI-built DroidDeck APK containing the test receiver**
+once (no local build and no PanVK rebuild):
+
+```sh
+adb install -r /path/to/updated-droiddeck.apk
+```
+
+On the phone, start **normal Mali Steam Launch** and wait for its client to open.
+From this repository on the laptop, with the phone authorized over ADB, run:
+
+```sh
+python3 tools/panvk/stage_phone_test.py ~/Downloads/droiddeck-panvk-raw-test-arm64.zip --run
+```
+
+The helper also accepts the raw `.tar.gz` or an extracted artifact directory.
+It uses the existing ADB device resolver (`--serial` if needed), copies only
+explicit raw files plus the two Python helpers to shared Downloads, triggers
+the development-only `PanvkClientProbeReceiver`, waits for the request-specific
+report and prints the complete result. No root, `run-as`, manual environment
+setup, second display or PanVK build is needed. A missing receiver or inactive
+Mali session is a clear failure. The shell-only receiver requires Android's
+`DUMP` permission, like the existing checkpoint activity; normal Launch never
+invokes it. Reports remain in `Download/DroidDeck/panvk-client-probe-<id>.log`.
+
+If the existing **second-screen Linux terminal** is available, the receiver/APK
+update is optional: transfer without `--run`, then paste the printed command
+into that terminal (on the usual primary Android user it is):
+
+```sh
+python3 -B /storage/emulated/0/Download/DroidDeckPanVKTest/run_panvk_phone_test.py
+```
+
+This runs alongside Steam; it does not replace Steam's startup command. It
+discovers the live Mali `droiddeck-session steam` client's actual environment
+through same-UID `/proc` entries, rejecting the compositor's broker/proxy
+environment and multiple displays. The receiver reuses `SessionTerminal`'s
+already-prepared command, binds and host environment, replacing only its
+interactive shell with the test helper. It registers that auxiliary runtime
+process with the existing session cleanup and enforces a bounded timeout.
+It never guesses `DISPLAY=:0`, starts another compositor, modifies Gamescope's
+environment or changes the normal session command. No activity switch is needed.
+The helper finds the paired ANGLE libraries under the installed
+`/root/.local/share/Steam/steamrtarm64`. If more than one pair exists it reports
+the candidate paths and fails; add `--angle-dir /actual/pair/directory` to select
+one explicitly. It never substitutes the guest's system EGL/GLES.
+
+Only the raw driver, original ICD, local path-only ICD, probe and available
+dependency/provenance text are staged under **`/root/panvk-test/<content-id>/`**.
+Each content version gets its own directory; repeated tests never overwrite an
+already-loaded DSO. The original generated JSON remains unchanged. The probe
+child alone selects the local PanVK ICD and library search directory. Gamescope,
+the app's Mali broker/proxy, Steam's running software GL client and their
+environments stay unchanged. No dependencies, vendor DSOs, glibc or loader are
+installed. No download happens inside the runtime.
+
+A separate dependency preflight prints the exact loader `OSError` (including
+missing DSO or symbol-version requirement), then the existing probe runs and
+prints its GL/device/loaded-library and pixel evidence. Any preflight failure,
+native crash, timeout, missing evidence or nonzero probe result ends with
+**`C8B.1 PanVK CLIENT-ONLY PROBE FAIL`** and a nonzero exit. Success requires all
+existing hardware/backend/identity/pixel/cleanup checks and prints individual
+PASS lines followed by **`C8B.1 PanVK CLIENT-ONLY PROBE PASS`**. Keep the complete
+terminal output and confirm the red triangle. This proves the standalone ANGLE
+path only; actual Steam/CEF UI acceleration is a subsequent step.
+
 #### Temporary raw-test path (current development default)
 
 The native Mesa build reached `[901/901] Linking target
@@ -704,8 +773,8 @@ Vulkan loader, a real Mali-G52 device (software renderers including llvmpipe are
 rejected), `GPU triangle readback: verified`, verified X11 CPU-copy pixels, clean
 teardown and `probe exit=0`. Keep all stdout/stderr and visually confirm the red
 triangle. This proves the standalone ANGLE draw/readback path only; Steam/CEF UI
-acceleration and polished B0 packaging/upload remain unproven. A new GitHub run
-must first confirm that the raw artifact is staged and uploaded successfully.
+acceleration and polished B0 packaging/upload remain unproven. The raw artifact
+upload is now reported successful; phone execution remains to be measured.
 
 #### Optional audited-package path (deferred)
 

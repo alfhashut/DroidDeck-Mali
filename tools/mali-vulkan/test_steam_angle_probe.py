@@ -6,14 +6,137 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import probe_steam_angle as probe
+import run_panvk_phone_test as phone
 
 
 class SteamAngleProbeTests(unittest.TestCase):
+    def test_phone_angle_pair_discovery_fails_on_ambiguity_instead_of_guessing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            steam = Path(args.steam_root)
+            pair = Path(args.egl).parent
+            self.assertEqual(phone.angle_pair(steam), pair)
+            other = pair / 'other-angle'
+            other.mkdir()
+            (other / 'libEGL.so').write_bytes(Path(args.egl).read_bytes())
+            (other / 'libGLESv2.so').write_bytes(Path(args.gles).read_bytes())
+            with self.assertRaisesRegex(RuntimeError, '--angle-dir'):
+                phone.angle_pair(steam)
+            self.assertEqual(phone.angle_pair(steam, other), other)
+
+    def test_phone_staging_keeps_raw_manifest_and_never_overwrites_a_live_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.fixture(directory)
+            artifact = root / 'raw'
+            artifact.mkdir()
+            raw_manifest = Path(__file__).resolve().parents[1] / 'panvk/tests/fixtures/panfrost_icd.aarch64.json'
+            (artifact / phone.MANIFEST).write_bytes(raw_manifest.read_bytes())
+            (artifact / phone.DRIVER).write_bytes(Path(args.panvk_library).read_bytes())
+            target = phone.stage(artifact, root / 'guest')
+            self.assertEqual((target / phone.MANIFEST).read_bytes(), raw_manifest.read_bytes())
+            expected = json.loads(raw_manifest.read_text())
+            expected['ICD']['library_path'] = './' + phone.DRIVER
+            self.assertEqual(json.loads((target / 'panvk-local.json').read_text()), expected)
+            self.assertEqual(phone.stage(artifact, root / 'guest'), target)
+            old_driver = (target / phone.DRIVER).read_bytes()
+            (artifact / phone.DRIVER).write_bytes(old_driver + b'new build')
+            replacement = phone.stage(artifact, root / 'guest')
+            self.assertNotEqual(target, replacement)
+            self.assertEqual((target / phone.DRIVER).read_bytes(), old_driver)
+            expected['ICD']['library_path'] = 'libGLES_mali.so'
+            (artifact / phone.MANIFEST).write_text(json.dumps(expected))
+            with self.assertRaisesRegex(RuntimeError, 'does not identify'):
+                phone.stage(artifact, root / 'guest')
+
+    def test_phone_discovers_real_client_and_rejects_compositor_or_ambiguous_displays(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            def process(pid, env):
+                path = proc / str(pid)
+                path.mkdir()
+                (path / 'cmdline').write_bytes(b'/bin/bash\0/usr/local/bin/droiddeck-session\0steam\0')
+                (path / 'environ').write_bytes('\0'.join(f'{k}={v}' for k, v in env.items()).encode())
+            client = dict(BL_INSIDE='1', BL_MALI_STEAM_UI='1', DISPLAY=':42', XDG_RUNTIME_DIR='/run/droiddeck')
+            process(100, dict(client, MALI_VULKAN_NORMAL_SESSION='1', MALI_VULKAN_BROKER_SOCKET='/broker.sock'))
+            with self.assertRaisesRegex(RuntimeError, 'no guessed DISPLAY'):
+                phone.client_environment(proc)
+            process(101, client)
+            self.assertEqual(phone.client_environment(proc), client)
+            process(102, dict(client, DISPLAY=':43'))
+            with self.assertRaisesRegex(RuntimeError, 'readable client displays=2'):
+                phone.client_environment(proc)
+
+    def test_phone_pass_requires_probe_success_and_every_evidence_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            target = Path(directory)
+            target_icd = target / 'panvk-local.json'
+            target_icd.write_bytes(Path(args.icd).read_bytes())
+            Path(args.panvk_library).rename(target / phone.DRIVER)
+            manifest = json.loads(target_icd.read_text())
+            manifest['ICD']['library_path'] = './' + phone.DRIVER
+            target_icd.write_text(json.dumps(manifest))
+            pair = Path(args.egl).parent
+            client = {'DISPLAY': ':42', 'LIBGL_ALWAYS_SOFTWARE': '1'}
+            success = (f'ICD={target_icd}\nPanVK library={target / phone.DRIVER}\nVulkan loader=/usr/lib/libvulkan.so.1\n'
+                       'Vulkan device=Mali-G52 (PanVK) vendor=0x13b5\n'
+                       'ANGLE backend=Vulkan; software renderer=none (validated)\n'
+                       'GPU triangle readback: verified\nX11 CPU-copy pixels: verified\n'
+                       'probe render/copy/cleanup completed\nprobe exit=0\n')
+            for code, stdout in ((0, success), (1, success), (0, success.replace('GPU triangle readback: verified', 'readback failed'))):
+                output = io.StringIO()
+                with patch.object(phone, 'client_environment', return_value=client), \
+                     patch.object(phone, 'stage', return_value=target), \
+                     patch.object(phone, 'angle_pair', return_value=pair), \
+                     patch.object(phone.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0),
+                         subprocess.CompletedProcess([], code, stdout)]) as invoke, contextlib.redirect_stdout(output):
+                    if code or 'readback failed' in stdout:
+                        with self.assertRaises(RuntimeError):
+                            phone.run(target, Path(args.steam_root))
+                        self.assertNotIn('CLIENT-ONLY PROBE PASS', output.getvalue())
+                    else:
+                        phone.run(target, Path(args.steam_root))
+                        self.assertIn('CLIENT-ONLY PROBE PASS', output.getvalue())
+                    for call in invoke.call_args_list:
+                        env = call.kwargs['env']
+                        self.assertEqual(env['DISPLAY'], ':42')
+                        self.assertEqual(env['VK_DRIVER_FILES'], str(target_icd))
+                        self.assertNotIn('LIBGL_ALWAYS_SOFTWARE', env)
+                self.assertEqual(client, {'DISPLAY': ':42', 'LIBGL_ALWAYS_SOFTWARE': '1'})
+
+    def test_phone_dependency_failure_never_launches_probe_or_reports_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            target = Path(directory)
+            output = io.StringIO()
+            with patch.object(phone, 'client_environment', return_value={}), \
+                 patch.object(phone, 'stage', return_value=target), \
+                 patch.object(phone, 'angle_pair', return_value=Path(args.egl).parent), \
+                 patch.object(phone.probe, 'prepare', return_value={'DISPLAY': ':42'}), \
+                 patch.object(phone.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'preflight')) as invoke, \
+                 contextlib.redirect_stdout(output):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    phone.run(target, Path(args.steam_root))
+                self.assertEqual(invoke.call_count, 1)
+                self.assertNotIn('CLIENT-ONLY PROBE PASS', output.getvalue())
+
+    def test_phone_main_reports_exact_missing_dependency_and_nonzero_failure(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['run_panvk_phone_test.py']), \
+             patch.object(phone, 'run', side_effect=OSError('libdrm.so.2: cannot open shared object file')), \
+             contextlib.redirect_stderr(output):
+            self.assertEqual(phone.main(), 1)
+        self.assertIn('CLIENT-ONLY PROBE FAIL', output.getvalue())
+        self.assertIn('libdrm.so.2', output.getvalue())
+        self.assertNotIn('CLIENT-ONLY PROBE PASS', output.getvalue())
+
     def test_software_wrong_backend_and_wrong_bundle_never_pass(self):
         hardware = 'ANGLE (Mesa, Vulkan 1.3 (Mali-G52 (PanVK)), panvk)'
         version = 'OpenGL ES 2.0 (ANGLE git hash: 5d4df51d1d7d)'

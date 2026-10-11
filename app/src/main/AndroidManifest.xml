@@ -136,6 +136,11 @@
             android:theme="@style/SessionTheme" />
 
         <!-- Explicit adb-only checkpoint; never started by the launcher or a normal session. -->
+        <receiver
+            android:name=".gpu.PanvkClientProbeReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
         <activity
             android:name=".gpu.SystemVulkanBrokerActivity"
             android:exported="true"

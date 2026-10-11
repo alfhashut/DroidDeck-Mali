@@ -1,20 +1,107 @@
 """B0 host checks: synthetic ELF/metadata only; no compiler, loader, GPU or network."""
 import importlib.util
+import contextlib
 import json
+import io
 import os
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
+import tarfile
 import unittest
+import zipfile
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
 import package_glibc as artifact
 import stage_raw_test as raw
+import stage_phone_test as phone
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_phone_adb_trigger_is_shell_protected_and_not_implicitly_started(self):
+        namespace = '{http://schemas.android.com/apk/res/android}'
+        manifest = ET.parse(ROOT / 'app/src/main/AndroidManifest.xml')
+        receiver = next(item for item in manifest.findall('./application/receiver')
+                        if item.get(namespace + 'name') == '.gpu.PanvkClientProbeReceiver')
+        self.assertEqual(receiver.get(namespace + 'exported'), 'true')
+        self.assertEqual(receiver.get(namespace + 'permission'), 'android.permission.DUMP')
+        self.assertFalse(receiver.findall('intent-filter'))
+
+    def test_phone_adb_run_requires_matching_request_completion_and_probe_pass(self):
+        for exit_code, proof in ((0, 'C8B.1 PanVK CLIENT-ONLY PROBE PASS'),
+                                 (1, 'C8B.1 PanVK CLIENT-ONLY PROBE PASS'),
+                                 (0, 'probe failed')):
+            output = f'{proof}\nDROIDDECK_PANVK_PROBE_DONE exit={exit_code}\n'
+            with patch.object(phone.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, 'Broadcast completed: result=1', ''),
+                    subprocess.CompletedProcess([], 0, output, '')]) as invoke, contextlib.redirect_stdout(io.StringIO()) as logged:
+                self.assertEqual(phone.run_phone(['adb', '-s', 'test-device'], '/storage/emulated/0'),
+                                 0 if exit_code == 0 and proof.endswith('PASS') else 1)
+                self.assertIn('DroidDeck PanVK phone test ' + ('PASS' if exit_code == 0 and proof.endswith('PASS') else 'FAIL'),
+                              logged.getvalue())
+            request_command = invoke.call_args_list[0].args[0][-1]
+            request = request_command.split()[-1]
+            self.assertEqual(len(request), 32)
+            self.assertIn('panvk-client-probe-' + request + '.log', invoke.call_args_list[1].args[0][-1])
+
+    def test_phone_adb_run_rejects_old_apk_and_times_out_without_stale_pass(self):
+        with patch.object(phone.subprocess, 'run', return_value=
+                          subprocess.CompletedProcess([], 0, 'Broadcast completed: result=0', '')):
+            with self.assertRaisesRegex(RuntimeError, 'CI APK'):
+                phone.run_phone(['adb'], '/storage/emulated/0')
+        with patch.object(phone.subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, 'Broadcast completed: result=1', ''),
+                subprocess.CompletedProcess([], 0, 'unfinished output', '')]), \
+             patch.object(phone.time, 'monotonic', side_effect=[0, 0, 100]), \
+             patch.object(phone.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'timed out waiting'):
+                phone.run_phone(['adb'], '/storage/emulated/0')
+
+    def test_phone_transfer_accepts_actions_zip_tar_and_directory_without_extra_dsos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_files = root / 'raw'
+            raw_files.mkdir()
+            for name in phone.FILES[:4]:
+                (raw_files / name).write_text(name + '\n')
+            (raw_files / 'libc.so.6').write_text('not copied')
+            archive = root / 'raw.tar.gz'
+            with tarfile.open(archive, 'w:gz') as tar:
+                tar.add(raw_files, arcname='droiddeck-panvk-raw-test-arm64')
+            download = root / 'download.zip'
+            with zipfile.ZipFile(download, 'w') as zipped:
+                zipped.write(archive, archive.name)
+            for index, source in enumerate((raw_files, archive, download)):
+                target = root / f'extracted{index}'
+                phone.unpack(source, target)
+                self.assertEqual({p.name for p in target.iterdir()}, set(phone.FILES[:4]))
+                for name in phone.FILES[:4]:
+                    self.assertEqual((target / name).read_bytes(), (raw_files / name).read_bytes())
+
+    def test_phone_transfer_rejects_duplicate_link_and_missing_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, kind in enumerate(('duplicate', 'link', 'missing')):
+                archive = root / f'{kind}.tar.gz'
+                with tarfile.open(archive, 'w:gz') as tar:
+                    if kind == 'missing':
+                        continue
+                    for repeat in range(2 if kind == 'duplicate' else 1):
+                        entry = tarfile.TarInfo(f'../../{repeat}/{phone.FILES[0]}')
+                        if kind == 'link':
+                            entry.type = tarfile.SYMTYPE
+                            entry.linkname = '/some/other/library'
+                            tar.addfile(entry)
+                        else:
+                            entry.size = 3
+                            tar.addfile(entry, io.BytesIO(b'ELF'))
+                with self.assertRaisesRegex(RuntimeError, 'duplicate|nonregular|missing'):
+                    phone.unpack(archive, root / f'out{index}')
+
     def test_raw_test_copies_only_explicit_outputs_and_keeps_exact_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
