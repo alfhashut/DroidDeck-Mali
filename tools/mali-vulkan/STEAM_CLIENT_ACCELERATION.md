@@ -491,6 +491,17 @@ along with Meson >= 1.4, Python >= 3.10, Mako, packaging, YAML, C/C++ compilers,
 Bison, Flex, Ninja, pkg-config, libdrm, libelf and zlib development files.
 The actual installed package/toolchain versions will be recorded per artifact.
 
+The first CI attempt stopped at Meson setup because `auto_features=disabled`
+also disabled the `spirv-tools` feature. The narrow correction explicitly sets
+`-Dspirv-tools=enabled`; Debian's `spirv-tools` package was already in the workflow.
+Keep both compiler generators: the pinned
+[`libpan/meson.build`](https://github.com/FristOneRR-Admin/FristOneRR-Panvk-Source/blob/efd07bab401b263a9ac114560ecdb9a2934f5d43/src/panfrost/libpan/meson.build)
+uses `prog_mesa_clc` to generate per-architecture SPIR-V and
+`prog_panfrost_compile` to generate embedded Mali helper shaders. PanVK consumes
+these generated dependencies. Even `mesa-clc=auto` selects CLC when PanVK is
+enabled; removing the explicit flags would not remove this requirement. This
+fix does not establish that the next CI build will succeed.
+
 WSI could be omitted for an independently built ANGLE offscreen display, but
 that is not the supplied Steam bundle's proven configuration. Matching
 `DisplayVkXcb::getWSIExtension()` requests `VK_KHR_xcb_surface` unconditionally;
@@ -583,8 +594,8 @@ a failed build/package step produces no successful runtime artifact.
 ### Phase B1 preparation and phone commands
 
 Later, run **Build isolated PanVK glibc ARM64 probe artifact** manually in
-Actions on the intended branch. The first CI build remains unexecuted and may
-expose additional fork portability issues; do not infer build success from
+Actions on the intended branch. The first attempt failed during setup as noted
+above; the next run may expose further issues. Do not infer build success from
 host unit tests. Download and transfer its two files plus
 `tools/mali-vulkan/probe_steam_angle.py` into an isolated guest directory.
 For example, inside the existing Linux guest, with those files already present:

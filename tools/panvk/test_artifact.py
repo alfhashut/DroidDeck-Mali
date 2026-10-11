@@ -125,8 +125,13 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(pin['commit'], 'efd07bab401b263a9ac114560ecdb9a2934f5d43')
         args = (artifact.TOOLS / 'meson-options.txt').read_text().splitlines()
         for required in ('-Dpanfrost-kmds=kbase', '-Dplatforms=x11', '-Dgallium-drivers=',
-                         '-Dpanfrost-rust=false', '-Dopengl=false', '-Degl=disabled', '-Dglx=disabled'):
+                         '-Dpanfrost-rust=false', '-Dopengl=false', '-Degl=disabled', '-Dglx=disabled',
+                         '-Dauto_features=disabled', '-Dmesa-clc=enabled',
+                         '-Dprecomp-compiler=enabled', '-Dspirv-tools=enabled'):
             self.assertIn(required, args)
+        install = next(step['run'] for step in job['steps']
+                       if step.get('name') == 'Install native build dependencies')
+        self.assertIn('spirv-tools', install.split())
         self.assertNotIn('build-panvk-glibc', (ROOT / '.github/workflows/build.yml').read_text())
 
 

@@ -22,6 +22,7 @@
 -Dshared-llvm=enabled
 -Dmesa-clc=enabled
 -Dprecomp-compiler=enabled
+-Dspirv-tools=enabled
 -Dinstall-mesa-clc=false
 -Dinstall-precomp-compiler=false
 -Dvulkan-layers=
