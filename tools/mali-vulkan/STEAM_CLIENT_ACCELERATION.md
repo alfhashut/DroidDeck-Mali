@@ -1,27 +1,35 @@
 # C8B.1: client graphics audit
 
-Status: **Phase A preserved; Phase A2 ANGLE audit and standalone phone probe;
-Phase B0 native build reported successful; portable packaging deferred in favor
-of a temporary raw-test CI artifact defined below. Hardware client acceleration
-is not phone-proven or enabled for Steam.** C8A's working software client remains
-the fallback and current behavior. No Gamescope, proxy, broker, compositor,
-session or APK packaging changes.
+Status (2026-10-11): **The real phone has verified Steam ARM64 ANGLE/Vulkan →
+PanVK → Mali-G52 GPU triangle readback with client-only `PANVK_ATOM_STRIDE=56`.
+No KFAULT or GPU timeout occurred in that run.** The standalone probe then
+failed at its artificial X11 CPU-copy verifier (`X_GetImage` / `BadMatch`);
+that later failure is not a PanVK GPU-rendering failure. It remains documented
+and unresolved. Portable packaging remains deferred in favor of the raw artifact.
+
+A development-only real Steam client integration is now implemented below;
+**real Steam UI hardware acceleration remains unproven** until actual
+steamwebhelper renderer evidence is collected. C8A software rendering stays
+the default and fallback. Gamescope, the proxy/broker, Android compositor,
+default Vulkan bridge, and game/Proton/FEX paths are unchanged.
 
 ## Decision
 
 Native AArch64 glibc PanVK/kbase is plausible; the audited backend is not
 inherently Bionic-only. However, the candidate revision is **not ready to adopt
 as a truthful, supported Zink client stack**. Do not stage its Android release
-binary, enable its compatibility feature flags, or switch Steam to it.
+binary, enable its compatibility feature flags, or enable it in default Steam
+startup. The opt-in ANGLE experiment below is separate from this Zink decision.
 
 The concrete capability gate is `alphaToOne = false` in the candidate's feature
 table, whereas Mesa documents it as a minimum Zink OpenGL 2.1 requirement.
 Additional advertised features and external-memory behavior need verification
-before adopting this fork. This is not a claim that glibc compilation is
-impossible, nor that a narrowly limited hardware draw could never work.
+before adopting this fork as a Zink stack. The development ANGLE/Vulkan client
+experiment below does not adopt Zink or change PanVK capabilities.
 
-Phase B (native VkDevice plus accelerated GL context/visible draw) and Phase C
-(Steam selection) remain gated. No hardware renderer or FPS success is claimed.
+Native VkDevice creation and accelerated GLES2 GPU readback are phone-proven.
+Real Steam UI presentation/renderer acceptance is a separate remaining gate;
+neither Steam startup nor the standalone draw proves UI acceleration or FPS.
 
 ## Reproducible candidate and sources
 
@@ -93,8 +101,9 @@ the phone's installed version is not established by the current catalog.
 This checkout's `.github/workflows/build.yml` builds Gamescope on the Mali branch
 and stages helpers/overlays into APK assets. `build-gamescope.yml` separately
 publishes the patched Gamescope component. Neither builds the hosted rootfs or
-a client PanVK/Mesa stack. **No Actions changes were made:** automatic packaging
-of this unvalidated candidate would bypass the audit gate.
+a client PanVK/Mesa stack. The development launcher is included by the existing
+session-helper asset glob and staged by `SessionFiles`; the raw PanVK driver
+is still supplied separately and is not bundled or rebuilt by the APK workflow.
 
 ## Native glibc and device access
 
@@ -282,8 +291,9 @@ of what this installed Valve build forwards. In public Chromium 126:
   argument is copied to the GPU child.
 - The proprietary Steam-to-CEF `-cef-*` translation/filtering cannot be proven
   from those public sources. Real GPU-child argv, `cef_log.txt` and
-  `webhelper_gpu.txt` must confirm any eventual Steam experiment. This change
-  does not change the launch arguments or claim they have been accepted.
+  `webhelper_gpu.txt` must confirm any eventual Steam experiment. The audit did
+  not change launch arguments; the development path below requests Vulkan but
+  still requires actual CEF evidence that the request was accepted.
 
 ### Exact ANGLE requirements versus candidate PanVK
 
@@ -661,6 +671,135 @@ The helper finds the paired ANGLE libraries under the installed
 `/root/.local/share/Steam/steamrtarm64`. If more than one pair exists it reports
 the candidate paths and fails; add `--angle-dir /actual/pair/directory` to select
 one explicitly. It never substitutes the guest's system EGL/GLES.
+
+For the development-only JOB_SUBMIT atom-stride A/B test, keep the same raw
+artifact and ANGLE pair and run 56 first:
+
+```sh
+python3 tools/panvk/stage_phone_test.py ~/Downloads/droiddeck-panvk-raw-test-arm64.zip --angle-dir /root/.local/share/Steam/steamrtarm64 --atom-stride 56 --run
+```
+
+If 56 repeats `[KFAULT] atom=0 code=0x40 core_req=0x0`, rerun that command with
+`--atom-stride 64` as a control. `--atom-stride auto` (or omitting the option)
+leaves `PANVK_ATOM_STRIDE` unset. Explicit 56/64 values apply only to the GPU
+probe child, after inherited PanVK overrides are removed; neither the running
+Steam session nor the dependency preflight receives the stride override.
+The pushed launcher carries the option without rebuilding PanVK or the APK.
+Reports retain the full driver output and summarize any logged atom stride
+and KFAULT fields; an unlogged effective stride is reported as unavailable,
+never inferred from the requested value. Keep `KBASE_IOCTL_MEM_JIT_INIT`
+warnings visible; `0x40` identifies `JOB_CONFIG_FAULT`, not OUT_OF_MEMORY.
+
+Observed phone run (2026-10-11), request
+`5af8e48d25ef43df91479b7f82823394`: requested 56, driver logged
+`[FristOneRR] atom stride = 56`, and `GPU triangle readback: verified` completed
+with no logged KFAULT or GPU timeout. The JIT warning remained visible. The
+full probe still failed with X11 `BadMatch` at `X_GetImage` (opcode 73), so no
+client-only PASS is claimed. The 64 control was not run because 56 did not
+repeat the JOB_CONFIG_FAULT. This run used the existing raw artifact and Steam
+ANGLE pair; neither PanVK nor the APK was rebuilt.
+
+#### Development real Steam client integration
+
+This opt-in path applies the proven probe's `prepare()` function at the native
+Steam `exec`, after Gamescope has already forked and isolated its client. The
+wrapper requires the Mali Steam client markers and refuses the compositor's
+broker environment. It validates the staged driver/probe SHA256 identities,
+the local raw ICD, Steam ANGLE pair and Steam ARM64 `libvulkan.so`; it then
+sets `PANVK_ATOM_STRIDE=56`, retains the probe's compatibility settings of `0`,
+and removes inherited software GL selectors. It uses the same library search
+order as the successful probe: raw driver directory, selected Steam ANGLE
+directory, Steam panorama directory, `/usr/lib`.
+
+Steam receives `-cef-use-gl=angle -cef-use-angle=vulkan` and the client alone
+receives `ANGLE_DEFAULT_PLATFORM=vulkan`. ANGLE documents the latter as a
+default backend selector in its [Display implementation](https://chromium.googlesource.com/angle/angle/+/refs/heads/main/src/libANGLE/Display.cpp).
+This is a request, not proof that Valve's CEF build honors it. No forced Vulkan
+capabilities, API overrides, Chromium Vulkan compositor features, or new
+PanVK/ANGLE/Gamescope builds are introduced.
+
+The session shell, Stop watcher, game provisioning and compositor keep their
+existing environments. The wrapper uses `exec`, retaining the native Steam
+PID, the existing Stop mailbox and exit-42 restart loop. Each experimental
+launch has a bounded observer; the shell stops and waits for that observer
+when Steam exits. This experiment is for UI navigation only: do not launch
+games inside it. Steam descendants inherit its client environment, and game
+environment isolation is outside this experiment; no Proton/FEX/game launch
+path has been changed.
+
+**An APK rebuild/install is required once**, because the installed APK refreshes
+`droiddeck-session` and the new `droiddeck-steam-client-panvk` launcher at every
+normal Launch. The existing asset glob packages both; PanVK remains the same
+separately staged raw artifact. No full rootfs download or PanVK rebuild is
+needed. The ADB receiver itself is unchanged.
+
+From the repository on the laptop:
+
+1. Obtain the APK built from these changes and install it, with any existing
+   session stopped:
+
+   ```sh
+   adb -s E68DS8U4IVYTKJXK install -r /path/to/updated-droiddeck.apk
+   ```
+
+2. Enable session logs in DroidDeck, then start normal Mali Steam Launch.
+   While that C8A session is running, stage the existing raw artifact and
+   configure the next experimental client launch:
+
+   ```sh
+   python3 -B tools/panvk/stage_phone_test.py ~/Downloads/droiddeck-panvk-raw-test-arm64.zip --serial E68DS8U4IVYTKJXK --angle-dir /root/.local/share/Steam/steamrtarm64 --steam-client enable --run
+   ```
+
+   This configures only the next launch; it runs no GPU draw or CPU-copy
+   verifier. Expect `DROIDDECK_STEAM_CLIENT_PANVK_CONFIGURED enabled` and
+   `real Steam UI acceleration UNPROVEN`, not a rendering PASS. The guest
+   config at `/root/.config/droiddeck/steam-client-panvk.json` points to the
+   ADB-accessible `Download/DroidDeckPanVKTest/steam-client-panvk.json`.
+
+3. Use normal **Stop**, wait for teardown, then normal **Mali Steam Launch**.
+   Navigate the real Steam UI; inspect sign-in/library/menu pixels and input.
+   Wait up to 60 seconds for webhelper diagnostics. Do not launch a game.
+
+4. Inspect the new session's `session.log` and `steam/webhelper_gpu.txt`,
+   `steam/cef_log.txt` and `steam/steamwebhelper.log` where present, or use
+   DroidDeck's existing Share logs after Stop. With logs enabled they are
+   under `Download/DroidDeck/<new-session-folder>/`. To copy them:
+
+   ```sh
+   adb -s E68DS8U4IVYTKJXK pull /sdcard/Download/DroidDeck ./panvk-steam-client-logs
+   ```
+
+   Diagnostics print the enabled state, selected ICD, stride 56, requested
+   flags, actual same-launch webhelper/GPU-child PIDs and ANGLE flags, their
+   allowlisted graphics environment and mapped graphics libraries. The
+   observer records only newly written renderer lines after each launch's
+   log offsets; old renderer lines are not evidence for this experiment.
+   Missing webhelper or renderer evidence is stated explicitly. Requested
+   flags, environment values and mappings alone are not an acceptance PASS.
+
+   **Acceptance requires current real steamwebhelper renderer evidence showing
+   ANGLE Vulkan + PanVK + Mali-G52, with no llvmpipe/SwiftShader/software
+   renderer, and a visibly working UI.** Keep KFAULT/JIT/native errors visible.
+   If CEF ignores the flags, drops the ICD/search environment, falls back to
+   software or fails presentation, retain the logs and mark UI acceleration
+   unproven. The standalone verifier's historical X_GetImage `BadMatch` is not
+   a GPU failure; any new real Steam presentation failure is separate evidence.
+
+5. Exercise normal Stop and a second Launch with the option still enabled.
+   Confirm teardown and repeat renderer evidence; startup alone is insufficient.
+
+To fall back immediately for the next Launch, including when the experimental
+session cannot start, run this laptop command (no artifact/live receiver needed):
+
+```sh
+python3 -B tools/panvk/stage_phone_test.py --serial E68DS8U4IVYTKJXK --steam-client disable
+```
+
+Then normal Stop and Launch. ADB removes only the shared development config;
+the now-broken guest link causes normal Launch to print
+`Steam client PanVK acceleration disabled; C8A ANGLE/OpenGL on Mesa llvmpipe`.
+Already-running processes are not reconfigured. The immutable raw staging
+directory stays available for later probes.
 
 Only the raw driver, original ICD, local path-only ICD, probe and available
 dependency/provenance text are staged under **`/root/panvk-test/<content-id>/`**.

@@ -41,7 +41,7 @@ if [ "$mode" = mali-wayland ] || { [ "$mode" = steam ] && [ "${BL_MALI_STEAM_UI:
     command -v Xwayland >/dev/null 2>&1 || { echo 'Mali Steam compatibility unavailable: Xwayland missing'; exit 66; }
     [ -r /usr/lib/dri/swrast_dri.so ] || { echo 'Mali Steam compatibility unavailable: Mesa software GL (swrast_dri.so) missing'; exit 66; }
     step 'Steam session selected; Mali Vulkan/AHB backend; ARM64 client UI compatibility'
-    echo '== Steam client graphics: ANGLE/OpenGL on Mesa llvmpipe; compositor retains Mali proxy Vulkan'
+    echo '== Steam client graphics: C8A software default; development client selection occurs after Gamescope forks; compositor retains Mali proxy Vulkan'
     export BL_INSIDE=1
     exec gamescope --backend wayland --mali-wayland-session --mali-xwayland --expose-wayland -f \
       -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- "$0" steam
@@ -810,10 +810,26 @@ BUSCONF
         done
       ) &
     fi
+    _bl_steam=("$steam_root/steamrtarm64/steam")
+    _bl_panvk=0
+    _bl_panvk_helper=/usr/local/bin/droiddeck-steam-client-panvk
+    _bl_panvk_config=$HOME/.config/droiddeck/steam-client-panvk.json
     _bl_graphics=(-no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan)
     if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
       _bl_graphics=(-no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=gl)
-      echo "== Steam client display=$DISPLAY; graphics=software GL; UI visibility/sign-in requires phone evidence"
+      if [ -f "$_bl_panvk_config" ]; then
+        # This is Gamescope's already-isolated client branch. Only the wrapper's
+        # exec receives PanVK/ANGLE/library overrides; this shell and compositor
+        # keep their existing environments. No game/Proton/FEX setup is changed.
+        python3 -B "$_bl_panvk_helper" check --config "$_bl_panvk_config" --steam-root "$steam_root" || exit 66
+        _bl_panvk=1
+        _bl_graphics=(-no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan)
+        _bl_steam=(python3 -B "$_bl_panvk_helper" launch --config "$_bl_panvk_config" --steam-root "$steam_root" -- "$steam_root/steamrtarm64/steam")
+        echo "== Steam client display=$DISPLAY; graphics=experimental ANGLE Vulkan/PanVK; real UI acceleration UNPROVEN"
+      else
+        echo '== Steam client PanVK acceleration disabled; C8A ANGLE/OpenGL on Mesa llvmpipe'
+        echo "== Steam client display=$DISPLAY; graphics=software GL; UI visibility/sign-in requires phone evidence"
+      fi
       echo '== network: using Android DNS and existing NetworkManager bridge; login reachability not yet measured'
     fi
     echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} -clientbeta $steam_channel ${_bl_graphics[*]} $*"
@@ -871,12 +887,24 @@ BUSCONF
       fi
       step "starting the Steam client${BL_STEAM_UI:+ ($BL_STEAM_UI UI)}"
       if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
-        "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
+        if [ "$_bl_panvk" = 1 ]; then
+          _bl_panvk_offsets=$(python3 -B "$_bl_panvk_helper" offsets --steam-root "$steam_root")
+        fi
+        "${_bl_steam[@]}" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
           "${_bl_graphics[@]}" "$@" &
         steam_pid=$!
         echo "== ARM64 Steam process pid=$steam_pid executable=$steam_root/steamrtarm64/steam"
+        if [ "$_bl_panvk" = 1 ]; then
+          python3 -B "$_bl_panvk_helper" observe --steam-root "$steam_root" --steam-pid "$steam_pid" --log-offsets "$_bl_panvk_offsets" &
+          panvk_observer=$!
+        fi
         rc=0
         wait "$steam_pid" || rc=$?
+        if [ -n "${panvk_observer:-}" ]; then
+          kill "$panvk_observer" 2>/dev/null || true
+          wait "$panvk_observer" 2>/dev/null || true
+          unset panvk_observer
+        fi
       else
         "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
           "${_bl_graphics[@]}" "$@"

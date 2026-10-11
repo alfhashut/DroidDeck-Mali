@@ -52,7 +52,32 @@ def unpack(artifact, output):
             raise RuntimeError(f'raw artifact missing {name}')
 
 
-def run_phone(adb, external):
+def guest_helper_uploads(helper, directory, angle_dir, atom_stride=None, steam_client=None):
+    options = []
+    if angle_dir is not None:
+        options += ['--angle-dir', angle_dir]
+    if atom_stride is not None:
+        options += ['--atom-stride', atom_stride]
+    if steam_client is not None:
+        options += ['--steam-client', steam_client]
+    if not options:
+        return [(helper, helper.name)]
+    # The installed ADB receiver executes a fixed script without arguments.
+    # Pass this run's option through a pushed launcher, without changing the APK
+    # or the actual guest helper. The next transfer without an override restores
+    # the original script and its default auto-detection.
+    implementation = 'run_panvk_phone_test_impl.py'
+    launcher = directory / helper.name
+    launcher.write_text(
+        '#!/usr/bin/env python3\n'
+        'import runpy, sys\n'
+        'from pathlib import Path\n'
+        f'sys.argv[1:1] = {options!r}\n'
+        f'runpy.run_path(str(Path(__file__).with_name({implementation!r})), run_name="__main__")\n')
+    return [(helper, implementation), (launcher, helper.name)]
+
+
+def run_phone(adb, external, steam_client=None):
     request = uuid.uuid4().hex
     receiver = 'com.droiddeck.launcher/.gpu.PanvkClientProbeReceiver'
     broadcast = subprocess.run(adb + ['shell', shlex.join([
@@ -62,7 +87,7 @@ def run_phone(adb, external):
         raise RuntimeError('PanVK trigger rejected/not installed. Install the CI APK containing this helper and '
                            'start normal Mali Steam Launch first. ' + broadcast.stdout + broadcast.stderr)
     report = external + '/Download/DroidDeck/panvk-client-probe-' + request + '.log'
-    print('Running client-only proof; report=' + report, flush=True)
+    print(('Configuring development Steam client; report=' if steam_client else 'Running client-only proof; report=') + report, flush=True)
     deadline = time.monotonic() + 85
     output = ''
     while time.monotonic() < deadline:
@@ -72,9 +97,13 @@ def run_phone(adb, external):
             output = result.stdout
             if 'DROIDDECK_PANVK_PROBE_DONE exit=' in output:
                 print(output, end='')
-                success = ('DROIDDECK_PANVK_PROBE_DONE exit=0' in output.splitlines()
-                           and 'C8B.1 PanVK CLIENT-ONLY PROBE PASS' in output)
-                print('DroidDeck PanVK phone test ' + ('PASS' if success else 'FAIL'))
+                marker = ('DROIDDECK_STEAM_CLIENT_PANVK_CONFIGURED enabled' if steam_client else
+                          'C8B.1 PanVK CLIENT-ONLY PROBE PASS')
+                success = ('DROIDDECK_PANVK_PROBE_DONE exit=0' in output.splitlines() and marker in output)
+                if steam_client:
+                    print('Steam client PanVK configuration ' + ('enabled; real UI acceleration UNPROVEN' if success else 'FAIL'))
+                else:
+                    print('DroidDeck PanVK phone test ' + ('PASS' if success else 'FAIL'))
                 return 0 if success else 1
         time.sleep(1)
     print(output, end='')
@@ -83,11 +112,22 @@ def run_phone(adb, external):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('artifact', type=Path, help='Actions download ZIP, raw-test tar.gz, or extracted raw directory')
+    parser.add_argument('artifact', type=Path, nargs='?', help='Actions download ZIP, raw-test tar.gz, or extracted raw directory (not needed for --steam-client disable)')
     parser.add_argument('--adb', default=os.environ.get('ADB', 'adb'))
     parser.add_argument('--serial')
+    parser.add_argument('--angle-dir', help='Guest Steam ANGLE pair directory; omitted means guest auto-detection')
+    parser.add_argument('--atom-stride', choices=('auto', '56', '64'),
+                        help='Development GPU probe only: force PANVK_ATOM_STRIDE=56/64; auto leaves it unset')
+    parser.add_argument('--steam-client', choices=('enable', 'disable'),
+                        help='Development Steam integration: enable configures the next Launch with stride 56; disable restores C8A without a running session')
     parser.add_argument('--run', action='store_true', help='Trigger the ADB-only receiver in the running Mali session and print its result')
     args = parser.parse_args()
+    if args.steam_client != 'disable' and args.artifact is None:
+        parser.error('artifact is required unless --steam-client disable is used')
+    if args.steam_client and args.atom_stride not in (None, '56'):
+        parser.error('the Steam client experiment is fixed to atom stride 56')
+    if args.steam_client != 'disable':
+        print('Requested atom stride=' + ('56' if args.steam_client else (args.atom_stride or 'auto')), flush=True)
     try:
         serial = resolve_serial(args.adb, args.serial, log=True)
         adb = [args.adb, '-s', serial]
@@ -95,15 +135,23 @@ def main():
         if not external.startswith('/') or '\n' in external:
             raise RuntimeError('cannot resolve the phone shared-storage path')
         remote = external + '/Download/DroidDeckPanVKTest'
+        if args.steam_client == 'disable':
+            subprocess.run(adb + ['shell', shlex.join(['rm', '-f', remote + '/steam-client-panvk.json'])], check=True)
+            print('Steam client PanVK acceleration disabled for the next Launch. Stop normally, then Launch to restore C8A.')
+            return 0
         with tempfile.TemporaryDirectory(prefix='panvk-phone-transfer-') as directory:
             staging = Path(directory) / 'artifact'
             unpack(args.artifact, staging)
             subprocess.run(adb + ['shell', shlex.join(['mkdir', '-p', remote + '/artifact'])], check=True)
             subprocess.run(adb + ['push', str(staging) + '/.', remote + '/artifact/'], check=True)
             for name in ('run_panvk_phone_test.py', 'probe_steam_angle.py'):
-                subprocess.run(adb + ['push', str(TOOLS / 'mali-vulkan' / name), remote + '/' + name], check=True)
+                source = TOOLS / 'mali-vulkan' / name
+                uploads = (guest_helper_uploads(source, Path(directory), args.angle_dir, args.atom_stride, args.steam_client)
+                           if name == 'run_panvk_phone_test.py' else [(source, name)])
+                for local, guest_name in uploads:
+                    subprocess.run(adb + ['push', str(local), remote + '/' + guest_name], check=True)
         if args.run:
-            return run_phone(adb, external)
+            return run_phone(adb, external, args.steam_client)
         print('Development files transferred. Start normal Mali Steam Launch, then repeat this command with --run.')
         print('Optional, if the existing second-screen Linux terminal is available:')
         print(shlex.join(['python3', '-B', remote + '/run_panvk_phone_test.py']))

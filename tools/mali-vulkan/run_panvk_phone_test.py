@@ -109,7 +109,60 @@ def angle_pair(steam, explicit=None):
     return candidates[0]
 
 
-def run(artifact, steam, explicit=None):
+def submission_diagnostics(output):
+    # Report driver evidence verbatim; the requested override is not proof that
+    # this driver selected it. Do not infer an effective stride from the request.
+    strides = [line for line in output.splitlines()
+               if re.search(r'atom[ _-]*stride|stride.*atom|JOB_SUBMIT.*stride', line, re.IGNORECASE)
+               and not line.startswith(('Requested atom stride=', 'probe child PANVK_ATOM_STRIDE='))
+               and 'Command ' not in line]
+    print('PanVK detected/effective atom stride (driver log): ' +
+          ('\n'.join(strides) if strides else 'not exposed in probe output'), flush=True)
+    for fault in re.finditer(r'\[KFAULT\]\s+atom=(\S+)\s+code=(\S+)\s+core_req=(\S+)', output):
+        atom, code, core_req = fault.groups()
+        meaning = ' (JOB_CONFIG_FAULT)' if code.lower() == '0x40' else ''
+        print(f'KFAULT summary: atom={atom} code={code}{meaning} core_req={core_req}', flush=True)
+
+
+def configure_steam_client(artifact, steam, explicit=None):
+    client = client_environment()
+    probe.require(Path('/usr/local/bin/droiddeck-steam-client-panvk').is_file(),
+                  'install the APK containing the development Steam client launcher first')
+    target = stage(artifact)
+    pair = angle_pair(steam, explicit).resolve(strict=True)
+    args = argparse.Namespace(icd=str(target / 'panvk-local.json'), panvk_library=str(target / DRIVER),
+                              steam_root=str(steam), egl=str(pair / 'libEGL.so'),
+                              gles=str(pair / 'libGLESv2.so'), atom_stride='56')
+    env = probe.prepare(args, environment=client)
+    loader = pair / 'libvulkan.so'
+    probe.require(loader.resolve(strict=True).is_relative_to(steam.resolve(strict=True)),
+                  'Steam ARM64 Vulkan loader must be inside the selected Steam tree')
+    probe.native_elf(loader)
+    config = {'version': 1, 'target': str(target.resolve()), 'steam_root': str(steam.resolve()),
+              'angle_dir': str(pair), 'atom_stride': '56',
+              'driver_sha256': digest(target / DRIVER), 'probe_sha256': digest(target / 'probe_steam_angle.py')}
+    shared = Path(__file__).resolve().parent / 'steam-client-panvk.json'
+    pointer = Path.home() / '.config/droiddeck/steam-client-panvk.json'
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    # The guest owns only a link to the development config. ADB can remove the
+    # shared file to recover C8A even when the experimental client cannot start.
+    with tempfile.TemporaryDirectory(prefix='.panvk-config-', dir=shared.parent) as directory:
+        pending = Path(directory) / shared.name
+        pending.write_text(json.dumps(config, indent=2) + '\n')
+        pending.replace(shared)
+    with tempfile.TemporaryDirectory(prefix='.panvk-link-', dir=pointer.parent) as directory:
+        pending = Path(directory) / pointer.name
+        pending.symlink_to(shared)
+        pending.replace(pointer)
+    print(f'Steam client PanVK acceleration configured: enabled (DEVELOPMENT ONLY); ICD={env["VK_DRIVER_FILES"]}', flush=True)
+    print('PANVK_ATOM_STRIDE=56; CEF request=-cef-use-gl=angle -cef-use-angle=vulkan; ANGLE_DEFAULT_PLATFORM=vulkan', flush=True)
+    print(f'Steam ARM64 ANGLE directory={pair}; Vulkan loader={loader}', flush=True)
+    print(f'Guest config={pointer}; shared recovery config={shared}', flush=True)
+    print('Stop normally, then Launch again to apply. Current Steam/Gamescope environments were not changed.', flush=True)
+    print('DROIDDECK_STEAM_CLIENT_PANVK_CONFIGURED enabled; real Steam UI acceleration UNPROVEN', flush=True)
+
+
+def run(artifact, steam, explicit=None, atom_stride='auto'):
     client = client_environment()
     target = stage(artifact)
     pair = angle_pair(steam, explicit)
@@ -118,14 +171,25 @@ def run(artifact, steam, explicit=None):
     env = probe.prepare(args, environment=client)
     print(f'DEVELOPMENT CLIENT-ONLY PanVK test: guest={target}; client DISPLAY={env["DISPLAY"]}', flush=True)
     print('Gamescope stays on its existing Mali proxy/broker; normal Steam startup is unchanged.', flush=True)
+    print(f'Requested atom stride={atom_stride}', flush=True)
     # Separate process: report missing dependencies without preloading the probe's ICD.
     subprocess.run([sys.executable, '-B', '-c', 'import ctypes,sys; ctypes.CDLL(sys.argv[1])',
                     args.panvk_library], env=env, check=True, timeout=15)
     command = [sys.executable, '-B', str(target / 'probe_steam_angle.py')]
     for option in ('icd', 'panvk_library', 'steam_root', 'egl', 'gles'):
         command += ['--' + option.replace('_', '-'), getattr(args, option)]
-    result = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=40)
+    command += ['--atom-stride', atom_stride]
+    try:
+        result = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=40)
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout or ''
+        if isinstance(output, bytes):
+            output = output.decode(errors='replace')
+        print(output, end='', flush=True)
+        submission_diagnostics(output)
+        raise
     print(result.stdout, end='', flush=True)
+    submission_diagnostics(result.stdout)
     probe.require(result.returncode == 0, f'ANGLE probe exited {result.returncode}; see exact failure above')
     evidence = {
         'PanVK ICD/library loaded': ('ICD=' + args.icd, 'PanVK library=' + args.panvk_library, 'Vulkan loader='),
@@ -146,12 +210,20 @@ def main():
     parser.add_argument('--artifact', type=Path, default=Path(__file__).resolve().parent / 'artifact')
     parser.add_argument('--steam-root', type=Path, default=Path('/root/.local/share/Steam'))
     parser.add_argument('--angle-dir', type=Path)
+    parser.add_argument('--steam-client', choices=('enable',),
+                        help='Configure the next development Steam client launch with stride 56; does not run the standalone probe')
+    parser.add_argument('--atom-stride', choices=('auto', '56', '64'), default='auto',
+                        help='Development GPU probe child only; auto leaves PANVK_ATOM_STRIDE unset')
     args = parser.parse_args()
     try:
-        run(args.artifact, args.steam_root, args.angle_dir)
+        if args.steam_client:
+            configure_steam_client(args.artifact, args.steam_root, args.angle_dir)
+            return 0
+        run(args.artifact, args.steam_root, args.angle_dir, args.atom_stride)
         return 0
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-        print(f'C8B.1 PanVK CLIENT-ONLY PROBE FAIL: {error}', file=sys.stderr)
+        label = 'Steam client PanVK configuration FAIL' if args.steam_client else 'C8B.1 PanVK CLIENT-ONLY PROBE FAIL'
+        print(f'{label}: {error}', file=sys.stderr)
         print('No PASS. Keep dependency/load/native errors above; no dependency libraries were installed.', file=sys.stderr)
         return 1
 

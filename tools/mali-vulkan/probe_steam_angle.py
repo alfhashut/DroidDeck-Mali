@@ -9,6 +9,7 @@ import ctypes as C
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -51,19 +52,82 @@ def native_elf(path):
             f'expected little-endian AArch64 ELF: {path}')
 
 
+def file_identity(path):
+    info = path.stat()
+    return (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino) if info.st_ino else None
+
+
+def mapping_matches(path, identity, mapping):
+    # Kernel file identity survives symlinks, hard links and proot guest/host
+    # pathname differences. A known mismatch must never fall back to pathname.
+    if identity is not None and mapping['identity'] is not None:
+        return identity == mapping['identity']
+    if mapping['deleted']:
+        return False
+    try:
+        return Path(mapping['path']).resolve(strict=True) == path
+    except (OSError, RuntimeError):
+        return False
+
+
 def verify_loaded_libraries(args):
-    paths = {line.split(maxsplit=5)[5] for line in
-             Path('/proc/self/maps').read_text().splitlines()
-             if len(line.split(maxsplit=5)) == 6 and line.split(maxsplit=5)[5].startswith('/')}
-    mapped = {Path(path).resolve() for path in paths}
+    maps_text = Path('/proc/self/maps').read_text()
+    relevant = [line for line in maps_text.splitlines() if any(name in line.lower() for name in
+                ('libegl', 'libgles', 'angle', 'libvulkan', 'libgallium', 'swiftshader', 'swrast', 'llvmpipe'))]
+
+    def fail(message):
+        print('library mapping validation failed: ' + message, flush=True)
+        print('relevant /proc/self/maps lines:\n' + ('\n'.join(relevant) or '<none>'), flush=True)
+        raise RuntimeError(message)
+
+    mappings = []
+    for line in maps_text.splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6 or not fields[5].startswith('/') or 'x' not in fields[1]:
+            continue
+        try:
+            major, minor = (int(value, 16) for value in fields[3].split(':'))
+            inode = int(fields[4])
+        except ValueError:
+            fail('invalid file identity in /proc/self/maps: ' + line)
+        deleted = fields[5].endswith(' (deleted)')
+        raw_path = fields[5][:-10] if deleted else fields[5]
+        path = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), raw_path)
+        mappings.append({'path': path, 'identity': (major, minor, inode) if inode else None,
+                         'deleted': deleted})
+    expected = []
     for path in (args.egl, args.gles, args.panvk_library):
-        require(Path(path).resolve() in mapped, f'required library not mapped: {path}')
-    loaders = sorted(str(path) for path in mapped if path.name.startswith('libvulkan.so'))
-    require(len(loaders) == 1, 'expected exactly one mapped Vulkan loader; inspect library paths')
-    print('Vulkan loader=' + loaders[0], flush=True)
+        try:
+            canonical = Path(path).resolve(strict=True)
+            identity = file_identity(canonical)
+        except (OSError, RuntimeError) as error:
+            fail(f'cannot identify required library: {path}: {error}')
+        matches = [entry for entry in mappings if mapping_matches(canonical, identity, entry)]
+        if not matches:
+            fail(f'required library not mapped: {path}; realpath={canonical}; device/inode={identity}')
+        expected.append((canonical, identity))
+        method = 'device/inode' if identity is not None and matches[0]['identity'] is not None else 'realpath'
+        print(f'library identity verified: expected={canonical}; device/inode={identity}; '
+              f'match={method}; mapped={matches[0]["path"]}', flush=True)
+    for entry in mappings:
+        name = Path(entry['path']).name.lower()
+        if any(token in entry['path'].lower() for token in ('swiftshader', 'llvmpipe', 'swrast', 'lavapipe')):
+            fail('software graphics library mapped: ' + entry['path'])
+        if name.startswith(('libegl', 'libgles')) and not any(
+                mapping_matches(path, identity, entry) for path, identity in expected[:2]):
+            fail('unrelated EGL/GLES library mapped: ' + entry['path'])
+    # Multiple segments or host/guest aliases of the same loader count once.
+    loaders = {}
+    for entry in mappings:
+        if Path(entry['path']).name.startswith('libvulkan.so'):
+            key = entry['identity'] or str(Path(entry['path']).resolve())
+            loaders.setdefault(key, entry['path'])
+    if len(loaders) != 1:
+        fail('expected exactly one mapped Vulkan loader; inspect library paths')
+    print('Vulkan loader=' + next(iter(loaders.values())), flush=True)
     print('PanVK library=' + str(Path(args.panvk_library).resolve()), flush=True)
-    graphics = sorted(path for path in paths if any(name in path for name in
-                      ('libvulkan', 'libEGL', 'libGLES', 'libgallium')))
+    graphics = sorted({entry['path'] for entry in mappings if any(name in entry['path'].lower() for name in
+                      ('libvulkan', 'libegl', 'libgles', 'angle', 'libgallium'))})
     print('loaded graphics libraries:\n' + '\n'.join(graphics), flush=True)
 
 
@@ -107,6 +171,10 @@ def prepare(args, environment=None):
                PANVK_DXVK_COMPAT='0', PANVK_KBASE_DRI3='0',
                pan_force_enable_shader_atomics='false',
                pan_enable_vertex_pipeline_stores_atomics='false')
+    atom_stride = getattr(args, 'atom_stride', 'auto')
+    require(atom_stride in ('auto', '56', '64'), 'invalid atom stride')
+    if atom_stride != 'auto':
+        env['PANVK_ATOM_STRIDE'] = atom_stride
     # Set search paths before exec/dlopen. Parent/production environment is untouched.
     # Raw test artifacts bundle no dependencies; missing DSOs must come from the guest.
     env['LD_LIBRARY_PATH'] = ':'.join(dict.fromkeys((str(driver.parent), str(egl.parent),
@@ -309,6 +377,8 @@ def main():
     for name in ('icd', 'panvk-library', 'egl', 'gles'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--steam-root', default=str(Path.home() / '.local/share/Steam'))
+    parser.add_argument('--atom-stride', choices=('auto', '56', '64'), default='auto',
+                        help='Development probe child only; auto leaves PANVK_ATOM_STRIDE unset')
     parser.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
@@ -319,6 +389,9 @@ def main():
                          'PANVK_KBASE_DRI3', 'pan_force_enable_shader_atomics',
                          'pan_enable_vertex_pipeline_stores_atomics')),
                     'probe child environment does not select the validated inputs')
+            require(os.environ.get('PANVK_ATOM_STRIDE') == expected.get('PANVK_ATOM_STRIDE'),
+                    'probe child atom stride differs from the request')
+            print('probe child PANVK_ATOM_STRIDE=' + os.environ.get('PANVK_ATOM_STRIDE', '<unset> (auto)'), flush=True)
             run(args)
             return 0
         env = prepare(args)

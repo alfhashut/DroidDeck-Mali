@@ -16,6 +16,153 @@ import run_panvk_phone_test as phone
 
 
 class SteamAngleProbeTests(unittest.TestCase):
+    def test_client_configuration_stages_raw_inputs_and_adb_can_disable_the_guest_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.fixture(directory)
+            steam = Path(args.steam_root)
+            pair = Path(args.egl).parent
+            (pair / 'libvulkan.so').write_bytes(Path(args.egl).read_bytes())
+            artifact = root / 'artifact'
+            artifact.mkdir()
+            (artifact / phone.DRIVER).write_bytes(Path(args.panvk_library).read_bytes())
+            (artifact / phone.MANIFEST).write_bytes((Path(__file__).resolve().parents[1] /
+                'panvk/tests/fixtures/panfrost_icd.aarch64.json').read_bytes())
+            shared = root / 'shared'
+            shared.mkdir()
+            original_stage = phone.stage
+            original_is_file = Path.is_file
+            client = {'DISPLAY': ':42', 'PANVK_ATOM_STRIDE': '64', 'LIBGL_ALWAYS_SOFTWARE': '1'}
+            with patch.object(phone, 'client_environment', return_value=client), \
+                 patch.object(phone, 'stage', side_effect=lambda path: original_stage(path, root / 'panvk-test')), \
+                 patch.object(phone, '__file__', str(shared / 'run_panvk_phone_test.py')), \
+                 patch.object(Path, 'home', return_value=root), \
+                 patch.object(Path, 'is_file', lambda path: True if str(path) == '/usr/local/bin/droiddeck-steam-client-panvk' else original_is_file(path)), \
+                 patch.object(phone.subprocess, 'run') as invoke, contextlib.redirect_stdout(io.StringIO()) as output:
+                phone.configure_steam_client(artifact, steam, pair)
+            self.assertFalse(invoke.called)
+            pointer = root / '.config/droiddeck/steam-client-panvk.json'
+            self.assertTrue(pointer.is_symlink())
+            config = json.loads(pointer.read_text())
+            self.assertEqual(config['atom_stride'], '56')
+            self.assertEqual(config['driver_sha256'], phone.digest(Path(config['target']) / phone.DRIVER))
+            self.assertIn('real Steam UI acceleration UNPROVEN', output.getvalue())
+            self.assertNotIn('CLIENT-ONLY PROBE PASS', output.getvalue())
+            (shared / pointer.name).unlink()
+            self.assertFalse(pointer.is_file())
+            self.assertEqual(client['PANVK_ATOM_STRIDE'], '64')
+
+    def test_atom_stride_override_is_explicit_and_only_in_prepared_child_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            parent = {'DISPLAY': ':7', 'PANVK_ATOM_STRIDE': '64'}
+            for stride in ('auto', '56', '64'):
+                args.atom_stride = stride
+                with patch.dict(os.environ, parent, clear=True):
+                    child = probe.prepare(args)
+                    self.assertEqual(dict(os.environ), parent)
+                self.assertEqual(child.get('PANVK_ATOM_STRIDE'), None if stride == 'auto' else stride)
+            args.atom_stride = '60'
+            with self.assertRaisesRegex(RuntimeError, 'invalid atom stride'):
+                probe.prepare(args, environment=parent)
+
+    def test_phone_stride_request_preserves_faults_warnings_and_timeout_output(self):
+        warning = 'MESA: warning: kbase: KBASE_IOCTL_MEM_JIT_INIT failed: Cannot allocate memory\n'
+        fault = '[KFAULT] atom=0 code=0x40 core_req=0x0\n'
+        for stride, log in (('56', warning + fault), ('64', 'kbase: atom stride forced to 64\n' + warning + fault)):
+            for timeout in (False, True):
+                output = io.StringIO()
+                result = (subprocess.TimeoutExpired('probe', 40, output=log.encode()) if timeout else
+                          subprocess.CompletedProcess([], 1, log))
+                with patch.object(phone, 'client_environment', return_value={'DISPLAY': ':42'}), \
+                     patch.object(phone, 'stage', return_value=Path('/test')), \
+                     patch.object(phone, 'angle_pair', return_value=Path('/Steam')), \
+                     patch.object(phone.probe, 'prepare', return_value={'DISPLAY': ':42'}), \
+                     patch.object(phone.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0), result]) as invoke, \
+                     contextlib.redirect_stdout(output):
+                    with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)):
+                        phone.run(Path('/artifact'), Path('/Steam'), atom_stride=stride)
+                self.assertEqual(invoke.call_args.args[0][-2:], ['--atom-stride', stride])
+                for call in invoke.call_args_list:
+                    self.assertNotIn('PANVK_ATOM_STRIDE', call.kwargs['env'])
+                logged = output.getvalue()
+                self.assertIn(warning, logged)
+                self.assertIn(fault, logged)
+                self.assertIn('code=0x40 (JOB_CONFIG_FAULT) core_req=0x0', logged)
+                self.assertIn('not exposed in probe output' if stride == '56' else 'atom stride forced to 64', logged)
+                self.assertNotIn('CLIENT-ONLY PROBE PASS', logged)
+
+    def maps_line(self, path, shown=None, identity=None):
+        if identity is None:
+            try:
+                identity = probe.file_identity(Path(path))
+            except OSError:
+                identity = (0, 0, 0)
+        major, minor, inode = identity
+        return f'1000-2000 r-xp 0000 {major:x}:{minor:x} {inode} {shown or path}'
+
+    def test_mapping_identity_accepts_steam_symlinks_and_proot_host_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            egl = Path(args.egl)
+            target = egl.with_name('libANGLE_egl_target.so')
+            egl.rename(target)
+            egl.symlink_to(target.name)
+            for host_paths in (False, True):
+                rows = [self.maps_line(path, '/unreachable/android/linuxfs' + str(Path(path).resolve())
+                                       if host_paths else str(Path(path).resolve()))
+                        for path in (args.egl, args.gles, args.panvk_library)]
+                rows.append(self.maps_line('/usr/lib/libvulkan.so.1', identity=(8, 1, 999)))
+                # The same loader through a proot host alias is not a second loader.
+                rows.append(self.maps_line('/android/linuxfs/usr/lib/libvulkan.so.1', identity=(8, 1, 999)))
+                output = io.StringIO()
+                with patch.object(Path, 'read_text', return_value='\n'.join(rows)), contextlib.redirect_stdout(output):
+                    probe.verify_loaded_libraries(args)
+                self.assertIn('match=device/inode', output.getvalue())
+                self.assertIn('expected=' + str(target), output.getvalue())
+                self.assertIn('PanVK library=' + args.panvk_library, output.getvalue())
+
+    def test_mapping_mismatched_inode_or_device_never_falls_back_to_same_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            major, minor, inode = probe.file_identity(Path(args.egl))
+            for wrong in ((major, minor, inode + 1), (major + 1, minor, inode)):
+                rows = [self.maps_line(args.egl, identity=wrong), self.maps_line(args.gles),
+                        self.maps_line(args.panvk_library), self.maps_line('/usr/lib/libvulkan.so.1')]
+                output = io.StringIO()
+                with patch.object(Path, 'read_text', return_value='\n'.join(rows)), contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(RuntimeError, 'required library not mapped'):
+                        probe.verify_loaded_libraries(args)
+                self.assertIn('relevant /proc/self/maps lines:', output.getvalue())
+                self.assertIn(rows[0], output.getvalue())
+                self.assertIn(rows[1], output.getvalue())
+                self.assertIn('realpath=' + args.egl, output.getvalue())
+                self.assertIn('device/inode=', output.getvalue())
+
+    def test_mapping_realpath_fallback_only_when_kernel_identity_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            rows = [self.maps_line(path, identity=(0, 0, 0))
+                    for path in (args.egl, args.gles, args.panvk_library, '/usr/lib/libvulkan.so.1')]
+            output = io.StringIO()
+            with patch.object(Path, 'read_text', return_value='\n'.join(rows)), contextlib.redirect_stdout(output):
+                probe.verify_loaded_libraries(args)
+            self.assertIn('match=realpath', output.getvalue())
+
+    def test_mapping_rejects_unrelated_system_or_software_egl_even_with_expected_pair_loaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            rows = [self.maps_line(path) for path in
+                    (args.egl, args.gles, args.panvk_library, '/usr/lib/libvulkan.so.1')]
+            for other in ('/system/lib64/libEGL.so', '/usr/lib/libEGL_mesa.so',
+                          '/root/Steam/swiftshader/libEGL.so', '/usr/lib/swrast_dri.so'):
+                output = io.StringIO()
+                with patch.object(Path, 'read_text', return_value='\n'.join(rows + [self.maps_line(other)])), \
+                     contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(RuntimeError, 'unrelated EGL/GLES|software graphics'):
+                        probe.verify_loaded_libraries(args)
+                self.assertIn(other, output.getvalue())
+
     def test_phone_angle_pair_discovery_fails_on_ambiguity_instead_of_guessing(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.fixture(directory)
@@ -213,8 +360,8 @@ class SteamAngleProbeTests(unittest.TestCase):
     def test_unloaded_explicit_driver_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.fixture(directory)
-            maps = '\n'.join(f'1-2 r-xp 0000 00:00 1 {path}' for path in (args.egl, args.gles))
-            with patch.object(Path, 'read_text', return_value=maps):
+            maps = '\n'.join(self.maps_line(path) for path in (args.egl, args.gles))
+            with patch.object(Path, 'read_text', return_value=maps), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, 'required library not mapped'):
                     probe.verify_loaded_libraries(args)
 
@@ -248,14 +395,14 @@ class SteamAngleProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             args = self.fixture(directory)
             libraries = [args.egl, args.gles, args.panvk_library, '/usr/lib/libvulkan.so.1.4.357']
-            maps = '\n'.join(f'1-2 r-xp 0000 00:00 1 {p}' for p in libraries)
+            maps = '\n'.join(self.maps_line(p) for p in libraries)
             output = io.StringIO()
             with patch.object(Path, 'read_text', return_value=maps), contextlib.redirect_stdout(output):
                 probe.verify_loaded_libraries(args)
             self.assertIn('Vulkan loader=/usr/lib/libvulkan.so.1.4.357', output.getvalue())
             self.assertIn('PanVK library=' + args.panvk_library, output.getvalue())
-            maps += '\n1-2 r-xp 0000 00:00 1 /another/libvulkan.so.1'
-            with patch.object(Path, 'read_text', return_value=maps):
+            maps += '\n' + self.maps_line('/another/libvulkan.so.1')
+            with patch.object(Path, 'read_text', return_value=maps), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, 'exactly one mapped Vulkan loader'):
                     probe.verify_loaded_libraries(args)
 

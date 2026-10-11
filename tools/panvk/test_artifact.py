@@ -22,6 +22,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_phone_launcher_forwards_stride_and_angle_without_setting_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = ROOT / 'tools/mali-vulkan/run_panvk_phone_test.py'
+            self.assertEqual(phone.guest_helper_uploads(helper, root, None), [(helper, helper.name)])
+            for stride in ('auto', '56', '64'):
+                angle = '/Steam/ANGLE pair'
+                uploads = phone.guest_helper_uploads(helper, root, angle, stride)
+                self.assertEqual(uploads[0], (helper, 'run_panvk_phone_test_impl.py'))
+                launcher = uploads[1][0]
+                with patch('sys.argv', [str(launcher)]), patch('runpy.run_path') as invoke:
+                    exec(compile(launcher.read_text(), str(launcher), 'exec'), {'__file__': str(launcher)})
+                    self.assertEqual(__import__('sys').argv[1:], ['--angle-dir', angle, '--atom-stride', stride])
+                self.assertEqual(invoke.call_args.args[0], str(root / 'run_panvk_phone_test_impl.py'))
+                self.assertNotIn('environ', launcher.read_text())
+
     def test_phone_adb_trigger_is_shell_protected_and_not_implicitly_started(self):
         namespace = '{http://schemas.android.com/apk/res/android}'
         manifest = ET.parse(ROOT / 'app/src/main/AndroidManifest.xml')
@@ -30,6 +46,37 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(receiver.get(namespace + 'exported'), 'true')
         self.assertEqual(receiver.get(namespace + 'permission'), 'android.permission.DUMP')
         self.assertFalse(receiver.findall('intent-filter'))
+
+    def test_client_configuration_completion_is_distinct_from_rendering_pass(self):
+        for marker, success in (('DROIDDECK_STEAM_CLIENT_PANVK_CONFIGURED enabled', True),
+                                ('C8B.1 PanVK CLIENT-ONLY PROBE PASS', False)):
+            output = marker + '\nDROIDDECK_PANVK_PROBE_DONE exit=0\n'
+            with patch.object(phone.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, 'Broadcast completed: result=1', ''),
+                    subprocess.CompletedProcess([], 0, output, '')]), contextlib.redirect_stdout(io.StringIO()) as logged:
+                self.assertEqual(phone.run_phone(['adb'], '/storage/emulated/0', steam_client='enable'), 0 if success else 1)
+                self.assertNotIn('phone test PASS', logged.getvalue())
+                if success:
+                    self.assertIn('real UI acceleration UNPROVEN', logged.getvalue())
+
+    def test_disable_needs_no_artifact_receiver_or_running_session(self):
+        with patch('sys.argv', ['stage_phone_test.py', '--steam-client', 'disable']), \
+             patch.object(phone, 'resolve_serial', return_value='test-device'), \
+             patch.object(phone.subprocess, 'check_output', return_value='/storage/emulated/10\n'), \
+             patch.object(phone.subprocess, 'run') as invoke, contextlib.redirect_stdout(io.StringIO()) as logged:
+            self.assertEqual(phone.main(), 0)
+        self.assertEqual(invoke.call_count, 1)
+        self.assertEqual(invoke.call_args.args[0], ['adb', '-s', 'test-device', 'shell',
+                         'rm -f /storage/emulated/10/Download/DroidDeckPanVKTest/steam-client-panvk.json'])
+        self.assertIn('disabled for the next Launch', logged.getvalue())
+
+    def test_client_enable_launcher_forwards_the_configuration_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            helper = ROOT / 'tools/mali-vulkan/run_panvk_phone_test.py'
+            uploads = phone.guest_helper_uploads(helper, Path(directory), None, steam_client='enable')
+            with patch('sys.argv', [str(uploads[1][0])]), patch('runpy.run_path'):
+                exec(compile(uploads[1][0].read_text(), str(uploads[1][0]), 'exec'), {'__file__': str(uploads[1][0])})
+                self.assertEqual(__import__('sys').argv[1:], ['--steam-client', 'enable'])
 
     def test_phone_adb_run_requires_matching_request_completion_and_probe_pass(self):
         for exit_code, proof in ((0, 'C8B.1 PanVK CLIENT-ONLY PROBE PASS'),

@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import signal
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -30,6 +31,7 @@ class SteamLaunchTests(unittest.TestCase):
         text = SCRIPT.read_text().replace('/usr/lib/dri/swrast_dri.so', str(self.root / 'swrast.so'))
         text = text.replace('/run/dbus', str(self.root / 'bus'))
         text = text.replace('/usr/local/share/droiddeck', str(self.root / 'share'))
+        text = text.replace('/usr/local/bin/droiddeck-steam-client-panvk', str(self.bin / 'droiddeck-steam-client-panvk'))
         self.script.write_text(text)
         self.script.chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.root / 'home'), PATH=str(self.bin) + ':' + os.environ['PATH'],
@@ -75,6 +77,16 @@ class SteamLaunchTests(unittest.TestCase):
         self.assertIn('ICD=' + self.env['VK_DRIVER_FILES'], result.stdout)
         self.assertNotIn('--mali-interactive-client', result.stdout)
 
+    def test_outer_gamescope_ignores_client_config_and_retains_its_proxy_icd(self):
+        config = Path(self.env['HOME']) / '.config/droiddeck/steam-client-panvk.json'
+        config.parent.mkdir(parents=True)
+        config.write_text('invalid development client config; must not be read by the compositor')
+        result = self.run_session()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ICD=' + self.env['VK_DRIVER_FILES'], result.stdout)
+        self.assertNotIn('PANVK_ATOM_STRIDE', result.stdout)
+        self.assertNotIn('configuration/launch FAIL', result.stdout)
+
     def test_compatibility_dependencies_fail_before_gamescope_or_download(self):
         for missing, message in [('Xwayland', 'Xwayland missing'), ('software', 'software GL')]:
             with self.subTest(missing=missing):
@@ -110,7 +122,7 @@ class SteamLaunchTests(unittest.TestCase):
         self.assertIn('--mali-interactive-client', result.stdout)
         self.assertNotIn('--mali-xwayland', result.stdout)
 
-    def inner(self, mali=True, exits=(0,), graceful=False):
+    def inner(self, mali=True, exits=(0,), graceful=False, experimental=False):
         # Exercise the actual shared Steam branch with cheap subprocess fixtures.
         home = self.root / 'home'
         steam = home / '.local/share/Steam'
@@ -132,12 +144,16 @@ class SteamLaunchTests(unittest.TestCase):
             self.stub(name, "from pathlib import Path\nPath(" + repr(str(self.root / 'forbidden')) + ").touch()")
         binary = steam / 'steamrtarm64/steam'
         binary.write_text('''#!/usr/bin/env python3
-import json,sys,time
+import json,os,sys,time
 from pathlib import Path
 root=Path(''' + repr(str(self.root)) + ''')
 p=root/'calls.json'
 calls=json.loads(p.read_text()) if p.exists() else []
 calls.append(sys.argv[1:]);p.write_text(json.dumps(calls))
+e=root/'client-envs.json'
+envs=json.loads(e.read_text()) if e.exists() else []
+envs.append({k:os.environ.get(k) for k in ('PANVK_ATOM_STRIDE','VK_DRIVER_FILES','LIBGL_ALWAYS_SOFTWARE','ANGLE_DEFAULT_PLATFORM')})
+e.write_text(json.dumps(envs))
 if '-shutdown' in sys.argv:
     (root/'shutdown-ack').touch();sys.exit(0)
 if ''' + repr(graceful) + ''' and not (root/'graceful-once').exists():
@@ -155,6 +171,34 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
             BL_DESKTOP='1', BL_LOSSLESS_OWNED='1', BL_STEAMDECK='0', BL_ADDED_GAMES='',
             XDG_DATA_HOME=str(home / '.local/share'), XDG_CONFIG_HOME=str(home / '.config'),
             XDG_CACHE_HOME=str(home / '.cache'), BL_CLIENT_CPUS='')
+        if experimental:
+            helper = self.bin / 'droiddeck-steam-client-panvk'
+            helper.write_bytes((ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-client-panvk').read_bytes())
+            target = home / 'panvk-test' / ('a' * 64)
+            target.mkdir(parents=True)
+            native = bytearray(20)
+            native[:6] = b'\x7fELF\x02\x01'
+            struct.pack_into('<H', native, 18, 183)
+            for path in (target / 'libvulkan_panfrost.so', steam / 'steamrtarm64/libEGL.so',
+                         steam / 'steamrtarm64/libGLESv2.so', steam / 'steamrtarm64/libvulkan.so'):
+                path.write_bytes(native)
+            (target / 'panvk-local.json').write_text(json.dumps({'file_format_version': '1.0.1', 'ICD': {
+                'library_path': './libvulkan_panfrost.so', 'api_version': '1.3.354', 'library_arch': '64'}}))
+            script = target / 'probe_steam_angle.py'
+            script.write_bytes((ROOT / 'tools/mali-vulkan/probe_steam_angle.py').read_bytes())
+            import hashlib
+            self.shared_config = self.root / 'shared-client-config.json'
+            self.shared_config.write_text(json.dumps({'version': 1, 'atom_stride': '56',
+                'target': str(target), 'steam_root': str(steam), 'angle_dir': str(steam / 'steamrtarm64'),
+                'probe_sha256': hashlib.sha256(script.read_bytes()).hexdigest(),
+                'driver_sha256': hashlib.sha256((target / 'libvulkan_panfrost.so').read_bytes()).hexdigest()}))
+            pointer = home / '.config/droiddeck/steam-client-panvk.json'
+            pointer.parent.mkdir(parents=True)
+            pointer.symlink_to(self.shared_config)
+            # Model Gamescope's existing post-fork client isolation accurately.
+            self.inner_env.update(MALI_VULKAN_NORMAL_SESSION='', MALI_VULKAN_BROKER_SOCKET='',
+                VK_DRIVER_FILES='', VK_ICD_FILENAMES='', LIBGL_ALWAYS_SOFTWARE='1',
+                MESA_LOADER_DRIVER_OVERRIDE='swrast', GALLIUM_DRIVER='llvmpipe')
         result = self.run_session(env=self.inner_env)
         return result, json.loads((self.root / 'calls.json').read_text())
 
@@ -184,6 +228,38 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ['-no-cef-sandbox', '-cef-force-gpu',
             '-cef-ozone-platform=x11', '-cef-use-gl=angle', '-cef-use-angle=vulkan'])
+
+    def test_experimental_client_restart_is_isolated_and_shared_config_removal_restores_c8a(self):
+        result, calls = self.inner(exits=(42, 0), experimental=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 2)
+        envs = json.loads((self.root / 'client-envs.json').read_text())
+        for args, env in zip(calls, envs):
+            self.assertIn('-cef-use-angle=vulkan', args)
+            self.assertNotIn('-cef-use-angle=gl', args)
+            self.assertEqual(env['PANVK_ATOM_STRIDE'], '56')
+            self.assertEqual(env['ANGLE_DEFAULT_PLATFORM'], 'vulkan')
+            self.assertIsNone(env['LIBGL_ALWAYS_SOFTWARE'])
+        self.assertFalse((self.root / 'forbidden').exists())
+        self.assertIn('UI acceleration UNPROVEN', result.stdout)
+        self.shared_config.unlink()
+        fallback = self.run_session(env=self.inner_env)
+        self.assertEqual(fallback.returncode, 0, fallback.stdout + fallback.stderr)
+        last = json.loads((self.root / 'client-envs.json').read_text())[-1]
+        self.assertIsNone(last['PANVK_ATOM_STRIDE'])
+        self.assertEqual(last['LIBGL_ALWAYS_SOFTWARE'], '1')
+        self.assertIn('acceleration disabled; C8A', fallback.stdout)
+        self.assertIn('-cef-use-angle=gl', json.loads((self.root / 'calls.json').read_text())[-1])
+
+    def test_experimental_client_uses_existing_clean_stop_without_exporting_panvk_to_the_watcher(self):
+        result, calls = self.inner(graceful=True, experimental=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls[1], ['-shutdown'])
+        envs = json.loads((self.root / 'client-envs.json').read_text())
+        self.assertEqual(envs[0]['PANVK_ATOM_STRIDE'], '56')
+        self.assertIsNone(envs[1]['PANVK_ATOM_STRIDE'])
+        self.assertEqual(envs[1]['LIBGL_ALWAYS_SOFTWARE'], '1')
+        self.assertIn('the app asked for a clean exit', result.stdout)
 
     def test_real_stop_mailbox_and_second_launch_reuse_existing_client(self):
         result, calls = self.inner(graceful=True)
