@@ -22,6 +22,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_affinity_requires_explicit_live_swap_experiment_before_adb(self):
+        for flags in (['--client-affinity', '0xff'],
+                      ['--perf-diagnostics', '--client-affinity', '0xff', '--run'],
+                      ['--swap-diagnostics', '--client-affinity', '0xff']):
+            with patch('sys.argv', ['stage_phone_test.py']+flags), \
+                 patch.object(phone, 'resolve_serial') as resolve, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    phone.main()
+                self.assertEqual(error.exception.code, 2)
+                resolve.assert_not_called()
+
     def test_x11_completion_cannot_substitute_for_gpu_proof(self):
         output = 'DROIDDECK_X11_DIAGNOSTICS_DONE\nDROIDDECK_PANVK_PROBE_DONE exit=0\n'
         for diagnostics in (False, True):
