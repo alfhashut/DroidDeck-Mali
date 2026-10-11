@@ -95,17 +95,38 @@ def runtime_closure(driver, roots):
     return files, sorted(external)
 
 
-def relocate_manifest(original):
+def relocate_manifest(original, path='<generated ICD>'):
     # Preserve generated format/API/other semantic fields; relocate only the library.
+    received = f'{path}: received JSON={json.dumps(original, sort_keys=True)}'
+
+    def check(condition, message):
+        require(condition, f'{message}; {received}')
+
+    check(isinstance(original, dict), 'generated ICD must be a JSON object')
     manifest = json.loads(json.dumps(original))
-    require(manifest.get('file_format_version') == '1.0.0', 'unexpected generated ICD format')
-    require(isinstance(manifest.get('ICD'), dict), 'missing generated ICD fields')
+    check(manifest.get('file_format_version') in ('1.0.0', '1.0.1'),
+          'unexpected generated ICD format (expected 1.0.0 or 1.0.1)')
+    check(isinstance(manifest.get('ICD'), dict), 'missing generated ICD fields')
     entry = manifest['ICD']
-    require(re.fullmatch(r'\d+\.\d+\.\d+', entry.get('api_version', '')),
-            'invalid generated ICD API version')
-    require(Path(entry.get('library_path', '')).name == DRIVER, 'wrong generated ICD library')
+    version = entry.get('api_version')
+    check(isinstance(version, str) and re.fullmatch(r'\d+\.\d+\.\d+', version),
+          'invalid generated ICD API version')
+    library = entry.get('library_path')
+    check(isinstance(library, str) and '\0' not in library and Path(library).name == DRIVER,
+          f'wrong generated ICD library (expected {DRIVER})')
+    check('library_arch' not in entry or entry['library_arch'] == '64',
+          'wrong generated ICD architecture (expected string "64")')
     entry['library_path'] = '../../../lib/' + DRIVER
     return manifest
+
+
+def read_manifest(path):
+    text = path.read_text()
+    try:
+        original = json.loads(text)
+    except ValueError as error:
+        raise RuntimeError(f'invalid generated ICD JSON at {path}: {error}; received text={text!r}') from error
+    return relocate_manifest(original, path)
 
 
 def package_owner(path):
@@ -128,8 +149,7 @@ def package(source, build, output):
             'source differs from audited commit')
     require(not output.exists(), 'output already exists; refusing to overwrite')
     driver = build / 'src/panfrost/vulkan' / DRIVER
-    original = json.loads((build / 'src/panfrost/vulkan/panfrost_icd.aarch64.json').read_text())
-    manifest = relocate_manifest(original)
+    manifest = read_manifest(build / 'src/panfrost/vulkan/panfrost_icd.aarch64.json')
     roots = [Path('/usr/lib/aarch64-linux-gnu'), Path('/lib/aarch64-linux-gnu')]
     files, external = runtime_closure(driver, roots)
     require(command('uname', '-m') == 'aarch64', 'packaging requires native AArch64')

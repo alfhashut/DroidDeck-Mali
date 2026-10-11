@@ -78,7 +78,51 @@ class ArtifactTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, reason):
                         artifact.runtime_closure(outside, [root])
 
-    def test_relocated_manifest_preserves_semantics_and_works_with_existing_probe(self):
+    def test_pinned_mesa_manifest_relocates_only_library_path(self):
+        # Exact pinned vk_icd_gen.py output with the B0 Meson target arguments:
+        # --api-version 1.4 --sizeof-pointer 8, pinned vk.xml, installed libdir.
+        fixture = artifact.TOOLS / 'tests/fixtures/panfrost_icd.aarch64.json'
+        original = json.loads(fixture.read_text())
+        relocated = artifact.read_manifest(fixture)
+        expected = json.loads(fixture.read_text())
+        expected['ICD']['library_path'] = '../../../lib/' + artifact.DRIVER
+        self.assertEqual(relocated, expected)
+        self.assertEqual(json.loads(fixture.read_text()), original)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'relocated artifact with spaces'
+            manifest = root / artifact.ICD
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps(relocated))
+            (root / 'lib').mkdir()
+            driver = self.elf(root / 'lib' / artifact.DRIVER)
+            self.assertEqual((manifest.parent / relocated['ICD']['library_path']).resolve(), driver)
+
+    def test_manifest_rejections_report_path_and_received_json(self):
+        original = json.loads((artifact.TOOLS / 'tests/fixtures/panfrost_icd.aarch64.json').read_text())
+        invalid = [None, [], {}, dict(original, file_format_version='1.0.2'),
+                   dict(original, ICD=[])]
+        for key, value in (('api_version', None), ('api_version', '1.4'),
+                           ('library_path', None), ('library_path', 'libGLES_mali.so'),
+                           ('library_path', 'libvulkan.so.1'), ('library_path', 'libc.so.6'),
+                           ('library_path', 'bad\0/' + artifact.DRIVER),
+                           ('library_arch', '32'), ('library_arch', 64)):
+            invalid.append(dict(original, ICD=dict(original['ICD'], **{key: value})))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'panfrost_icd.aarch64.json'
+            for data in invalid:
+                with self.subTest(data=data):
+                    path.write_text(json.dumps(data))
+                    with self.assertRaises(RuntimeError) as caught:
+                        artifact.read_manifest(path)
+                    self.assertIn(str(path), str(caught.exception))
+                    self.assertIn('received JSON=' + json.dumps(data, sort_keys=True), str(caught.exception))
+            path.write_text('{broken JSON')
+            with self.assertRaises(RuntimeError) as caught:
+                artifact.read_manifest(path)
+            self.assertIn(str(path), str(caught.exception))
+            self.assertIn('{broken JSON', str(caught.exception))
+
+    def test_legacy_relocated_manifest_preserves_semantics_and_works_with_existing_probe(self):
         original = {'file_format_version': '1.0.0', 'ICD': {
             'library_path': '/opt/droiddeck-client-panvk/lib/' + artifact.DRIVER,
             'api_version': '1.4.357', 'is_portability_driver': False}}
