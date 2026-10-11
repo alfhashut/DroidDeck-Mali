@@ -3,6 +3,14 @@ name: Build isolated PanVK glibc ARM64 probe artifact
 # C8B.1 B0 only: no APK integration, production staging, release, or automatic builds.
 'on':
   workflow_dispatch:
+    inputs:
+      artifact_mode:
+        description: Temporary raw phone-test output or strict portable package
+        type: choice
+        default: raw-test
+        options:
+          - raw-test
+          - audited-package
 
 permissions:
   contents: read
@@ -19,6 +27,7 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
       LC_ALL: C.UTF-8
+      PANVK_ARTIFACT: ${{ inputs.artifact_mode == 'audited-package' && 'panvk-glibc-arm64' || 'droiddeck-panvk-raw-test-arm64' }}
     steps:
       - name: Install native build dependencies
         run: |
@@ -57,26 +66,26 @@ jobs:
           ref: ${{ steps.source.outputs.commit }}
           path: panvk-source
           persist-credentials: false
-      - name: Build and audit isolated runtime
+      - name: Build isolated ICD and stage selected artifact (raw-test by default)
         run: |
           bash tools/panvk/build-glibc.sh \
             "$GITHUB_WORKSPACE/panvk-source" "$RUNNER_TEMP/panvk-build" \
-            "$GITHUB_WORKSPACE/out/panvk-glibc-arm64"
+            "$GITHUB_WORKSPACE/out/$PANVK_ARTIFACT" "${{ inputs.artifact_mode || 'raw-test' }}"
       - name: Archive without installing into the runner or APK
         run: |
           set -euo pipefail
           panvk_epoch=$(git -C panvk-source show -s --format=%ct HEAD)
           tar --sort=name --mtime="@$panvk_epoch" --owner=0 --group=0 --numeric-owner \
-            -C out -cf - panvk-glibc-arm64 | gzip -n > out/panvk-glibc-arm64.tar.gz
+            -C out -cf - "$PANVK_ARTIFACT" | gzip -n > "out/$PANVK_ARTIFACT.tar.gz"
           cd out
-          sha256sum panvk-glibc-arm64.tar.gz > panvk-glibc-arm64.tar.gz.sha256
-          cat panvk-glibc-arm64/BUILD_INFO.txt >> "$GITHUB_STEP_SUMMARY"
+          sha256sum "$PANVK_ARTIFACT.tar.gz" > "$PANVK_ARTIFACT.tar.gz.sha256"
+          cat "$PANVK_ARTIFACT/BUILD_INFO.txt" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: panvk-glibc-arm64
+          name: ${{ env.PANVK_ARTIFACT }}
           path: |
-            out/panvk-glibc-arm64.tar.gz
-            out/panvk-glibc-arm64.tar.gz.sha256
+            out/${{ env.PANVK_ARTIFACT }}.tar.gz
+            out/${{ env.PANVK_ARTIFACT }}.tar.gz.sha256
           if-no-files-found: error
       - name: Preserve configure failure evidence
         if: failure()

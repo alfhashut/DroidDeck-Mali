@@ -5,10 +5,15 @@ if [[ ${GITHUB_ACTIONS:-} != true || ${RUNNER_ARCH:-} != ARM64 || $(uname -m) !=
     echo 'PanVK build requires the native ARM64 GitHub Actions job; do not build locally.' >&2
     exit 1
 fi
-if [[ $# != 3 ]]; then
-    echo "usage: $0 SOURCE BUILD OUTPUT" >&2
+if [[ $# != 3 && $# != 4 ]]; then
+    echo "usage: $0 SOURCE BUILD OUTPUT [audited-package|raw-test]" >&2
     exit 2
 fi
+panvk_mode=${4:-audited-package}
+case "$panvk_mode" in
+    audited-package|raw-test) ;;
+    *) echo "Unknown PanVK artifact mode: $panvk_mode" >&2; exit 2 ;;
+esac
 panvk_tools=$(cd -- "$(dirname -- "$0")" && pwd)
 panvk_source=$(realpath -- "$1")
 panvk_build=$(realpath -m -- "$2")
@@ -31,5 +36,11 @@ meson setup "$panvk_build" "$panvk_source" "${panvk_options[@]}"
 ninja -C "$panvk_build" -j 2 \
     src/panfrost/vulkan/libvulkan_panfrost.so \
     src/panfrost/vulkan/panfrost_icd.aarch64.json
-python3 -B "$panvk_tools/package_glibc.py" \
-    --source "$panvk_source" --build "$panvk_build" --output "$panvk_output"
+if [[ $panvk_mode == raw-test ]]; then
+    # Development-only: keep exact build outputs; do not invoke strict packaging.
+    python3 -B "$panvk_tools/stage_raw_test.py" \
+        --source "$panvk_source" --build "$panvk_build" --output "$panvk_output"
+else
+    python3 -B "$panvk_tools/package_glibc.py" \
+        --source "$panvk_source" --build "$panvk_build" --output "$panvk_output"
+fi

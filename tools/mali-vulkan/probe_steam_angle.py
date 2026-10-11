@@ -79,8 +79,12 @@ def prepare(args):
     icd, driver = (Path(p).resolve(strict=True) for p in (args.icd, args.panvk_library))
     require(icd.stat().st_size <= 1024 * 1024, 'oversized ICD manifest')
     manifest = json.loads(icd.read_text())
-    require(manifest.get('file_format_version') == '1.0.0', 'unexpected ICD format')
-    entry = manifest['ICD']
+    require(isinstance(manifest, dict) and manifest.get('file_format_version') in ('1.0.0', '1.0.1'),
+            'unexpected ICD format (expected 1.0.0 or 1.0.1)')
+    entry = manifest.get('ICD')
+    require(isinstance(entry, dict), 'ICD fields missing')
+    require('library_arch' not in entry or entry['library_arch'] == '64',
+            'ICD architecture must be string "64"')
     require(isinstance(entry.get('api_version'), str), 'ICD API version missing')
     library = Path(entry['library_path'])
     library = (library if library.is_absolute() else icd.parent / library).resolve(strict=True)
@@ -103,7 +107,7 @@ def prepare(args):
                pan_force_enable_shader_atomics='false',
                pan_enable_vertex_pipeline_stores_atomics='false')
     # Set search paths before exec/dlopen. Parent/production environment is untouched.
-    # The isolated artifact includes its private dependency closure beside the ICD.
+    # Raw test artifacts bundle no dependencies; missing DSOs must come from the guest.
     env['LD_LIBRARY_PATH'] = ':'.join(dict.fromkeys((str(driver.parent), str(egl.parent),
         str(root / 'steamrtarm64/panorama'), '/usr/lib')))
     return env

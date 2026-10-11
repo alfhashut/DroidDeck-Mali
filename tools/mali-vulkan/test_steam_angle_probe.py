@@ -95,6 +95,32 @@ class SteamAngleProbeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'required library not mapped'):
                     probe.verify_loaded_libraries(args)
 
+    def test_raw_mesa_101_manifest_works_after_library_path_only_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            fixture = Path(__file__).resolve().parents[1] / 'panvk/tests/fixtures/panfrost_icd.aarch64.json'
+            manifest = json.loads(fixture.read_text())
+            driver = Path(args.panvk_library).with_name('libvulkan_panfrost.so')
+            Path(args.panvk_library).rename(driver)
+            args.panvk_library = str(driver)
+            manifest['ICD']['library_path'] = './' + driver.name
+            icd = Path(args.icd)
+            icd.write_text(json.dumps(manifest))
+            with patch.dict(os.environ, {'DISPLAY': ':7'}, clear=True):
+                child = probe.prepare(args)
+                self.assertEqual(child['VK_DRIVER_FILES'], str(icd))
+                self.assertEqual(child['LD_LIBRARY_PATH'].split(':')[0], str(driver.parent))
+                for arch in ('32', 64, None):
+                    manifest['ICD']['library_arch'] = arch
+                    icd.write_text(json.dumps(manifest))
+                    with self.assertRaisesRegex(RuntimeError, 'architecture'):
+                        probe.prepare(args)
+                manifest['ICD']['library_arch'] = '64'
+                manifest['file_format_version'] = '1.0.2'
+                icd.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(RuntimeError, 'ICD format'):
+                    probe.prepare(args)
+
     def test_loader_path_is_reported_and_ambiguous_loaders_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.fixture(directory)

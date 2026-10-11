@@ -1,7 +1,8 @@
 # C8B.1: client graphics audit
 
 Status: **Phase A preserved; Phase A2 ANGLE audit and standalone phone probe;
-Phase B0 manual CI artifact build defined below. Hardware client acceleration
+Phase B0 native build reported successful; portable packaging deferred in favor
+of a temporary raw-test CI artifact defined below. Hardware client acceleration
 is not phone-proven or enabled for Steam.** C8A's working software client remains
 the fallback and current behavior. No Gamescope, proxy, broker, compositor,
 session or APK packaging changes.
@@ -544,6 +545,11 @@ the native ARM64 Actions environment, verifies a clean source checkout, applies
 `patches/0001-android-only-liblog.patch` and
 `patches/0002-clc-supported-availability-warnings.patch`, and runs Meson with
 the recorded options. Artifact metadata records both patch filenames and hashes.
+The workflow now defaults to `artifact_mode=raw-test`, which bypasses
+`package_glibc.py` after the same build; explicitly choosing `audited-package`
+retains the strict path described here. The build script's three-argument default
+also remains the strict path. No packaging validator or dependency allowlist is
+weakened by the development bypass.
 Ninja builds only `libvulkan_panfrost.so` and
 `panfrost_icd.aarch64.json`, plus their required generated/build dependencies,
 with two workers. CLC and precomp generators are not installed or shipped.
@@ -569,7 +575,7 @@ glibc symbol requirements; the container's glibc version alone is not the exact
 minimum. Nothing replaces `/usr/lib`, rootfs ICD discovery files, the Vulkan
 loader, software Mesa or the Gamescope proxy.
 
-The Actions artifact named `panvk-glibc-arm64` contains:
+The optional **audited-package** Actions artifact named `panvk-glibc-arm64` contains:
 
 ```text
 panvk-glibc-arm64.tar.gz
@@ -606,10 +612,106 @@ a failed build/package step produces no successful runtime artifact.
 
 ### Phase B1 preparation and phone commands
 
-Later, run **Build isolated PanVK glibc ARM64 probe artifact** manually in
-Actions on the intended branch. The first attempt failed during setup as noted
-above; the next run may expose further issues. Do not infer build success from
-host unit tests. Download and transfer its two files plus
+#### Temporary raw-test path (current development default)
+
+The native Mesa build reached `[901/901] Linking target
+src/panfrost/vulkan/libvulkan_panfrost.so` in CI. Polished portable packaging is
+intentionally deferred. Run **Build isolated PanVK glibc ARM64 probe artifact**
+manually on the intended branch with **artifact_mode: raw-test**. Download the
+Actions artifact **droiddeck-panvk-raw-test-arm64** and extract the download ZIP
+on the host. It contains a `.tar.gz` and its `.sha256` file. In that directory:
+
+```sh
+sha256sum -c droiddeck-panvk-raw-test-arm64.tar.gz.sha256
+tar -xzf droiddeck-panvk-raw-test-arm64.tar.gz
+(cd droiddeck-panvk-raw-test-arm64 && sha256sum -c SHA256SUMS)
+```
+
+This is **TEMPORARY / DEVELOPMENT-ONLY / NOT PRODUCTION-READY**. Its explicit
+file list is the built `libvulkan_panfrost.so`, the **byte-for-byte generated**
+`panfrost_icd.aarch64.json`, `DEPENDENCIES.txt` (readelf dynamic dependencies and
+symbol-version requirements), `BUILD_INFO.txt`, `SOURCE_DIFF.patch`, Mesa's
+license and `SHA256SUMS`. It bundles **no dependencies**, Android vendor DSOs,
+glibc or Vulkan loader. It does not claim portable ABI compatibility or successful
+phone execution. No strict packaging code runs in this mode.
+
+Use the existing DroidDeck Linux-runtime file-transfer mechanism to copy the
+whole extracted directory to
+`/root/panvk-probe/droiddeck-panvk-raw-test-arm64/` **inside the Linux guest**.
+Also copy `tools/mali-vulkan/probe_steam_angle.py` to
+`/root/panvk-probe/probe_steam_angle.py`. An Android filesystem copy alone does
+not establish that the files are present at these guest paths. In the guest:
+
+```sh
+cd /root/panvk-probe/droiddeck-panvk-raw-test-arm64
+sha256sum -c SHA256SUMS
+cat BUILD_INFO.txt
+cat DEPENDENCIES.txt
+getconf GNU_LIBC_VERSION
+```
+
+The generated ICD is format **1.0.1**, API **1.4.354**, `library_arch: "64"`,
+with build-install path
+`/opt/droiddeck-client-panvk/lib/libvulkan_panfrost.so`. Preserve that original
+JSON as evidence. Create a **separate local ICD**, changing only `library_path`
+to locate the adjacent raw library. The standalone probe now accepts validated
+1.0.0/1.0.1 manifests and rejects a non-64-bit architecture field.
+
+Run the following only in the existing isolated **Xwayland client environment**,
+whose live `DISPLAY` is set and whose compositor broker/proxy selectors have
+already been cleared by the client fork. Find the actual paired ANGLE libraries
+in the installed Steam tree and replace `ACTUAL_PAIR_DIRECTORY` below. Keep
+Gamescope's parent environment unchanged; do not replace normal Steam startup.
+
+```sh
+(
+set -eu
+panvk_test=/root/panvk-probe/droiddeck-panvk-raw-test-arm64
+angle_pair=/root/.local/share/Steam/ACTUAL_PAIR_DIRECTORY
+python3 -B - "$panvk_test" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+manifest = json.loads((root / 'panfrost_icd.aarch64.json').read_text())
+assert manifest['file_format_version'] == '1.0.1'
+assert manifest['ICD']['library_arch'] == '64'
+assert Path(manifest['ICD']['library_path']).name == 'libvulkan_panfrost.so'
+manifest['ICD']['library_path'] = './libvulkan_panfrost.so'
+(root / 'panvk-local.json').write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+export VK_DRIVER_FILES="$panvk_test/panvk-local.json"
+export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+export LD_LIBRARY_PATH="$panvk_test:$angle_pair:/root/.local/share/Steam/steamrtarm64/panorama:/usr/lib"
+# A separate process reports the exact missing DSO or symbol version before ANGLE
+# can reduce an ICD load failure to a generic eglInitialize error.
+python3 -B -c 'import ctypes,sys; ctypes.CDLL(sys.argv[1])' "$panvk_test/libvulkan_panfrost.so"
+python3 -B /root/panvk-probe/probe_steam_angle.py \
+  --icd "$VK_DRIVER_FILES" \
+  --panvk-library "$panvk_test/libvulkan_panfrost.so" \
+  --egl "$angle_pair/libEGL.so" \
+  --gles "$angle_pair/libGLESv2.so"
+)
+```
+
+If the preflight or probe reports a missing dependency, preserve the **exact
+`OSError` library name/version** and `DEPENDENCIES.txt`; stop and report it.
+Do not copy CI system libraries or vendor libraries into this artifact or replace
+the guest's glibc/loader. Native glibc and dependency compatibility remain phone
+questions, not promises made by a raw upload.
+
+Require `ANGLE backend=Vulkan`, the explicit PanVK ICD/library and one guest
+Vulkan loader, a real Mali-G52 device (software renderers including llvmpipe are
+rejected), `GPU triangle readback: verified`, verified X11 CPU-copy pixels, clean
+teardown and `probe exit=0`. Keep all stdout/stderr and visually confirm the red
+triangle. This proves the standalone ANGLE draw/readback path only; Steam/CEF UI
+acceleration and polished B0 packaging/upload remain unproven. A new GitHub run
+must first confirm that the raw artifact is staged and uploaded successfully.
+
+#### Optional audited-package path (deferred)
+
+If explicitly choosing `artifact_mode=audited-package`, the unchanged strict
+packaging path must complete before the following instructions apply. Do not
+infer packaging/upload success from host unit tests. Download its two files plus
 `tools/mali-vulkan/probe_steam_angle.py` into an isolated guest directory.
 For example, inside the existing Linux guest, with those files already present:
 

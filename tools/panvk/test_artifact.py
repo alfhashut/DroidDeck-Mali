@@ -9,11 +9,64 @@ import unittest
 from unittest.mock import patch
 
 import package_glibc as artifact
+import stage_raw_test as raw
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_raw_test_copies_only_explicit_outputs_and_keeps_exact_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, build, output = root / 'source', root / 'build', root / 'raw-test'
+            (source / 'docs').mkdir(parents=True)
+            (source / 'docs/license.rst').write_text('Mesa license fixture')
+            (source / 'VERSION').write_text('26.3.0-devel\n')
+            generated = build / 'src/panfrost/vulkan'
+            generated.mkdir(parents=True)
+            self.elf(generated / raw.DRIVER)
+            manifest = (artifact.TOOLS / 'tests/fixtures/panfrost_icd.aarch64.json').read_bytes()
+            (generated / raw.MANIFEST).write_bytes(manifest)
+            for name in ('libGLES_mali.so', 'libc.so.6', 'libvulkan.so.1', 'libdrm.so.2'):
+                (generated / name).write_bytes(b'must not be copied')
+            pin = json.loads((artifact.TOOLS / 'source.json').read_text())
+            def command(*argv):
+                if argv[-2:] == ('rev-parse', 'HEAD'):
+                    return pin['commit'] + '\n'
+                if argv[-2:] == ('diff', '--binary'):
+                    return 'source patch fixture\n'
+                if argv[:2] == ('readelf', '-dW'):
+                    return '(NEEDED) Shared library: [libdrm.so.2]\n'
+                if argv[:3] == ('readelf', '--version-info', '--wide'):
+                    return 'Name: GLIBC_2.38\n'
+                self.fail(f'unexpected command: {argv}')
+            with patch.object(raw, 'command', side_effect=command):
+                raw.stage(source, build, output)
+                with self.assertRaises(FileExistsError):
+                    raw.stage(source, build, output)
+            self.assertEqual({p.name for p in output.iterdir()}, {
+                raw.DRIVER, raw.MANIFEST, 'DEPENDENCIES.txt', 'SOURCE_DIFF.patch',
+                'BUILD_INFO.txt', 'SHA256SUMS', 'Mesa-license.rst'})
+            self.assertEqual((output / raw.MANIFEST).read_bytes(), manifest)
+            self.assertEqual((output / raw.DRIVER).read_bytes(), (generated / raw.DRIVER).read_bytes())
+            dependencies = (output / 'DEPENDENCIES.txt').read_text()
+            self.assertIn('libdrm.so.2', dependencies)
+            self.assertIn('GLIBC_2.38', dependencies)
+            info = json.loads((output / 'BUILD_INFO.txt').read_text())
+            self.assertIn('NOT PRODUCTION-READY', info['status'])
+            self.assertEqual(info['source_commit'], pin['commit'])
+            for line in (output / 'SHA256SUMS').read_text().splitlines():
+                checksum, name = line.split('  ')
+                self.assertEqual(checksum, raw.digest(output / name))
+
+    def test_raw_test_rejects_wrong_source_before_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(raw, 'command', return_value='wrong commit\n'):
+                with self.assertRaisesRegex(RuntimeError, 'pinned commit'):
+                    raw.stage(root / 'source', root / 'build', root / 'out')
+            self.assertFalse((root / 'out').exists())
+
     def elf(self, path, machine=183):
         data = bytearray(20)
         data[:6] = b'\x7fELF\x02\x01'
@@ -161,8 +214,12 @@ class ArtifactTests(unittest.TestCase):
         import yaml
         workflow = yaml.safe_load((ROOT / '.github/workflows/build-panvk-glibc.yml').read_text())
         self.assertEqual(set(workflow['on']), {'workflow_dispatch'})
+        mode = workflow['on']['workflow_dispatch']['inputs']['artifact_mode']
+        self.assertEqual(mode['default'], 'raw-test')
+        self.assertEqual(mode['options'], ['raw-test', 'audited-package'])
         self.assertEqual(workflow['permissions'], {'contents': 'read'})
         job = workflow['jobs']['panvk']
+        self.assertIn('droiddeck-panvk-raw-test-arm64', job['env']['PANVK_ARTIFACT'])
         self.assertEqual(job['runs-on'], 'ubuntu-24.04-arm')
         self.assertEqual(job['container'], 'debian:13-slim')
         pin = json.loads((artifact.TOOLS / 'source.json').read_text())
