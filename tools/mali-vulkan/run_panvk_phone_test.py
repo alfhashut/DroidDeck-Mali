@@ -155,7 +155,7 @@ def configure_steam_client(artifact, steam, explicit=None):
         pending.symlink_to(shared)
         pending.replace(pointer)
     print(f'Steam client PanVK acceleration configured: enabled (DEVELOPMENT ONLY); ICD={env["VK_DRIVER_FILES"]}', flush=True)
-    print('PANVK_ATOM_STRIDE=56; CEF request=-cef-use-gl=angle -cef-use-angle=vulkan; ANGLE_DEFAULT_PLATFORM=vulkan', flush=True)
+    print('PANVK_ATOM_STRIDE=56; Steam CEF request=-cef-use-vulkan -> --use-angle=vulkan; ANGLE_DEFAULT_PLATFORM=vulkan', flush=True)
     print(f'Steam ARM64 ANGLE directory={pair}; Vulkan loader={loader}', flush=True)
     print(f'Guest config={pointer}; shared recovery config={shared}', flush=True)
     print('Stop normally, then Launch again to apply. Current Steam/Gamescope environments were not changed.', flush=True)

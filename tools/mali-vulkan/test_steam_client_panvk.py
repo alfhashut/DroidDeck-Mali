@@ -86,7 +86,7 @@ class SteamClientPanvkTests(unittest.TestCase):
         binary = steam / 'steamrtarm64/steam'
         binary.touch()
         prepared = client.inputs(config, steam, parent, target.parent)
-        command = [str(binary), '-gamepadui', '-cef-use-gl=angle', '-cef-use-angle=vulkan']
+        command = [str(binary), '-gamepadui', '-cef-use-vulkan']
         with patch('sys.argv', [str(LAUNCHER), 'launch', '--config', str(config), '--steam-root', str(steam), '--', *command]), \
              patch.object(client, 'inputs', return_value=prepared), patch.object(client.os, 'execve') as execute, \
              patch.dict(os.environ, parent, clear=True), contextlib.redirect_stdout(io.StringIO()):
@@ -95,6 +95,21 @@ class SteamClientPanvkTests(unittest.TestCase):
             self.assertEqual(dict(os.environ), before)
         self.assertEqual(execute.call_args.args[:2], (str(binary), command))
         self.assertEqual(execute.call_args.args[2]['PANVK_ATOM_STRIDE'], '56')
+
+    def test_unsupported_or_conflicting_cef_requests_never_exec(self):
+        config, steam, target, parent = self.fixture()
+        binary = steam / 'steamrtarm64/steam'
+        binary.touch()
+        prepared = client.inputs(config, steam, parent, target.parent)
+        for flags in (['-cef-use-angle=vulkan', '-cef-use-gl=angle'],
+                      ['-cef-use-vulkan', '-cef-use-angle=gl'],
+                      ['-cef-use-vulkan', '-no-linux-angle']):
+            with patch('sys.argv', [str(LAUNCHER), 'launch', '--config', str(config), '--steam-root',
+                                  str(steam), '--', str(binary), *flags]), \
+                 patch.object(client, 'inputs', return_value=prepared), patch.object(client.os, 'execve') as execute, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(client.main(), 1)
+            execute.assert_not_called()
 
     def process(self, proc, pid, argv, parent, env=None):
         path = proc / str(pid)
@@ -140,6 +155,25 @@ class SteamClientPanvkTests(unittest.TestCase):
              patch.object(client.time, 'sleep'), contextlib.redirect_stdout(output):
             client.observe(100, self.root / 'Steam', {}, proc, duration=1)
         self.assertIn('not observed', output.getvalue())
+        self.assertIn('UI acceleration UNPROVEN', output.getvalue())
+
+    def test_fresh_presentation_errors_are_not_renderer_success_or_stale_log_evidence(self):
+        proc = self.root / 'proc'
+        self.process(proc, 100, ['/Steam/steam'], 1)
+        steam = self.root / 'Steam'
+        logs = steam / 'logs'
+        logs.mkdir(parents=True)
+        path = logs / 'webhelper.txt'
+        path.write_text('old BadMatch\n')
+        offsets = client.log_offsets(steam)
+        with path.open('a') as stream:
+            stream.write('Error: AcquirePixmap: failed to create glx pixmap for window: 0x1400012\n')
+        output = io.StringIO()
+        with patch.object(client.time, 'monotonic', side_effect=[0, 0, 2]), \
+             patch.object(client.time, 'sleep'), contextlib.redirect_stdout(output):
+            client.observe(100, steam, offsets, proc, duration=1)
+        self.assertIn('new X11 presentation log evidence', output.getvalue())
+        self.assertNotIn('old BadMatch', output.getvalue())
         self.assertIn('UI acceleration UNPROVEN', output.getvalue())
 
 

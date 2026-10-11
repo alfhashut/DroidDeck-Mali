@@ -22,6 +22,54 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_x11_completion_cannot_substitute_for_gpu_proof(self):
+        output = 'DROIDDECK_X11_DIAGNOSTICS_DONE\nDROIDDECK_PANVK_PROBE_DONE exit=0\n'
+        for diagnostics in (False, True):
+            with patch.object(phone.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, 'Broadcast completed: result=1', ''),
+                    subprocess.CompletedProcess([], 0, output, '')]), contextlib.redirect_stdout(io.StringIO()) as logged:
+                self.assertEqual(phone.run_phone(['adb'], '/storage/emulated/0', x11_diagnostics=diagnostics),
+                                 0 if diagnostics else 1)
+                self.assertNotIn('phone test PASS', logged.getvalue())
+
+    def test_cef_inspection_completion_is_distinct_from_gpu_and_x11_completion(self):
+        for marker, success in (('DROIDDECK_CEF_DIAGNOSTICS_DONE', True),
+                                ('DROIDDECK_X11_DIAGNOSTICS_DONE', False),
+                                ('C8B.1 PanVK CLIENT-ONLY PROBE PASS', False)):
+            output = marker + '\nDROIDDECK_PANVK_PROBE_DONE exit=0\n'
+            with patch.object(phone.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, 'Broadcast completed: result=1', ''),
+                    subprocess.CompletedProcess([], 0, output, '')]), contextlib.redirect_stdout(io.StringIO()) as logged:
+                self.assertEqual(phone.run_phone(['adb'], '/storage/emulated/0', cef_diagnostics=True), 0 if success else 1)
+                self.assertNotIn('phone test PASS', logged.getvalue())
+
+    def test_cef_transfer_does_not_copy_artifacts_or_trigger_x11(self):
+        with patch('sys.argv', ['stage_phone_test.py', '--cef-diagnostics']), \
+             patch.object(phone, 'resolve_serial', return_value='test-device'), \
+             patch.object(phone.subprocess, 'check_output', return_value='/storage/emulated/0\n'), \
+             patch.object(phone.subprocess, 'run') as invoke, \
+             patch.object(phone, 'unpack') as unpack, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(phone.main(), 0)
+        unpack.assert_not_called()
+        commands = [call.args[0] for call in invoke.call_args_list]
+        self.assertFalse(any('/artifact' in ' '.join(command) or 'diagnose_steam_x11' in ' '.join(command)
+                             for command in commands))
+        self.assertTrue(any(command[-1].endswith('/diagnose_steam_cef.py') for command in commands))
+
+    def test_x11_transfer_has_no_driver_artifact_or_client_configuration(self):
+        with patch('sys.argv', ['stage_phone_test.py', '--x11-diagnostics']), \
+             patch.object(phone, 'resolve_serial', return_value='test-device'), \
+             patch.object(phone.subprocess, 'check_output', return_value='/storage/emulated/0\n'), \
+             patch.object(phone.subprocess, 'run') as invoke, \
+             patch.object(phone, 'unpack') as unpack, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(phone.main(), 0)
+        unpack.assert_not_called()
+        commands = [call.args[0] for call in invoke.call_args_list]
+        self.assertFalse(any('broadcast' in ' '.join(command) for command in commands))
+        self.assertFalse(any('/artifact' in ' '.join(command) or 'steam-client-panvk.json' in ' '.join(command)
+                             for command in commands))
+        self.assertTrue(any(command[-1].endswith('/diagnose_steam_x11.py') for command in commands))
+
     def test_phone_launcher_forwards_stride_and_angle_without_setting_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -711,8 +711,11 @@ and removes inherited software GL selectors. It uses the same library search
 order as the successful probe: raw driver directory, selected Steam ANGLE
 directory, Steam panorama directory, `/usr/lib`.
 
-Steam receives `-cef-use-gl=angle -cef-use-angle=vulkan` and the client alone
-receives `ANGLE_DEFAULT_PLATFORM=vulkan`. ANGLE documents the latter as a
+Steam receives the installed ARM64 build's supported `-cef-use-vulkan` option,
+which generates `--use-angle=vulkan`; see the [exact-build audit](STEAM_CEF_BACKEND.md).
+The earlier `-cef-use-gl`/`-cef-use-angle` spellings were not translated by this
+Steam build. The client alone receives `ANGLE_DEFAULT_PLATFORM=vulkan`.
+ANGLE documents the latter as a
 default backend selector in its [Display implementation](https://chromium.googlesource.com/angle/angle/+/refs/heads/main/src/libANGLE/Display.cpp).
 This is a request, not proof that Valve's CEF build honors it. No forced Vulkan
 capabilities, API overrides, Chromium Vulkan compositor features, or new

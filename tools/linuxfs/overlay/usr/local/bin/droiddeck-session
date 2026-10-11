@@ -823,7 +823,9 @@ BUSCONF
         # keep their existing environments. No game/Proton/FEX setup is changed.
         python3 -B "$_bl_panvk_helper" check --config "$_bl_panvk_config" --steam-root "$steam_root" || exit 66
         _bl_panvk=1
-        _bl_graphics=(-no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan)
+        # Audited ARM64 build 1791592380 supports this Steam option and emits
+        # --use-angle=vulkan. It does not translate -cef-use-angle/-cef-use-gl.
+        _bl_graphics=(-no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-vulkan)
         _bl_steam=(python3 -B "$_bl_panvk_helper" launch --config "$_bl_panvk_config" --steam-root "$steam_root" -- "$steam_root/steamrtarm64/steam")
         echo "== Steam client display=$DISPLAY; graphics=experimental ANGLE Vulkan/PanVK; real UI acceleration UNPROVEN"
       else
