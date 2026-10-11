@@ -19,6 +19,8 @@ panvk_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["
 [[ ! -e $panvk_build && ! -e $panvk_output ]]
 git -C "$panvk_source" apply --check "$panvk_tools/patches/0001-android-only-liblog.patch"
 git -C "$panvk_source" apply "$panvk_tools/patches/0001-android-only-liblog.patch"
+git -C "$panvk_source" apply --check "$panvk_tools/patches/0002-clc-supported-availability-warnings.patch"
+git -C "$panvk_source" apply "$panvk_tools/patches/0002-clc-supported-availability-warnings.patch"
 export LC_ALL=C.UTF-8
 export CC=gcc CXX=g++ LLVM_CONFIG=/usr/bin/llvm-config-19
 export SOURCE_DATE_EPOCH

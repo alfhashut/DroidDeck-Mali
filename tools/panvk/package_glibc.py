@@ -167,8 +167,9 @@ def package(source, build, output):
         'source_repository': 'https://github.com/' + pin['repository'],
         'source_commit': pin['commit'], 'mesa_version': (source / 'VERSION').read_text().strip(),
         'architecture': 'AArch64 / Linux / glibc / native Debian 13 on ubuntu-24.04-arm',
-        'patch': {'file': '0001-android-only-liblog.patch',
-                  'sha256': digest(TOOLS / 'patches/0001-android-only-liblog.patch')},
+        'patches': [{'file': name, 'sha256': digest(TOOLS / 'patches' / name)} for name in (
+            '0001-android-only-liblog.patch',
+            '0002-clc-supported-availability-warnings.patch')],
         'source_diff_sha256': hashlib.sha256(command('git', '-C', str(source), 'diff').encode()).hexdigest(),
         'configure_arguments': args, 'meson_build_options': selected,
         'toolchain': {name: command(*argv) for name, argv in {

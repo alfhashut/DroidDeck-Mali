@@ -502,6 +502,17 @@ these generated dependencies. Even `mesa-clc=auto` selects CLC when PanVK is
 enabled; removing the explicit flags would not remove this requirement. This
 fix does not establish that the next CI build will succeed.
 
+The second CI attempt found SPIRV-Tools 2025.1.1 but the CLC API probe failed
+before testing `LinkerOptions::SetAllowPtrTypeMismatch`: its own `args` list in
+[`src/compiler/clc/meson.build`](https://github.com/FristOneRR-Admin/FristOneRR-Panvk-Source/blob/efd07bab401b263a9ac114560ecdb9a2934f5d43/src/compiler/clc/meson.build#L86-L101)
+unconditionally passed `-Wno-error=unguarded-availability` and
+`-Wno-error=unguarded-availability-new`, which GCC 14 rejects. The second source
+patch filters these flags with `cpp.get_supported_arguments()` before passing
+them to the probe. GCC remains the compiler; the actual API test, LLVM-version
+failure condition and workaround definition remain unchanged. No SPIRV-Tools
+package or capability is substituted. The next CI run must establish the real
+API result and whether compilation succeeds; no local build was run.
+
 WSI could be omitted for an independently built ANGLE offscreen display, but
 that is not the supplied Steam bundle's proven configuration. Matching
 `DisplayVkXcb::getWSIExtension()` requests `VK_KHR_xcb_surface` unconditionally;
@@ -530,8 +541,10 @@ was dispatched as part of this task.
 `tools/panvk/source.json` is the single source pin consumed by the second
 checkout and checked before building. `build-glibc.sh` refuses execution outside
 the native ARM64 Actions environment, verifies a clean source checkout, applies
-only `patches/0001-android-only-liblog.patch`, and runs Meson with the recorded
-options. Ninja builds only `libvulkan_panfrost.so` and
+`patches/0001-android-only-liblog.patch` and
+`patches/0002-clc-supported-availability-warnings.patch`, and runs Meson with
+the recorded options. Artifact metadata records both patch filenames and hashes.
+Ninja builds only `libvulkan_panfrost.so` and
 `panfrost_icd.aarch64.json`, plus their required generated/build dependencies,
 with two workers. CLC and precomp generators are not installed or shipped.
 
