@@ -6,6 +6,21 @@ import json
 from pathlib import Path
 import statistics
 
+SHM_CHILD_STAGES = (
+    'shm_lookup', 'shm_source', 'staging_acquire', 'staging_create', 'staging_map',
+    'staging_validate', 'shm_copy', 'shm_source_release', 'texture_create',
+    'upload_record', 'upload_prepare', 'upload_submit', 'upload_finalize',
+    'upload_queue', 'upload_wait', 'shm_cleanup',
+)
+SPAN_STAGES = frozenset(SHM_CHILD_STAGES) | {
+    'frame', 'shm_import', 'ahb_acquire', 'render', 'wait', 'vk_submit', 'android_handoff',
+}
+# These always execute on a successful data-pointer import, including fallback.
+SHM_REQUIRED_STAGES = {
+    'shm_lookup', 'shm_source', 'staging_acquire', 'staging_validate', 'shm_copy',
+    'shm_source_release', 'texture_create', 'upload_record', 'upload_submit',
+}
+
 
 def load(path):
     rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -31,30 +46,136 @@ def unique_index(events, key):
     return {identity: rows[0] for identity, rows in groups.items() if len(rows) == 1}
 
 
-def spans(events):
-    pending, output = {}, []
+def pair_spans(events):
+    pending, output, issues = {}, [], []
+    def issue(event, reason):
+        issues.append(dict(pid=event['pid'], tid=event['tid'], role=event['role'],
+                           attempt=event['attempt'], client=event['client'],
+                           stage=event['stage'], mono_ns=event['mono_ns'], reason=reason))
     for event in sorted(events, key=lambda e: (e['mono_ns'], e['event_seq'])):
         stage = event['stage']
         if not stage.endswith(('_begin', '_end')):
             continue
         scope, edge = stage.rsplit('_', 1)
+        if scope not in SPAN_STAGES:
+            issue(event, 'unknown scope')
+            continue
         # attempt binds SHM/frame scopes before an output AHB has been acquired.
         identity = ('attempt', event['attempt']) if event['attempt'] else ('frame', event['key'], event['frame'])
-        discriminator = (event.get('scope',0), event['object'], event['value']) if scope in ('wait', 'vk_submit') else ()
+        has_local_identity = scope in ('wait', 'vk_submit') or (scope in SHM_CHILD_STAGES and scope != 'shm_copy')
+        discriminator = (event.get('scope',0), event['object'], event['value']) if has_local_identity else ()
         key = (event['pid'], event['tid'], scope, identity, discriminator)
         if edge == 'begin':
-            pending[key] = event
-        elif key in pending:
+            if key in pending:
+                issue(event, 'duplicate begin; ambiguous pair discarded')
+                pending[key] = None
+            else:
+                pending[key] = event
+        elif key not in pending:
+            issue(event, 'unpaired end')
+        else:
             begin = pending.pop(key)
+            if begin is None:
+                continue
+            if begin['client'] != event['client']:
+                issue(event, 'client identity changed inside scope')
+                continue
+            if any(begin[field] and event[field] and begin[field] != event[field] for field in ('key','frame')):
+                issue(event, 'known frame identity changed inside scope')
+                continue
             wall = event['mono_ns'] - begin['mono_ns']
             cpu = event['cpu_ns'] - begin['cpu_ns'] if event['cpu_ns'] and begin['cpu_ns'] else None
             if cpu is not None and not 0 <= cpu <= wall:
+                issue(event, 'invalid CPU samples; wall span retained')
                 cpu = None
             output.append(dict(role=event['role'], pid=event['pid'], tid=event['tid'], stage=scope,
+                               client=begin['client'], attempt=begin['attempt'],
+                               key=begin['key'], frame=begin['frame'], scope=begin.get('scope',0),
                                start_ns=begin['mono_ns'], end_ns=event['mono_ns'], wall_ns=wall,
                                cpu_ns=cpu, off_cpu_ns=wall-cpu if cpu is not None else None,
                                status=event['status'], object=event['object'], value=event['value']))
-    return output
+    for begin in pending.values():
+        if begin is not None:
+            issue(begin, 'unpaired begin')
+    return output, issues
+
+
+def spans(events):
+    return pair_spans(events)[0]
+
+
+def interval_union_ns(spans):
+    """Union on one thread's monotonic axis, never a sum of nested durations."""
+    end, total = None, 0
+    for span in sorted(spans, key=lambda s: (s['start_ns'], s['end_ns'])):
+        start, stop = span['start_ns'], span['end_ns']
+        total += max(0, stop - max(start, end if end is not None else start))
+        end = max(stop, end if end is not None else stop)
+    return total
+
+
+def shm_decomposition(frames, issues, clean, all_spans=None):
+    """Same-attempt, same-thread interval coverage; gaps retain no attribution."""
+    imports = []
+    for frame in frames:
+        parents = [s for s in frame['spans'] if s['role']=='gamescope' and s['stage']=='shm_import']
+        for parent in parents:
+            related = [s for s in (all_spans if all_spans is not None else frame['spans'])
+                       if s['role']=='gamescope' and s['stage'] in SHM_CHILD_STAGES
+                       and s['pid']==parent['pid'] and s['attempt']==parent['attempt']]
+            children = [s for s in related if parent['start_ns'] <= s['start_ns'] <= s['end_ns'] <= parent['end_ns']]
+            reasons = []
+            if not clean:
+                reasons.append('capture incomplete, lossy or late-armed')
+            if len(parents) != 1:
+                reasons.append('multiple import parents for this attempt')
+            if parent['client'] != frame['client']:
+                reasons.append('import client differs from successful publication')
+            if any(s['tid']!=parent['tid'] or s['client']!=parent['client'] for s in related):
+                reasons.append('child thread/client differs from import')
+            if len(children) != len(related):
+                reasons.append('child crosses import boundary')
+            missing = sorted(SHM_REQUIRED_STAGES - {s['stage'] for s in children})
+            if missing:
+                reasons.append('missing required decomposition scopes: ' + ', '.join(missing))
+            if parent['status'] or any(s['status'] for s in children):
+                reasons.append('scope reports failure')
+            if any(i['pid']==parent['pid'] and i['attempt']==parent['attempt']
+                   and i['stage'].rsplit('_',1)[0] in set(SHM_CHILD_STAGES) | {'shm_import'}
+                   and not i['reason'].startswith('invalid CPU') for i in issues):
+                reasons.append('malformed/unpaired SHM scope for this attempt')
+            # Proper nesting or disjoint intervals are safe. Crossing scopes
+            # cannot represent the documented sequential/nested call boundaries.
+            ordered = sorted(children, key=lambda s:(s['start_ns'], -s['end_ns']))
+            stack = []
+            for child in ordered:
+                while stack and child['start_ns'] >= stack[-1]['end_ns']:
+                    stack.pop()
+                if stack and child['end_ns'] > stack[-1]['end_ns']:
+                    reasons.append('crossing child scopes; remainder ambiguous')
+                    break
+                stack.append(child)
+            covered = interval_union_ns(children) if not reasons else None
+            imports.append(dict(client=frame['client'], attempt=frame['attempt'], key=frame['key'], frame=frame['frame'],
+                                start_ns=parent['start_ns'], end_ns=parent['end_ns'], total_ns=parent['wall_ns'],
+                                stage_inclusive_ns={stage:interval_union_ns([s for s in children if s['stage']==stage])
+                                                    for stage in SHM_CHILD_STAGES},
+                                stage_span_counts=dict(Counter(s['stage'] for s in children)),
+                                covered_ns=covered, unattributed_ns=parent['wall_ns']-covered if covered is not None else None,
+                                remainder_unavailable_reasons=reasons))
+    valid = [row for row in imports if row['unattributed_ns'] is not None]
+    mean_ms = lambda values: statistics.mean(values)/1e6 if values else None
+    return dict(count=len(imports), total_import_mean_ms=mean_ms([r['total_ns'] for r in imports]),
+                stage_inclusive_mean_ms={stage:mean_ms([r['stage_inclusive_ns'][stage] for r in valid])
+                                         for stage in SHM_CHILD_STAGES},
+                stage_span_counts=dict(sum((Counter(r['stage_span_counts']) for r in valid), Counter())),
+                observed_stage_span_counts=dict(sum((Counter(r['stage_span_counts']) for r in imports), Counter())),
+                remainder_samples=len(valid), ambiguous_imports=len(imports)-len(valid),
+                paired_total_import_mean_ms=mean_ms([r['total_ns'] for r in valid]),
+                covered_import_mean_ms=mean_ms([r['covered_ns'] for r in valid]),
+                unattributed_inside_import_mean_ms=mean_ms([r['unattributed_ns'] for r in valid]),
+                per_import=imports,
+                method='same-attempt/thread nested or disjoint child interval union; inclusive stage means overlap and must not be added; absent optional scopes contribute zero on valid imports; no GPU execution timing')
 
 
 def analyze(paths, window=None):
@@ -82,7 +203,6 @@ def analyze(paths, window=None):
     joined = {key for key in game_pub.keys() & native_pub.keys()
               if (game_pub[key]['sync'],game_pub[key]['fence']) == (native_pub[key]['sync'],native_pub[key]['fence'])
               and game_pub[key]['sync'] and game_pub[key]['fence']}
-    attempts = {game_pub[key]['attempt']: key for key in joined if game_pub[key]['attempt']}
     producer = unique_index([native_pub[key] for key in joined], lambda e:(e['key'],e['fence']))
     # The native submit precedes publication and has no frame yet. Bind only a
     # unique (key,fence) which later published successfully in THIS process/run.
@@ -102,6 +222,7 @@ def analyze(paths, window=None):
             if submit and event['mono_ns'] >= submit['mono_ns']:
                 event['key'],event['frame'] = submit['key'],submit['frame']
                 event['identity_source'] = 'same native device namespace/timeline semaphore/value as bound submit'
+    all_spans, span_issues = pair_spans(events)
     commits = unique_index([e for e in game if e['stage'] == 'client_commit'], lambda e:e['client'])
     frames, durations = [], []
     for key in sorted(joined):
@@ -110,7 +231,10 @@ def analyze(paths, window=None):
                 or (e['role'] == 'android' and identity(e) == key)]
         rows.sort(key=lambda e:e['mono_ns'])
         commit = commits.get(game_pub[key]['client'])
-        frame_spans = [s for s in spans(rows) if window[0] <= s['start_ns'] <= s['end_ns'] < window[1]]
+        frame_spans = [dict(s, joined_key=key[0], joined_frame=key[1]) for s in all_spans
+                       if ((s['role']=='gamescope' and attempt and s['attempt']==attempt)
+                           or (s['role']=='android' and (s['key'],s['frame'])==key))
+                       and window[0] <= s['start_ns'] <= s['end_ns'] < window[1]]
         durations += frame_spans
         latch = [e['value'] for e in rows if e['stage']=='android_latch_time' and e['status']==0 and 0 < e['value'] <= e['mono_ns']]
         lifecycle_stages = {'ahb_acquire_end','outer_commit','android_submit','pool_return','outer_release'}
@@ -154,6 +278,7 @@ def analyze(paths, window=None):
                 observed_successful_frame_counts=successful, successful_rates_per_second={k:v/((window[1]-window[0])/1e9) for k,v in successful.items()},
                 observed_counts=counts, rates_per_second={k:v/((window[1]-window[0])/1e9) for k,v in counts.items()},
                 joined_frames=len(frames), frames=frames, stage_spans=summaries,
+                span_diagnostics=span_issues, shm_import_decomposition=shm_decomposition(frames, span_issues, clean, all_spans),
                 unmatched_publish_ids=[list(k) for k in sorted((game_pub.keys() | native_pub.keys())-joined)],
                 interpretation='observations only; boundary frames/loss are explicit; nested scopes overlap, never sum them',
                 coverage_gaps=['CEF/XDamage IDs are external and not equal to wlroots commit IDs',
@@ -161,6 +286,7 @@ def analyze(paths, window=None):
                                'release fence timestamp is first successful readability observation, not kernel signal time',
                                'same-token Android repeats are application repeats, not physical repeated refreshes',
                                'native upload submits without an output key/fence remain unassigned; raw journals retained',
+                               'SHM upload_queue includes ICD mirror upload/bulk ACKs, locks and submit RPC; these costs are not independently separated',
                                'wait wall/CPU timestamps do not measure GPU execution or exact scheduler wakeup latency'])
 
 
@@ -170,7 +296,10 @@ def main():
     args=parser.parse_args()
     root=args.directory/'frame-journal' if (args.directory/'frame-journal').is_dir() else args.directory
     window=None
-    report=args.directory/'guest-report.txt'
+    # Direct frame-journal/ invocation must retain the external sample bounds,
+    # rather than silently including trailing guard frames after affinity restore.
+    capture_root = args.directory.parent if args.directory.name=='frame-journal' else args.directory
+    report=capture_root/'guest-report.txt'
     if report.is_file():
         markers={line.split('=',1)[0]:json.loads(line.split('=',1)[1]) for line in report.read_text().splitlines()
                  if line.startswith(('PERF_SAMPLING_START=','PERF_SAMPLING_END='))}

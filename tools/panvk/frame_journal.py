@@ -20,11 +20,19 @@ def main():
     def shell(*words):
         subprocess.run(adb + ['shell', shlex.join(words)], check=True)
     if args.action == 'arm':
-        shell('mkdir', '-p', ROOT)
-        # Stale control can never start a new session by accident.
-        shell('rm', '-f', ROOT + '/control')
-        shell('touch', ROOT + '/armed')
-        print('Armed. Use normal Stop then Mali Steam Launch to start both new CI workers.')
+        # Expand only the two worker-marker patterns in the Android shell.
+        # Quoting them as individual shell() arguments would disable globbing.
+        # Retain trace-*.jsonl and capture-*.json for previous-run analysis.
+        script = '\n'.join([
+            'set -e',
+            'trace_root=' + shlex.quote(ROOT),
+            'mkdir -p "$trace_root"',
+            'rm -f "$trace_root/armed" "$trace_root/control"',
+            'rm -f "$trace_root"/ready-*-gamescope "$trace_root"/ready-*-android',
+            'touch "$trace_root/armed"',
+        ])
+        subprocess.run(adb + ['shell', script], check=True)
+        print('Armed. Use normal Stop then Mali Steam Launch to create both current-cycle workers.')
     elif args.action == 'disarm':
         shell('rm', '-f', ROOT + '/armed', ROOT + '/control')
         print('Disarmed; workers flush incomplete captures and exit. Existing trace files retained.')

@@ -2,9 +2,11 @@
 
 The external dynamic capture is implemented and phone-tested. Its original
 captures do not provide private Gamescope stages or a shared frame identity.
-The opt-in internal journal below adds those hooks and awaits CI/phone validation.
-The exact cause of the earlier 21–22 CEF → ~18 Android FPS limit remains
-unmeasured. Missing stages are emitted as unavailable, not inferred timings.
+The opt-in internal journal below has now produced a successful synchronized
+phone capture. The reported 129 joined frames identify SHM import as the largest
+measured downstream scope in that capture; its internal costs remain unresolved.
+The decomposition added below awaits a new matched CI build and phone evidence.
+Missing stages are emitted as unavailable, not inferred timings.
 
 The original external-only diagnostic requires no build. The new internal
 journal requires a matched CI Gamescope/APK build, with no renderer, capability,
@@ -155,12 +157,18 @@ foreign-recorder isolation, affinity restoration, ambiguous timestamp/queue
 matches, and renderer fallback rejection. `git diff --check`, Python AST parsing,
 and whitespace checks for untracked diagnostic files passed.
 
-## Internal frame journal: development implementation, awaiting CI/phone evidence
+## Internal frame journal: successful capture, SHM decomposition awaiting phone evidence
 
 The external-only limitations above describe the previous capture. Patch
 `0126-mali-frame-trace.patch` and the Android hooks now add an **opt-in internal
-journal**. This code has host validation only. No new phone measurement has been
-made, and neither the earlier 22→18 gap nor its cause is established.
+journal**. The first successful phone capture reported 129 joined frames with
+no unmatched publish IDs: whole-frame wall mean 62.54 ms, SHM import 40.89 ms,
+SHM copy 13.22 ms, render 7.08 ms, AHB acquire about 0.0027 ms, Android queue
+submit 1.23 ms and handoff 1.12 ms. These are the user's same-capture analyzer
+results, not a fresh local reanalysis. Nested or differently sampled means must
+not be added/subtracted. This identifies the largest known downstream scope;
+it does not yet explain where inside SHM import the time goes or measure GPU
+execution. No optimization is implemented or recommended here.
 
 The default path, renderer, queues, ownership transitions, waits, capabilities,
 client atom stride, and pacing remain unchanged. Nothing sets a new affinity
@@ -189,8 +197,9 @@ observer overhead appears material; instrumentation overhead is not yet phone
 quantified.
 
 The guest `steam_frame_journal.py` controller runs automatically during
-`--frame-diagnostics` if armed. It requires exactly one live ready worker of each
-role. It writes one shared `run start_ns end_ns cpu_stride` control atomically,
+`--frame-diagnostics` if armed. It requires exactly one fresh valid ready marker
+per role, with guest `/proc` liveness for Gamescope only (see activation rules
+below). It writes one shared `run start_ns end_ns cpu_stride` control atomically,
 one second ahead, with two seconds of trailing guard. Native windows are bounded
 to 30 seconds; use the recommended 10-second external sample (maximum internal
 sample 27 seconds). A capture does not change an active control window. The
@@ -224,6 +233,92 @@ the existing BOOTTIME/Chromium/X11 clock anchors when comparing external traces.
 | Same callback's previous-buffer release | `release_callback` identifies the **replaced** frame, saved when registering the transaction. `value` indicates presence of a release FD. Callback never looks up a mutable buffer list or assigns the incoming frame's ID to the outgoing fence. |
 | Compositor release queue, existing poll/readable callback | `release_queued`, `release_fence_pending`, `release_fence_observed`. Observation requires the existing successful readable poll; an error is not ACK. `value=0` on release_queued means no fence was supplied: do not invent a fence signal time. Implicit DMA-BUF import is not a fence-completion observation. |
 | Android registry release; Gamescope buffer reuse | `pool_return` after the actual owned/submitted bits clear (with pool counts), followed by actual `outer_release` receipt and later `ahb_acquire_end` of the same key with a new frame. Unsubmitted cancellation is separate `cancel_unsubmitted`, never a release. |
+
+### SHM import decomposition: exact operations, no behavior changes
+
+The old `shm_import_begin/end` surrounds the normal loop's
+`wlr_surface_get_texture(surface)`, reinterpretation of `VulkanWlrTexture_t`, and
+`vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr)`. For a data-pointer
+buffer, that function probes DMA-BUF, begins read access, acquires staging,
+validates its persistent mapping, copies/converts pixels, ends source access,
+creates the sampled destination texture, acquires/begins/records a command
+buffer and submits the upload. Texture creation is **before upload**, not a
+post-upload registration operation. `staging.submitted(sequence)`, lease
+bookkeeping/destructors and returning the texture also remain inside import.
+The later `vulkan_mali_normal_upload_done()` and compositor/output work are
+outside the journal's SHM parent.
+
+All added events use the existing journal and a snapshot of `g_maliFrameTrace`:
+`client` and `attempt` are exact. Output `key/frame` are usually still zero until
+AHB acquisition. The analyzer retains those original fields and attaches
+`joined_key/joined_frame` via the attempt's exact successful publication; no
+timestamp-proximity match or new wire ID is introduced. Local handles/byte
+counts/timeline values in `object/value` are diagnostic only.
+
+Each name in this table has `_begin` and `_end` events:
+
+| Stage | Exact code boundary / nesting |
+| --- | --- |
+| `shm_lookup` | Around the existing `wlr_surface_get_texture` in `mali_normal.cpp`. |
+| `shm_source` | Entry of `vulkan_create_texture_from_wlr_buffer`, DMA-BUF probe, `wlr_buffer_begin_data_ptr_access`, width/height setup; ends before staging acquisition. A DMA-BUF/failed-access early return closes this scope but cannot satisfy the data-pointer decomposition. |
+| `staging_acquire` | Lease setup, range check and complete `maliStaging.acquire`; also encloses legacy buffer create/allocate/bind when that existing fallback runs. Includes pool scans, cached completion checks, optional allocation/resize/retirement and reuse waits. Pool policy is untouched. |
+| `staging_create` | `MaliStagingBackend::create` from API resolution through CreateBuffer, requirements/type selection, AllocateMemory, BindBufferMemory, mapping and existing error cleanup. Nested in acquire, present only when a slot is created. |
+| `staging_map` | Around the actual `mapStaging` call on cold slot creation; around existing legacy `MapMemory` on fallback. Does not claim a new map occurs on a warm persistent slot. |
+| `staging_validate` | Selection/check of the cached mapped pointer and mapped byte range; includes the legacy map branch if used. Warm validation is separate from an actual map. |
+| `shm_copy` | Existing unchanged memcpy plus ARGB/XRGB channel conversion and byte accounting. |
+| `shm_source_release` | Existing legacy UnmapMemory, if any, then `wlr_buffer_end_data_ptr_access`. |
+| `texture_create` | `new CVulkanTexture`, flags and full `BInit`, including image/memory/view creation and their existing proxy RPCs. Ends before upload recording. |
+| `upload_record` | `g_device.commandBuffer()` (allocation/reuse and BeginCommandBuffer) through `copyBufferToImage`. |
+| `upload_prepare` | Existing `maliStaging.backend.prepare` call and result check, marking the coherent staging allocation for this upload. No upload is added. |
+| `upload_submit` | Full existing `g_device.submit(std::move(cmdBuffer))`: finalization, submit-info/ring bookkeeping, QueueSubmit and pending-command registration. Ends before `staging.submitted(sequence)`. |
+| `upload_finalize` | Nested in pooled upload submit only: existing `cmdBuffer->end()`, barriers and EndCommandBuffer. Enabled by the already-existing `maliStagingUploadRecording` flag; compositor submissions are excluded. |
+| `upload_queue` | Nested in pooled upload submit only: exact `vk.QueueSubmit` call and existing result check, after ring sealing. The proxy's coherent mirror upload/bulk writes/ACKs, locks, MB_RENDERER_SUBMIT RPC and native queue call are included in this API scope. |
+| `upload_wait` | Existing `MaliProfiledWait` inside staging backend reuse, ending **before** successful command-buffer reset; nested in acquire. Also wraps the existing immediate `g_device.wait(sequence)` on legacy fallback. No wait is introduced or moved. Buffer/sequence distinguish actual waits. |
+| `shm_cleanup` | Existing legacy DestroyBuffer/FreeMemory after its wait. Absent on the normal persistent-slot path. |
+
+Normal pooled upload has **no immediate completion wait after submission**.
+No `upload_wait` event is fabricated for implicit queue ordering or GPU work.
+Later output/compositor waits keep their existing `wait_begin/end` events and
+are outside import. Backend reuse can still wait for an earlier upload.
+Scope destructors close early-return paths; parent import status records import
+failure. The added scope helper's `finish()` emits once and never performs any
+renderer/resource/synchronization operation.
+
+`stage_spans` summarizes every observed pair using the existing count, wall
+mean/p95, CPU sample count/mean, paired wall mean and paired off-CPU mean.
+`span_diagnostics` explicitly reports unknown scopes, unpaired edges, duplicate
+begins, changed client identities and invalid CPU samples. Ambiguous pairs are
+discarded rather than overwritten. CPU requires the same PID/TID and valid
+samples at both edges; missing/invalid CPU never becomes zero or GPU time.
+
+`shm_import_decomposition` contains per-import identities/durations and:
+
+- `total_import_mean_ms` for complete joined parent scopes in the sample;
+- `stage_inclusive_mean_ms` and `stage_span_counts` for the children. Means use
+  the same `remainder_samples` imports; absent optional operations contribute
+  zero, without creating fake spans. These stage means **overlap**;
+- `covered_import_mean_ms` and `unattributed_inside_import_mean_ms`, using the
+  interval union of actual child scopes on the parent's thread, equivalent to
+  subtracting mutually exclusive covered time only once;
+- `paired_total_import_mean_ms`, `remainder_samples`, `ambiguous_imports` and
+  per-import `remainder_unavailable_reasons`, making subset selection explicit.
+
+Remainder is unavailable for incomplete/lossy/late captures, missing required
+new stages, malformed/unpaired child scopes, multiple parents, a child on a
+different thread/client, a child outside its import or crossing (improperly
+nested) children. Old captures with only import/copy remain analyzable, but
+cannot supply the new decomposition. No timings from separate runs are combined.
+
+Uncovered gaps include ordinary setup/return/lease bookkeeping, scheduling
+between scopes and diagnostic overhead. Included parent scopes still contain
+their own internal work: acquire includes pool scans, resize destruction and
+retirement; texture creation includes multiple resource RPCs. In particular,
+`upload_queue` cannot independently split ICD lock wait, bulk-copy/ACK transport,
+broker scheduling and native QueueSubmit time. Native upload submits still lack
+a shared output key/fence at that point. The new same-attempt API scope does not
+invent a native upload join, GPU execution time or an exact kernel wakeup time.
+Use the next synchronized phone capture to locate the dominant API stage before
+proposing any further diagnostic split or optimization.
 
 `client` and `attempt` are Gamescope-local diagnostic IDs. They are carried into
 its output-buffer metadata and `outer_release`, but **not added to the wire
@@ -281,7 +376,11 @@ PID/TID. Paired wall/CPU/off-CPU means use the same subset. Nested stages overla
 never sum them. Queue depth is registry ownership/callback count, not an inferred
 SurfaceFlinger queue.
 
-Run both analyzers on the same capture. The original analyzer retains mandatory
+Run both analyzers on the same capture. Passing the `frame-journal/` directory
+directly also reads its parent's `guest-report.txt`, if present, to retain the
+external sample bounds and exclude guard frames after affinity restoration.
+Without that report only the full journal control window is available.
+The original analyzer retains mandatory
 ANGLE_VULKAN/PanVK/Mali-G52 and affinity-restoration validation. Its old
 `stages_unobservable` fields describe **external-only** coverage; the new
 companion provides the exact-ID internal records and stage scopes:
@@ -305,6 +404,14 @@ repeats and per-frame ownership lifetimes become observable. Keep fresh
 repeated warnings remain evidence, not an assumed cause.
 
 ### Exact CI build and phone procedure
+
+The journal **Python control fix alone needs no new APK/Gamescope build** if the matched
+native hooks below are already installed. `frame_journal.py` runs on the host;
+`--frame-diagnostics` dynamically pushes `steam_frame_journal.py` into the guest.
+The **new SHM stages require a new matched Gamescope/APK CI build** because the
+canonical event table is compiled into both processes. Normal Stop/Launch is
+still required after re-arm so both workers recreate their ready markers for
+the new cycle.
 
 **One new matched APK/Gamescope build is required for these internal hooks.**
 Do all heavy compilation in GitHub Actions. After these changes are committed
@@ -336,17 +443,31 @@ adb -s E68DS8U4IVYTKJXK install -r /tmp/droiddeck-frame-apk/app-release-unsigned
 
 Then, from the repository root:
 
-1. Arm before launching; use normal **Stop**, then the existing experimental
-   **Mali Steam Launch**. Leave the proven PanVK client option enabled.
+1. Use normal **Stop**, then arm, then use the existing experimental
+   **Mali Steam Launch**. Leave the proven PanVK client option enabled. Re-arm
+   removes the old `armed`, `control`, `ready-*-gamescope` and `ready-*-android`
+   markers before touching a fresh `armed`; previous `trace-*.jsonl` and
+   `capture-*.json` files are preserved.
 
    ```sh
    python3 -B tools/panvk/frame_journal.py arm --serial E68DS8U4IVYTKJXK
    ```
 
-2. Once Steam is open, check for **both** live `ready-PID-gamescope` and
+2. Once Steam is open, check for **both** current-cycle `ready-PID-gamescope` and
    `ready-PID-android` files. Missing workers mean a stale/mismatched binary,
    startup without the arm marker, or shared-storage access failure; do not call
    an external-only capture internal evidence.
+
+   The guest controller requires exactly one marker per role, valid positive
+   PIDs, matching `version=1 pid=PID role=ROLE` contents, and marker modification
+   times **at least as new as the current `armed` marker**. Equality is allowed
+   for shared-storage timestamp rounding; stale-file removal on arm provides
+   the cycle boundary. Malformed, older and duplicate markers fail explicitly.
+   Only Gamescope's PID must exist in guest `/proc`. Android runs outside the
+   Linux/PRoot guest, so its real native worker PID may be invisible there;
+   guest `/proc` cannot establish Android liveness. Its fresh marker establishes
+   readiness, while the exact selected Android trace output is required afterward.
+   A worker dying after readiness cannot be ruled out by markers alone.
 
    ```sh
    python3 -B tools/panvk/frame_journal.py status --serial E68DS8U4IVYTKJXK
@@ -357,11 +478,12 @@ Then, from the repository root:
    temporary `0xff` and the existing exact mixed-mask restore watchdog are
    automatic.
 
-   ```sh
+   ```fish
+   set -l capture_dir (mktemp -d /tmp/steam-shm-decomposition-XXXXXX)
    python3 -B tools/panvk/stage_phone_test.py \
      --serial E68DS8U4IVYTKJXK \
      --frame-diagnostics --perf-seconds 10 \
-     --perf-output /tmp/steam-frame-internal --run
+     --perf-output "$capture_dir" --run
    ```
 
 4. Require `frame-journal-control`, two current-run journal files, both headers
@@ -370,6 +492,31 @@ Then, from the repository root:
    the existing live renderer proof. Compare individual same-frame import,
    render/submit/wait, publish-to-handoff, latch, release-queue/fence and reuse
    intervals. Boundary frames without a complete lifecycle stay partial.
+
+   `frame-journal-control.ready` and `capture-RUN.json` identify the two selected
+   PID/role workers and record `arm_mtime_ns`; the shared four-field native control
+   format is unchanged. `finish()` requires exactly
+   `trace-RUN-PID-gamescope.jsonl` and `trace-RUN-PID-android.jsonl` for those
+   selected PIDs. It reports `expected_files`, `missing_files`,
+   `unexpected_files` and `complete_pair_available`; two arbitrary same-run
+   files cannot substitute for a missing Android output. File presence alone
+   does not establish complete/lossless trace contents; use the analyzer.
+
+   Analyze the new children and same-import remainder, keeping the mandatory
+   external renderer/affinity validation. Use the existing trace processor:
+
+   ```fish
+   python3 -B tools/panvk/analyze_steam_frames.py "$capture_dir" \
+     --trace-processor /tmp/droiddeck-trace-processor \
+     > "$capture_dir/external-summary.json"
+   python3 -B tools/panvk/analyze_frame_journal.py "$capture_dir/frame-journal" \
+     > "$capture_dir/shm-summary.json"
+   ```
+
+   Require new `stage_spans` entries, nonzero `remainder_samples`, inspect any
+   `ambiguous_imports`/`span_diagnostics`, and compare the inclusive stages only
+   within this new capture. Do not subtract the old 13.22 ms copy mean from the
+   new capture's import mean. The old raw PanVK artifact is reused unchanged.
 
 5. Disarm after collection, even if capture fails, then normal **Stop** and
    **Launch** to verify ordinary restart. Traces remain for analysis; the arm
@@ -403,4 +550,7 @@ proposing optimization.
   `test_normal.py`, `test_icd.py`, `test_normal_session.py`,
   `tests/frame_trace_host.c`, `tests/frame_trace_android.c`,
   `tests/android/hardware_buffer.h`, `tests/renderer_host.cpp`.
+- SHM decomposition delta: the existing patch/canonical journal/analyzer/docs
+  above, `tools/panvk/test_shm_decomposition.py`, and one Python-only CI test
+  invocation in `build.yml`. Native broker/presentation behavior is untouched.
 - CI and procedure: `.github/workflows/build.yml`, this document.

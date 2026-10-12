@@ -36,7 +36,15 @@ static const char *dd_ft_names[] = {
     "android_handoff_begin", "android_handoff_end", "android_submit", "android_repeat",
     "release_callback", "release_queued", "release_fence_pending",
     "release_fence_observed", "pool_return", "cancel_unsubmitted",
-    "transaction_complete", "android_latch_time", "shm_copy_begin", "shm_copy_end"
+    "transaction_complete", "android_latch_time", "shm_copy_begin", "shm_copy_end",
+    "shm_lookup_begin", "shm_lookup_end", "shm_source_begin", "shm_source_end",
+    "staging_acquire_begin", "staging_acquire_end", "staging_create_begin", "staging_create_end",
+    "staging_map_begin", "staging_map_end", "staging_validate_begin", "staging_validate_end",
+    "shm_source_release_begin", "shm_source_release_end", "texture_create_begin", "texture_create_end",
+    "upload_record_begin", "upload_record_end", "upload_prepare_begin", "upload_prepare_end",
+    "upload_submit_begin", "upload_submit_end", "upload_finalize_begin", "upload_finalize_end",
+    "upload_queue_begin", "upload_queue_end", "upload_wait_begin", "upload_wait_end",
+    "shm_cleanup_begin", "shm_cleanup_end"
 };
 static pthread_mutex_t dd_ft_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t dd_ft_thread;

@@ -4,7 +4,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 
 --- /dev/null
 +++ b/src/frame_trace.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,62 @@
 +/* Development-only journal. No renderer/wire/ownership changes. */
 +#ifndef DD_FRAME_TRACE_H
 +#define DD_FRAME_TRACE_H
@@ -21,7 +21,21 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +    DD_FT_HANDOFF_BEGIN, DD_FT_HANDOFF_END, DD_FT_ANDROID_SUBMIT, DD_FT_ANDROID_REPEAT,
 +    DD_FT_RELEASE_CALLBACK, DD_FT_RELEASE_QUEUED, DD_FT_RELEASE_FENCE_PENDING,
 +    DD_FT_RELEASE_FENCE_OBSERVED, DD_FT_POOL_RETURN, DD_FT_CANCEL,
-+    DD_FT_TRANSACTION_COMPLETE, DD_FT_LATCH_TIME, DD_FT_COPY_BEGIN, DD_FT_COPY_END, DD_FT_COUNT
++    DD_FT_TRANSACTION_COMPLETE, DD_FT_LATCH_TIME, DD_FT_COPY_BEGIN, DD_FT_COPY_END,
++    DD_FT_SHM_LOOKUP_BEGIN, DD_FT_SHM_LOOKUP_END, DD_FT_SHM_SOURCE_BEGIN, DD_FT_SHM_SOURCE_END,
++    DD_FT_STAGING_ACQUIRE_BEGIN, DD_FT_STAGING_ACQUIRE_END,
++    DD_FT_STAGING_CREATE_BEGIN, DD_FT_STAGING_CREATE_END,
++    DD_FT_STAGING_MAP_BEGIN, DD_FT_STAGING_MAP_END,
++    DD_FT_STAGING_VALIDATE_BEGIN, DD_FT_STAGING_VALIDATE_END,
++    DD_FT_SHM_SOURCE_RELEASE_BEGIN, DD_FT_SHM_SOURCE_RELEASE_END,
++    DD_FT_TEXTURE_CREATE_BEGIN, DD_FT_TEXTURE_CREATE_END,
++    DD_FT_UPLOAD_RECORD_BEGIN, DD_FT_UPLOAD_RECORD_END,
++    DD_FT_UPLOAD_PREPARE_BEGIN, DD_FT_UPLOAD_PREPARE_END,
++    DD_FT_UPLOAD_SUBMIT_BEGIN, DD_FT_UPLOAD_SUBMIT_END,
++    DD_FT_UPLOAD_FINALIZE_BEGIN, DD_FT_UPLOAD_FINALIZE_END,
++    DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END,
++    DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END,
++    DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END, DD_FT_COUNT
 +};
 +/* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
 + * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
@@ -39,17 +53,23 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +}
 +struct DDFrameScope {
 +    dd_ft_stage end; dd_ft_id id; uint64_t object, value;
-+    DDFrameScope(dd_ft_stage begin, dd_ft_stage finish, dd_ft_id identity,
-+                 uint64_t obj = 0, uint64_t val = 0) : end(finish), id(identity), object(obj), value(val) {
-+        dd_ft_event(begin, id, object, value, 0, 1);
++    DDFrameScope(dd_ft_stage begin, dd_ft_stage finishStage, dd_ft_id identity,
++                 uint64_t obj = 0, uint64_t val = 0, bool enabled = true)
++        : end(enabled ? finishStage : DD_FT_COUNT), id(identity), object(obj), value(val) {
++        if (enabled) dd_ft_event(begin, id, object, value, 0, 1);
 +    }
-+    ~DDFrameScope() { dd_ft_event(end, id, object, value, 0, 1); }
++    DDFrameScope(const DDFrameScope &) = delete;
++    DDFrameScope &operator=(const DDFrameScope &) = delete;
++    void finish() {
++        if (end != DD_FT_COUNT) { dd_ft_event(end, id, object, value, 0, 1); end = DD_FT_COUNT; }
++    }
++    ~DDFrameScope() { finish(); }
 +};
 +#endif
 +#endif
 --- /dev/null
 +++ b/src/frame_trace.inc
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,163 @@
 +/* Compiled once into maliahb, and once into the normal Gamescope TU.
 + * Armed at startup only. A worker handles control/output off the hot path.
 + * Records stop at capacity; never overwrite and silently lose frame identity.
@@ -88,7 +108,15 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +    "android_handoff_begin", "android_handoff_end", "android_submit", "android_repeat",
 +    "release_callback", "release_queued", "release_fence_pending",
 +    "release_fence_observed", "pool_return", "cancel_unsubmitted",
-+    "transaction_complete", "android_latch_time", "shm_copy_begin", "shm_copy_end"
++    "transaction_complete", "android_latch_time", "shm_copy_begin", "shm_copy_end",
++    "shm_lookup_begin", "shm_lookup_end", "shm_source_begin", "shm_source_end",
++    "staging_acquire_begin", "staging_acquire_end", "staging_create_begin", "staging_create_end",
++    "staging_map_begin", "staging_map_end", "staging_validate_begin", "staging_validate_end",
++    "shm_source_release_begin", "shm_source_release_end", "texture_create_begin", "texture_create_end",
++    "upload_record_begin", "upload_record_end", "upload_prepare_begin", "upload_prepare_end",
++    "upload_submit_begin", "upload_submit_end", "upload_finalize_begin", "upload_finalize_end",
++    "upload_queue_begin", "upload_queue_end", "upload_wait_begin", "upload_wait_end",
++    "shm_cleanup_begin", "shm_cleanup_end"
 +};
 +static pthread_mutex_t dd_ft_lock = PTHREAD_MUTEX_INITIALIZER;
 +static pthread_t dd_ft_thread;
@@ -305,7 +333,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
      g_maliNormalSessionActive = true; failed = false; stopped = 0;
      std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
      g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
-@@ -305,12 +337,17 @@
+@@ -305,12 +337,19 @@
          vulkan_mali_normal_tick();
          auto now = std::chrono::steady_clock::now();
          if (server.pending && server.surface && now >= next && (perfBaseline || vulkan_mali_normal_available())) {
@@ -314,7 +342,9 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +                tracePending && tracePending == traceLastRendered, 1);
              vulkan_mali_normal_frame_begin();
 +            dd_ft_event(DD_FT_SHM_BEGIN, g_maliFrameTrace, 0, 0, 0, 1);
++            DDFrameScope traceLookup(DD_FT_SHM_LOOKUP_BEGIN, DD_FT_SHM_LOOKUP_END, g_maliFrameTrace);
              auto texture = wlr_surface_get_texture(server.surface);
++            traceLookup.finish();
              auto wrapped = reinterpret_cast<VulkanWlrTexture_t *>(texture);
              auto source = wrapped && wrapped->buf ? vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr) : nullptr;
 +            dd_ft_event(DD_FT_SHM_END, g_maliFrameTrace, uint64_t(uintptr_t(wrapped ? wrapped->buf : nullptr)), 0, source ? 0 : -1, 1);
@@ -324,7 +354,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
              MaliCpuScope sceneScope(DD_CPU_SCENE, DD_CPU_FRAME);
              FrameInfo_t frame{}; auto &layer = *frame.layers.push();
              layer.tex = source.get(); layer.opacity = 1.0f; layer.filter = GamescopeUpscaleFilter::NEAREST;
-@@ -321,13 +358,21 @@
+@@ -321,13 +360,21 @@
              // Include import texture cleanup in frame/RPC accounting.
              { MaliCpuScope retire(DD_CPU_RETIRE, DD_CPU_FRAME); source = nullptr; }
              vulkan_mali_normal_frame_end(result == 0);
@@ -346,7 +376,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
              next = (perfBaseline ? std::chrono::steady_clock::now() : now) + framePeriod;
          }
          // Steam's bootstrap can download for minutes; an idle UI also needs no redraw.
-@@ -341,6 +386,7 @@
+@@ -341,6 +388,7 @@
      connector.reset(); gamescope::IBackend::Set(nullptr);
      if (host.manager) banner_ahb_v1_destroy(host.manager);
      if (host.display) wl_display_disconnect(host.display);
@@ -427,6 +457,40 @@ No rendering, ownership, pacing, or Vulkan capability changes.
      normalPerf.waitingOutput = true;
      return false; // Only observes ownership; never acquires, recycles or assumes release.
  }
+--- a/src/mali_staging.inc
++++ b/src/mali_staging.inc
+@@ -34,8 +34,11 @@
+         VkSemaphore semaphore = g_device.maliScratchTimeline();
+         VkSemaphoreWaitInfo info{}; info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+         info.semaphoreCount = 1; info.pSemaphores = &semaphore; info.pValues = &value;
++        DDFrameScope traceWait(DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END, g_maliFrameTrace,
++            uint64_t(uintptr_t(r.buffer)), value, g_maliFrameTrace.attempt != 0);
+         MaliWaitScope reason(DD_WAIT_SHM_STAGING_REUSE, (uint64_t)(uintptr_t)r.buffer);
+         VkResult result = MaliProfiledWait(g_device.vk.WaitSemaphores, g_device.vk.GetDeviceProcAddr, g_device.device(), &info, 5000000000ull);
++        traceWait.finish();
+         if (result == VK_SUCCESS) g_device.resetCmdBuffers(value);
+         return result;
+     }
+@@ -52,6 +55,8 @@
+         r = {};
+     }
+     int create(uint64_t bytes, Resource &r) {
++        DDFrameScope traceCreate(DD_FT_STAGING_CREATE_BEGIN, DD_FT_STAGING_CREATE_END, g_maliFrameTrace,
++            0, bytes, g_maliFrameTrace.attempt != 0);
+         if (!staging || !mapStaging) { VkResult result = resolve(); if (result != VK_SUCCESS) return result; }
+         VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+         bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+@@ -70,7 +75,10 @@
+         result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
+         if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
+         if (result == VK_SUCCESS) {
++            DDFrameScope traceMap(DD_FT_STAGING_MAP_BEGIN, DD_FT_STAGING_MAP_END, g_maliFrameTrace,
++                uint64_t(uintptr_t(r.memory)), requirements.size, g_maliFrameTrace.attempt != 0);
+             result = mapStaging(g_device.device(), r.memory, &r.mapped);
++            traceMap.finish();
+             if (result == VK_SUCCESS) { ++maps.created; r.mappedBytes = requirements.size; }
+             else {
+                 ++maps.failures; r.mapped = nullptr;
 --- a/src/mali_x11.inc
 +++ b/src/mali_x11.inc
 @@ -4,6 +4,7 @@
@@ -463,19 +527,126 @@ No rendering, ownership, pacing, or Vulkan capability changes.
      X11Unlisten(w->map); X11Unlisten(w->unmap); X11Unlisten(w->commit);
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
-@@ -4988,6 +4988,7 @@
+@@ -1377,7 +1377,10 @@
+ {
+ 	MaliCpuScope cpuScope(DD_CPU_SUBMIT);
+ 
++	DDFrameScope traceFinalize(DD_FT_UPLOAD_FINALIZE_BEGIN, DD_FT_UPLOAD_FINALIZE_END, g_maliFrameTrace,
++	    uint64_t(uintptr_t(cmdBuffer->rawBuffer())), 0, maliStagingUploadRecording && g_maliFrameTrace.attempt);
+ 	cmdBuffer->end();
++	traceFinalize.finish();
+ 
+ 	// The seq no of the last submission.
+ 	const uint64_t lastSubmissionSeqNo = m_submissionSeqNo++;
+@@ -1436,7 +1439,10 @@
+ 
+     // Explicitly seals even an empty epoch (normal SHM U has no ring stores).
+     uploadRingOperation(DD_RING_SEAL, 0, 0, rawCmdBuffer);
++	DDFrameScope traceQueue(DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END, g_maliFrameTrace,
++	    uint64_t(uintptr_t(rawCmdBuffer)), nextSeqNo, maliStagingUploadRecording && g_maliFrameTrace.attempt);
+ 	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, m_maliDiagnostic ? m_maliProducerFence : VK_NULL_HANDLE ) );
++	traceQueue.finish();
+ 
+ 	return nextSeqNo;
+ }
+@@ -4883,6 +4889,7 @@
+ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+ {
+ 	MaliCpuScope shmScope(DD_CPU_SHM_ACCESS, DD_CPU_SHM);
++	DDFrameScope traceSource(DD_FT_SHM_SOURCE_BEGIN, DD_FT_SHM_SOURCE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)));
+ 
+ 
+ 	struct wlr_dmabuf_attributes dmabuf = {0};
+@@ -4904,7 +4911,9 @@
+ 	uint32_t width = buf->width;
+ 	uint32_t height = buf->height;
+ 
++	traceSource.finish();
+ 	shmScope.set(DD_CPU_POOL);
++	DDFrameScope traceAcquire(DD_FT_STAGING_ACQUIRE_BEGIN, DD_FT_STAGING_ACQUIRE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)), uint64_t(stride) * height);
+ 	MaliStagingPool<MaliStagingBackend>::Lease staging;
+ 	VkBuffer buffer = VK_NULL_HANDLE;
+ 	VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
+@@ -4970,6 +4979,8 @@
+ 
  	}
  
++	traceAcquire.finish();
++	DDFrameScope traceValidate(DD_FT_STAGING_VALIDATE_BEGIN, DD_FT_STAGING_VALIDATE_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)), uint64_t(stride) * height);
+ 	void *dst = staging.slot ? staging.slot->resource.mapped : nullptr;
+ 	if (staging.slot) {
+ 		if (!dst || uint64_t(stride) * height > staging.slot->resource.mappedBytes) {
+@@ -4978,7 +4989,9 @@
+ 			return nullptr;
+ 		}
+ 	} else {
++		DDFrameScope traceMap(DD_FT_STAGING_MAP_BEGIN, DD_FT_STAGING_MAP_END, g_maliFrameTrace, uint64_t(uintptr_t(bufferMemory)), uint64_t(stride) * height);
+ 		result = g_device.vk.MapMemory( g_device.device(), bufferMemory, 0, VK_WHOLE_SIZE, 0, &dst );
++		traceMap.finish();
+ 		if ( result != VK_SUCCESS )
+ 		{
+ 			wlr_buffer_end_data_ptr_access( buf );
+@@ -4987,7 +5000,9 @@
+ 		}
+ 	}
+ 
++	traceValidate.finish();
  	shmScope.set(DD_CPU_COPY);
 +	dd_ft_event(DD_FT_COPY_BEGIN, g_maliFrameTrace, uint64_t(uintptr_t(buf)), stride * height, 0, 1);
  	memcpy( dst, src, stride * height );
      if (maliCpuDetail.active) maliCpuDetail.shmBytes += uint64_t(stride) * height;
      if (g_device.IsMaliDiagnostic() && (drmFormat == DRM_FORMAT_ARGB8888 || drmFormat == DRM_FORMAT_XRGB8888)) {
-@@ -4999,6 +5000,7 @@
+@@ -4999,12 +5014,16 @@
          }
          drmFormat = DRM_FORMAT_ABGR8888;
      }
 +	dd_ft_event(DD_FT_COPY_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)), stride * height, 0, 1);
  	shmScope.set(DD_CPU_SHM_ACCESS);
++	DDFrameScope traceRelease(DD_FT_SHM_SOURCE_RELEASE_BEGIN, DD_FT_SHM_SOURCE_RELEASE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)));
  	if (!staging.slot) g_device.vk.UnmapMemory( g_device.device(), bufferMemory );
  
+ 	wlr_buffer_end_data_ptr_access( buf );
+ 
++	traceRelease.finish();
+ 	shmScope.set(DD_CPU_SOURCE);
++	DDFrameScope traceTexture(DD_FT_TEXTURE_CREATE_BEGIN, DD_FT_TEXTURE_CREATE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)));
+ 	gamescope::OwningRc<CVulkanTexture> pTex = new CVulkanTexture();
+ 	CVulkanTexture::createFlags texCreateFlags;
+ 	texCreateFlags.bSampled = true;
+@@ -5013,24 +5032,35 @@
+ 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
+ 		return nullptr;
+ 
++	traceTexture.finish();
+ 	shmScope.set(DD_CPU_COMMANDS);
++	DDFrameScope traceRecord(DD_FT_UPLOAD_RECORD_BEGIN, DD_FT_UPLOAD_RECORD_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 	auto cmdBuffer = g_device.commandBuffer();
+ 
+ 	cmdBuffer->copyBufferToImage( buffer, 0, stride / DRMFormatGetBPP(drmFormat), pTex);
+ 	// TODO: Sync this copyBufferToImage
++	traceRecord.finish();
+ 
+ 	shmScope.set(DD_CPU_SUBMIT);
+ 	if (staging.slot) {
++		DDFrameScope tracePrepare(DD_FT_UPLOAD_PREPARE_BEGIN, DD_FT_UPLOAD_PREPARE_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 		result = maliStaging.backend.prepare(staging.slot->resource, cmdBuffer->rawBuffer());
+ 		if (result != VK_SUCCESS) g_device.FailMaliDiagnostic("normal SHM coherent upload arm", result);
++		tracePrepare.finish();
+ 		// The existing end-of-upload barrier makes transfer writes visible to
+ 		// later compute on this same queue; retaining storage removes the CPU wait.
+ 		MaliStagingUploadScope recording;
++		DDFrameScope traceSubmit(DD_FT_UPLOAD_SUBMIT_BEGIN, DD_FT_UPLOAD_SUBMIT_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
++		traceSubmit.finish();
+ 		staging.submitted(sequence);
+ 	} else {
++		DDFrameScope traceSubmit(DD_FT_UPLOAD_SUBMIT_BEGIN, DD_FT_UPLOAD_SUBMIT_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+-		g_device.wait(sequence);
++		traceSubmit.finish();
++		{ DDFrameScope traceWait(DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)), sequence);
++		g_device.wait(sequence); }
++		DDFrameScope traceCleanup(DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)), sequence);
+ 		g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
+ 		g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);
+ 	}

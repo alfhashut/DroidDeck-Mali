@@ -14,7 +14,21 @@ enum dd_ft_stage {
     DD_FT_HANDOFF_BEGIN, DD_FT_HANDOFF_END, DD_FT_ANDROID_SUBMIT, DD_FT_ANDROID_REPEAT,
     DD_FT_RELEASE_CALLBACK, DD_FT_RELEASE_QUEUED, DD_FT_RELEASE_FENCE_PENDING,
     DD_FT_RELEASE_FENCE_OBSERVED, DD_FT_POOL_RETURN, DD_FT_CANCEL,
-    DD_FT_TRANSACTION_COMPLETE, DD_FT_LATCH_TIME, DD_FT_COPY_BEGIN, DD_FT_COPY_END, DD_FT_COUNT
+    DD_FT_TRANSACTION_COMPLETE, DD_FT_LATCH_TIME, DD_FT_COPY_BEGIN, DD_FT_COPY_END,
+    DD_FT_SHM_LOOKUP_BEGIN, DD_FT_SHM_LOOKUP_END, DD_FT_SHM_SOURCE_BEGIN, DD_FT_SHM_SOURCE_END,
+    DD_FT_STAGING_ACQUIRE_BEGIN, DD_FT_STAGING_ACQUIRE_END,
+    DD_FT_STAGING_CREATE_BEGIN, DD_FT_STAGING_CREATE_END,
+    DD_FT_STAGING_MAP_BEGIN, DD_FT_STAGING_MAP_END,
+    DD_FT_STAGING_VALIDATE_BEGIN, DD_FT_STAGING_VALIDATE_END,
+    DD_FT_SHM_SOURCE_RELEASE_BEGIN, DD_FT_SHM_SOURCE_RELEASE_END,
+    DD_FT_TEXTURE_CREATE_BEGIN, DD_FT_TEXTURE_CREATE_END,
+    DD_FT_UPLOAD_RECORD_BEGIN, DD_FT_UPLOAD_RECORD_END,
+    DD_FT_UPLOAD_PREPARE_BEGIN, DD_FT_UPLOAD_PREPARE_END,
+    DD_FT_UPLOAD_SUBMIT_BEGIN, DD_FT_UPLOAD_SUBMIT_END,
+    DD_FT_UPLOAD_FINALIZE_BEGIN, DD_FT_UPLOAD_FINALIZE_END,
+    DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END,
+    DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END,
+    DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END, DD_FT_COUNT
 };
 /* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
  * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
@@ -32,11 +46,17 @@ void dd_ft_event(enum dd_ft_stage stage, struct dd_ft_id id,
 }
 struct DDFrameScope {
     dd_ft_stage end; dd_ft_id id; uint64_t object, value;
-    DDFrameScope(dd_ft_stage begin, dd_ft_stage finish, dd_ft_id identity,
-                 uint64_t obj = 0, uint64_t val = 0) : end(finish), id(identity), object(obj), value(val) {
-        dd_ft_event(begin, id, object, value, 0, 1);
+    DDFrameScope(dd_ft_stage begin, dd_ft_stage finishStage, dd_ft_id identity,
+                 uint64_t obj = 0, uint64_t val = 0, bool enabled = true)
+        : end(enabled ? finishStage : DD_FT_COUNT), id(identity), object(obj), value(val) {
+        if (enabled) dd_ft_event(begin, id, object, value, 0, 1);
     }
-    ~DDFrameScope() { dd_ft_event(end, id, object, value, 0, 1); }
+    DDFrameScope(const DDFrameScope &) = delete;
+    DDFrameScope &operator=(const DDFrameScope &) = delete;
+    void finish() {
+        if (end != DD_FT_COUNT) { dd_ft_event(end, id, object, value, 0, 1); end = DD_FT_COUNT; }
+    }
+    ~DDFrameScope() { finish(); }
 };
 #endif
 #endif
