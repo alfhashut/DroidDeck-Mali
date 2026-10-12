@@ -223,7 +223,12 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         if (op == MB_MEMORY_READ || op == MB_MEMORY_WRITE) {
             if (op == MB_MEMORY_WRITE ? !mb_interop_write_size(s->wire_version, bytes, size) : size > mb_interop_read_limit(s->wire_version)) return MB_PROTOCOL_ERROR;
             uint8_t *ptr = (uint8_t *)m->map + offset - m->map_offset;
-            if (op == MB_MEMORY_WRITE) memcpy(ptr, w + 20, (size_t)size);
+            if (op == MB_MEMORY_WRITE) {
+                struct dd_ft_id trace = {0}; trace.scope = d->normal.trace_scope;
+                if (d->normal.enabled) dd_ft_event(DD_FT_BROKER_MAPPED_COPY_BEGIN, trace, m->id, offset, 0, 1);
+                memcpy(ptr, w + 20, (size_t)size);
+                if (d->normal.enabled) dd_ft_event(DD_FT_BROKER_MAPPED_COPY_END, trace, m->id, offset, 0, 1);
+            }
             else { memcpy(reply, ptr, (size_t)size); *extra = (uint32_t)size; *count = 1; } break;
         }
         if (!v->atom || offset % v->atom || (size % v->atom && size != m->size - offset)) return MB_PROTOCOL_ERROR;

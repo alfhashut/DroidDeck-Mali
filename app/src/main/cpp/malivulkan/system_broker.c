@@ -246,6 +246,39 @@ static uint32_t query_devices(uint8_t *payload) {
     return MB_PREFIX_BYTES + count * MB_RECORD_BYTES;
 }
 
+/* Header receipt identifies the connection, not a resource. Observe body read
+ * only when exactly one normal device supplies an unambiguous existing scope.
+ * The decoded dispatch that immediately follows binds the request offline. */
+static int broker_trace_read_request(struct vk_session *s, int fd, uint8_t *request,
+        uint32_t bytes, uint32_t op) {
+    struct dd_ft_id trace = {0}; unsigned devices = 0;
+    if (dd_ft_active() && (op == MB_MEMORY_WRITE || op == MB_RENDERER_SUBMIT)) {
+        for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
+            if (s->logical[i].normal.enabled) { trace.scope = s->logical[i].normal.trace_scope; ++devices; }
+    }
+    if (devices != 1) trace.scope = 0;
+    if (trace.scope) dd_ft_event(DD_FT_BROKER_RECEIVE_BEGIN, trace, op, bytes, 0, 1);
+    int result = mb_read(fd, request, bytes);
+    if (trace.scope) dd_ft_event(DD_FT_BROKER_RECEIVE_END, trace, op, bytes, result, 1);
+    return result;
+}
+static struct dd_ft_id broker_trace_request(struct vk_session *s, uint32_t op,
+        const uint8_t *request, uint32_t bytes, uint64_t *object, uint64_t *value) {
+    struct dd_ft_id id = {0};
+    if (!dd_ft_active() || bytes < 4) return id;
+    for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i) {
+        struct native_device *d = &s->logical[i];
+        if (!d->normal.enabled || d->id != mb_get_u32(request)) continue;
+        if (op == MB_MEMORY_WRITE && bytes >= 20) {
+            id.scope = d->normal.trace_scope; *object = mb_get_u32(request+4); *value = mb_get_u64(request+8);
+        } else if (op == MB_RENDERER_SUBMIT && bytes == 28) {
+            id.scope = d->normal.trace_scope; id.fence = mb_get_u32(request+12);
+            *object = mb_get_u32(request+16); *value = mb_get_u64(request+20);
+        }
+        break;
+    }
+    return id;
+}
 static void serve(int fd) {
     struct vk_session *s = calloc(1, sizeof(*s));
     uint8_t *request = malloc(MB_RENDERER_MAX_REQUEST);
@@ -258,6 +291,7 @@ static void serve(int fd) {
         uint32_t status = MB_PROTOCOL_ERROR, count = 0;
         VkResult result = VK_SUCCESS;
         int finish = 0;
+        struct dd_ft_id trace_id = {0}; uint64_t trace_object = 0, trace_value = 0;
         struct native_device *measured = NULL;
         for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
             if (s->logical[i].normal.enabled && !s->logical[i].normal.stopping) { measured = &s->logical[i]; break; }
@@ -274,7 +308,7 @@ static void serve(int fd) {
             break;
         } else if ((version != MB_SESSION_VERSION && version != MB_CAP_VERSION && version != MB_DEVICE_VERSION && version != MB_SUBMIT_VERSION && version != MB_INTEROP_VERSION && version != MB_RENDERER_VERSION) ||
                    (s->wire_version && version != s->wire_version) ||
-                   (request_bytes && mb_read(fd, request, request_bytes))) {
+                   (request_bytes && broker_trace_read_request(s, fd, request, request_bytes, op))) {
             finish = 1;
         } else if (version >= MB_CAP_VERSION && op == MB_GLOBAL && !request_bytes && !s->library) {
             void *library = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
@@ -345,11 +379,17 @@ static void serve(int fd) {
             if (op == MB_SESSION_END && result == VK_TIMEOUT) finish = 1;
         } else if (version >= MB_INTEROP_VERSION && op >= MB_BUFFER_CREATE && op <= MB_AHB_PRESENT && s->instance && s->listed) {
             uint32_t extra = 0;
+            trace_id = broker_trace_request(s, op, request, request_bytes, &trace_object, &trace_value);
+            if (trace_id.scope) dd_ft_event(DD_FT_BROKER_DISPATCH_BEGIN, trace_id, trace_object, trace_value, 0, 1);
             status = native_interop_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (trace_id.scope) dd_ft_event(DD_FT_BROKER_DISPATCH_END, trace_id, trace_object, trace_value, result, 1);
             if (status == MB_OK) bytes += extra;
         } else if (version == MB_RENDERER_VERSION && op >= MB_RENDERER_SEMAPHORE_CREATE && op <= MB_RENDERER_IDLE && s->instance && s->listed) {
             uint32_t extra = 0;
+            trace_id = broker_trace_request(s, op, request, request_bytes, &trace_object, &trace_value);
+            if (trace_id.scope) dd_ft_event(DD_FT_BROKER_DISPATCH_BEGIN, trace_id, trace_object, trace_value, 0, 1);
             status = native_renderer_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
+            if (trace_id.scope) dd_ft_event(DD_FT_BROKER_DISPATCH_END, trace_id, trace_object, trace_value, result, 1);
             if (status == MB_OK) bytes += extra;
         } else if (version == MB_RENDERER_VERSION && op >= MB_NORMAL_BEGIN && op <= MB_NORMAL_STATS && s->instance && s->listed) {
             uint32_t extra = 0;
@@ -364,6 +404,7 @@ static void serve(int fd) {
         if (version == MB_RENDERER_VERSION && status == MB_PROTOCOL_ERROR) finish = 1;
         if (measured && measured->normal.enabled && op != MB_NORMAL_STATS)
             dd_perf_add(&measured->normal.perf, op, dd_perf_now() - service_start);
+        if (trace_id.scope) dd_ft_event(DD_FT_BROKER_REPLY_BEGIN, trace_id, trace_object, trace_value, 0, 1);
         mb_put_u32(payload, status); mb_put_u32(payload + 4, (uint32_t)result); mb_put_u32(payload + 8, count);
         if (version == MB_VERSION) mb_header(header, bytes);
         else mb_session_header(header, op, bytes);
@@ -375,6 +416,7 @@ static void serve(int fd) {
         if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes)) {
             ERROR("write response: %s", strerror(errno)); break;
         }
+        if (trace_id.scope) dd_ft_event(DD_FT_BROKER_REPLY_END, trace_id, trace_object, trace_value, result, 1);
         if (finish) break;
     }
     if (close_session(s)) free(s);

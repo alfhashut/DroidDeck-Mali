@@ -6,7 +6,9 @@ static void proxy_free_resources(struct proxy_logical *d) {
 }
 static struct proxy_resource *submit_find(struct proxy_logical *d, uintptr_t handle, enum proxy_resource_kind kind) {
     struct proxy_resource *found = NULL;
+    PROXY_TRACE_SCOPE(trace_lock, PROXY_LOCK, 0, 1);
     pthread_mutex_lock(&d->owner->lock);
+    proxy_trace_finish(&trace_lock);
     uint64_t visited = 0;
     found = proxy_registry_find(&d->registry, handle, kind, &visited);
     if (d->owner->perf_enabled) {

@@ -16,6 +16,7 @@
 #include "interop_protocol.h"
 #include "normal_api.h"
 #include "normal_memory_perf.h"
+#include "frame_trace_proxy.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
 #endif
@@ -55,21 +56,29 @@ _Static_assert(offsetof(struct proxy_device, loader) == 0, "physical-device disp
 /* A connection owns the remote instance; IDs only have meaning on that connection. */
 static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_t *request,
                     uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
+    PROXY_TRACE_SCOPE(trace_exchange, RPC_EXCHANGE, 0, 0);
+    struct proxy_trace_guard trace_header __attribute__((cleanup(proxy_trace_finish))) = {DD_FT_COUNT,0,0};
+    struct proxy_trace_guard trace_decode __attribute__((cleanup(proxy_trace_finish))) = {DD_FT_COUNT,0,0};
     int teardown = s->wire_version >= MB_SUBMIT_VERSION && (op == MB_DEVICE_DESTROY || op == MB_DESTROY || op == MB_AHB_PRESENT || op == MB_SESSION_PRESENT || op == MB_SESSION_END);
     /* Await safe GPU teardown or consumer release acknowledgement, even after a finite producer timeout. */
     if (teardown) {
         struct timeval no_timeout = {0};
         if (setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout))) goto broken;
     }
+    trace_header.end = DD_FT_RPC_HEADER_END;
+    proxy_trace(DD_FT_RPC_HEADER_BEGIN, 0, 0, 0);
     uint8_t header[MB_HEADER_BYTES];
     mb_session_header(header, op, request_bytes);
     mb_put_u32(header + 4, s->wire_version);
-    if (mb_write(s->fd, header, sizeof(header)) || mb_write(s->fd, request, request_bytes) ||
-        mb_read(s->fd, header, sizeof(header))) goto broken;
+    proxy_trace_finish(&trace_header);
+    if (proxy_trace_write(s->fd, header, sizeof(header)) || proxy_trace_write(s->fd, request, request_bytes) ||
+        proxy_trace_read(s->fd, header, sizeof(header))) goto broken;
     uint32_t bytes = mb_get_u32(header + 12);
     if (mb_get_u32(header) != MB_MAGIC || mb_get_u32(header + 4) != s->wire_version ||
         mb_get_u32(header + 8) != op || bytes < MB_PREFIX_BYTES || bytes > capacity) goto broken;
-    if (mb_read(s->fd, reply, bytes)) goto broken;
+    if (proxy_trace_read(s->fd, reply, bytes)) goto broken;
+    trace_decode.end = DD_FT_RPC_DECODE_END;
+    proxy_trace(DD_FT_RPC_DECODE_BEGIN, 0, 0, 0);
     if (teardown) {
         struct timeval normal_timeout = {.tv_sec = 10};
         if (setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &normal_timeout, sizeof(normal_timeout))) goto broken;
@@ -381,6 +390,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInst
         if (!strcmp(name, "vkDroidDeckPerformanceMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformanceMALI;
         if (!strcmp(name, "vkDroidDeckPerformance2MALI")) return (PFN_vkVoidFunction)proxy_DroidDeckPerformance2MALI;
         if (!strcmp(name, "vkDroidDeckProfiledWaitMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckProfiledWaitMALI;
+        if (!strcmp(name, "vkDroidDeckFrameTraceMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckFrameTraceMALI;
         if (!strcmp(name, "vkDroidDeckStagingMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckStagingMALI;
         if (!strcmp(name, "vkDroidDeckMapStagingMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckMapStagingMALI;
         if (!strcmp(name, "vkDroidDeckUploadRingMALI")) return (PFN_vkVoidFunction)proxy_DroidDeckUploadRingMALI;

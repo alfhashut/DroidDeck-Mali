@@ -5,7 +5,10 @@ captures do not provide private Gamescope stages or a shared frame identity.
 The opt-in internal journal below has now produced a successful synchronized
 phone capture. The reported 129 joined frames identify SHM import as the largest
 measured downstream scope in that capture; its internal costs remain unresolved.
-The decomposition added below awaits a new matched CI build and phone evidence.
+The subsequent SHM decomposition capture reports ~35.8 ms import, ~21.2 ms
+upload_submit, ~20.3 ms upload_queue and ~11.0 ms copy, with no upload wait.
+Those are user-provided same-capture results, not a local reanalysis. The new
+upload-queue subscopes below await a matched CI build and phone evidence.
 Missing stages are emitted as unavailable, not inferred timings.
 
 The original external-only diagnostic requires no build. The new internal
@@ -157,7 +160,7 @@ foreign-recorder isolation, affinity restoration, ambiguous timestamp/queue
 matches, and renderer fallback rejection. `git diff --check`, Python AST parsing,
 and whitespace checks for untracked diagnostic files passed.
 
-## Internal frame journal: successful capture, SHM decomposition awaiting phone evidence
+## Internal frame journal: SHM decomposed, upload queue awaiting phone evidence
 
 The external-only limitations above describe the previous capture. Patch
 `0126-mali-frame-trace.patch` and the Android hooks now add an **opt-in internal
@@ -165,10 +168,12 @@ journal**. The first successful phone capture reported 129 joined frames with
 no unmatched publish IDs: whole-frame wall mean 62.54 ms, SHM import 40.89 ms,
 SHM copy 13.22 ms, render 7.08 ms, AHB acquire about 0.0027 ms, Android queue
 submit 1.23 ms and handoff 1.12 ms. These are the user's same-capture analyzer
-results, not a fresh local reanalysis. Nested or differently sampled means must
-not be added/subtracted. This identifies the largest known downstream scope;
-it does not yet explain where inside SHM import the time goes or measure GPU
-execution. No optimization is implemented or recommended here.
+results, not a fresh local reanalysis. The next decomposition capture reported ~35.8 ms
+import, ~21.2 ms upload_submit, ~20.3 ms upload_queue and ~11.0 ms copy, with
+negligible staging and no upload_wait. Nested or differently sampled means must
+not be added/subtracted. Upload_queue is now the largest known downstream cost;
+its internal proxy/transport/native costs still await the new capture. No GPU
+execution time is measured. No optimization is implemented or recommended here.
 
 The default path, renderer, queues, ownership transitions, waits, capabilities,
 client atom stride, and pacing remain unchanged. Nothing sets a new affinity
@@ -186,7 +191,7 @@ Unarmed event calls return after an atomic gate check: no clock reads, journal
 locks, allocation, worker, or journal I/O. Startup checks the arm marker once.
 Diagnostic bookkeeping does not participate in rendering/pacing decisions.
 
-When armed, each process allocates 16,384 fixed records (about 1.4 MiB), checks
+When armed, each process allocates 65,536 fixed records (about 5.5 MiB), checks
 control every 100 ms, and records into RAM with a nonblocking try-lock. It never
 waits behind another observer: contention/capacity loss increments `dropped`.
 The worker serializes JSONL **after the recording window**, independently of
@@ -394,7 +399,7 @@ python3 -B tools/panvk/analyze_frame_journal.py /tmp/steam-frame-internal \
 ```
 
 Coverage gaps remain: CEF/XDamage lack these commit IDs; native upload submits
-without an output key/fence remain unassigned; no hardware GPU execution clock
+need the exact namespace/transaction binding described below, otherwise stay unassigned; no hardware GPU execution clock
 or exact kernel fence signal/wakeup timestamp is added; physical Android
 scanout and repeated panel refreshes lack a shared ID. SF latency histories
 remain independently measured timestamp evidence, with ambiguous matches left
@@ -403,12 +408,129 @@ repeats and per-frame ownership lifetimes become observable. Keep fresh
 `KBASE_IOCTL_MEM_JIT_INIT`, KFAULT and GLX/Composite warning capture unchanged;
 repeated warnings remain evidence, not an assumed cause.
 
+### Upload queue decomposition: existing proxy/broker operations
+
+This is observation only. `CVulkanDevice::submit` seals the existing upload
+ring and calls `vk.QueueSubmit`. The real call path for the pooled SHM upload is:
+
+```
+CVulkanDevice::submit / upload_queue
+  renderer_QueueSubmit (ICD)
+    validate submit, submit_find command/semaphore/fence (registry lock)
+    lock connection; walk active coherent mirrors
+      [upload ring: fallback/dirty ranges, when present]
+      interop_copy_upload_locked -> interop_upload_mapping_locked
+        acquire/reuse bounded request storage
+        for each <=512-KiB chunk: serialize + memcpy mirror into request
+          rpc -> rpc_exchange -> header/write header/write payload
+                              -> read reply header/read ACK/decode
+        check ACK/accounting
+    unlock; serialize submit; renderer_rpc (allocate/pack, lock connection)
+      rpc -> rpc_exchange
+        broker serve: read header/body, decode device -> native_renderer_command
+          validate resources/order -> real native vkQueueSubmit
+          update command/semaphore state -> serialize/write reply
+      validate reply, unlock/free
+    lock connection; mark rings submitted/reset staging command; unlock
+```
+
+Bulk `MB_MEMORY_WRITE` dispatch validates the mapped range/reference state,
+then `memcpy`s the received bytes into the existing Android mapped allocation.
+It does not introduce a new map, flush, or GPU wait. Broker submit continues to
+use the Android system Vulkan device. No client PanVK code or artifact changes.
+
+The Gamescope-owned journal sink is passed through the private **local-only**
+`vkDroidDeckFrameTraceMALI` callback entrypoint around the existing QueueSubmit,
+and cleared immediately afterward. It sends no RPC, creates no worker and
+advertises no Vulkan extension. Proxy details are sampled for `attempt % 8 == 0`
+to avoid emitting twenty events for every 512-KiB chunk of every frame. The
+existing frame/queue scopes and `proxy_submit_link` remain recorded for all
+attempts. CPU sampling still follows the existing journal control stride.
+Native broker request scopes are recorded during the active window, and remain
+raw when the corresponding detailed client RPC is not sampled. The larger
+bounded journal allocation exists only in armed sessions; no JSON/log I/O occurs
+inside a scope. Observer overhead still needs phone validation.
+
+All listed scope names have `_begin`/`_end` events:
+
+| Scope | Exact existing boundary |
+| --- | --- |
+| `proxy_prepare` | QueueSubmit entry through submit validation/resource lookup/previous failure check. |
+| `proxy_lock` | Each existing pthread_mutex_lock call only: value 1 registry lookup, 2 mirror walk/upload, 3 renderer RPC, 4 submit final bookkeeping. Includes scheduling/API overhead, not proof of mutex contention by itself. |
+| `proxy_mirror` | Locked active-registry walk, coherent/ring selection, existing transfers and unlock; nested transfers overlap. |
+| `proxy_dirty` | Existing ring fallback/range-byte/accounting decision before transfer, only when a ring is present. Post-transfer ring marking remains in mirror/finalize scopes. |
+| `proxy_bulk_setup` | Limit/capacity calculation and existing conditional realloc/reuse. |
+| `proxy_bulk_pack` | Each chunk length/header preparation and mirror-to-request memcpy. |
+| `proxy_bulk_rpc` | Each existing memory-write rpc call, including ACK receipt and existing performance accounting. Object=memory resource ID, value=offset. |
+| `proxy_bulk_ack` | Existing chunk ACK validation/accounting through loop increment/exit. |
+| `proxy_submit_pack` | Submit field serialization (value 0); renderer_rpc allocation/device-prefix packing (value 1). |
+| `proxy_submit_rpc` | Existing renderer_rpc call, including packing/lock/transport/reply/free. Object=timeline semaphore resource ID, value=signal value. |
+| `rpc_exchange` | Actual rpc_exchange entry through return/error cleanup. |
+| `rpc_header` | Existing transport header encoding only. |
+| `rpc_send` | Each existing complete mb_write call, header then payload; original short-circuit order retained. |
+| `rpc_receive` | Each existing complete mb_read call, reply header then payload. Includes socket blocking and rescheduling; these cannot be separated with this journal. |
+| `rpc_decode` | Result decoding after payload receive, including original error handling. Reply-header validation remains exchange remainder. |
+| `proxy_reply_handle` | renderer_rpc size/count/output validation, connection unlock, request free. |
+| `proxy_finalize` | Existing successful-submit accounting/ring/staging bookkeeping through unlock. |
+| `broker_receive` | Existing request-body mb_read only, after header receipt. Requires exactly one active normal device on this connection; object=wire opcode, value=body bytes. CPU samples may be absent when no known frame/timeline exists. |
+| `broker_dispatch` | After body receipt/device lookup, immediately around existing memory-write or submit handler. Includes handler validation/native work/state updates. |
+| `broker_mapped_copy` | Existing memory-write memcpy into the native mapped allocation only. |
+| `vk_submit` (existing) | Existing real native vkQueueSubmit call plus the original tiny perf accounting wrapper. This is API wall time, not GPU execution time. |
+| `broker_reply` | Existing reply serialization, original log decision/formatting, header+payload writes through return. No logging behavior changes. |
+
+Identity is unchanged: client/attempt belong to Gamescope, output
+`key/frame/sync/fence` retain their existing meanings. `fence` remains a broker
+resource ID, never a VkFence or FD. `proxy_submit_link` records the existing wire
+semaphore ID/signal value and a **process-local** connection pointer in `scope`.
+Android retains its existing device `trace_scope`. A successfully published R
+with exactly matching key/frame/fence AND semaphore/value anchors those two
+namespaces; conflicting/many-to-one anchors are rejected. U submissions then use
+the same namespace/semaphore/value, without a new wire ID.
+
+Memory writes have no frame/timeline on the wire. Attribution requires the
+mapped namespace, exact memory ID/offset, and **exactly one complete synchronous
+client RPC interval containing the native handler span**. That is a causal
+transaction bound on the serialized request/ACK stream, not nearest-timestamp
+matching. Ambiguous/partial intervals stay unassigned. A reply end may race the
+client's final read; the immediately preceding same-thread decoded dispatch
+with the same namespace/resource/value binds that reply in request order.
+The immediately preceding body receive on the same worker and unique normal
+device scope is bound by decoded dispatch order. No resource/frame identity is
+claimed before decoding. Native events keep client/attempt zero; the analyzer records the successful
+publication identity and `identity_source` separately. No synthetic cross-process
+frame/wire IDs are sent.
+
+`stage_spans` gives the existing count/mean/p95, CPU sample count/mean, paired
+wall mean and off-CPU mean for all new spans. `upload_queue_decomposition` gives
+per-queue identities, inclusive stage interval-union means, real pre-submit
+exchange time, RPC wall time, observed broker coverage, and
+`unattributed_inside_queue_mean_ms`. Remainder subtracts **only same-thread
+client interval union**. Native work runs concurrently with client receive and
+is never added to client coverage. Unsampled/malformed/lossy/old-build queues
+have an unavailable remainder with a reason. `broker_complete_samples` requires
+one decoded handler for every observed client bulk/submit RPC; absent native
+coverage remains null rather than zero. Native per-stage counts distinguish
+`paired_rpc_wall_mean_ms` uses exactly the broker-complete queue subset;
+`broker_stage_sample_counts` and per-queue span counts expose missing coverage.
+RPC time outside observed broker scopes still
+includes body reception, transport, scheduling and observer gaps; it is not a
+pure network or scheduler measurement.
+
+Coverage gaps: broker header wait precedes request/device identification and
+remains inside client RPC wall time only. Body reception is directly measured
+when the connection has one normal device; otherwise it stays unassigned.
+No broker timestamps are backdated or guessed. Driver-internal locks, kernel
+socket-ready-to-running delay, and GPU execution remain unobservable. The
+journal cannot assign unsampled/partial native requests by timing proximity.
+No optimization recommendation follows until the next capture has complete
+sampled decomposition and sufficient exact native attribution.
+
 ### Exact CI build and phone procedure
 
 The journal **Python control fix alone needs no new APK/Gamescope build** if the matched
 native hooks below are already installed. `frame_journal.py` runs on the host;
 `--frame-diagnostics` dynamically pushes `steam_frame_journal.py` into the guest.
-The **new SHM stages require a new matched Gamescope/APK CI build** because the
+The **new SHM/upload-queue stages and local ICD callback require a new matched Gamescope/APK CI build** because the
 canonical event table is compiled into both processes. Normal Stop/Launch is
 still required after re-arm so both workers recreate their ready markers for
 the new cycle.
@@ -423,7 +545,7 @@ gh workflow run build.yml --ref mali-gpu-experiment
 
 Its `gamescope` job (**Build experimental Gamescope**, ARM runner) applies patch
 0126 and produces `gamescope-patched`; its dependent `build` job (**Build APK**)
-embeds that same binary, compiles the Android hooks, checks the diagnostic
+embeds that same binary, compiles the Android hooks and glibc proxy ICD, checks the diagnostic
 marker in the embedded Gamescope and produces `droiddeck-apk`. Use both jobs from
 the same SHA/run. The standalone `build-gamescope.yml` artifact alone lacks the
 Android hooks. Other branches skip Gamescope source compilation and are not the
@@ -479,7 +601,7 @@ Then, from the repository root:
    automatic.
 
    ```fish
-   set -l capture_dir (mktemp -d /tmp/steam-shm-decomposition-XXXXXX)
+   set -l capture_dir (mktemp -d /tmp/steam-upload-queue-XXXXXX)
    python3 -B tools/panvk/stage_phone_test.py \
      --serial E68DS8U4IVYTKJXK \
      --frame-diagnostics --perf-seconds 10 \
@@ -502,7 +624,7 @@ Then, from the repository root:
    files cannot substitute for a missing Android output. File presence alone
    does not establish complete/lossless trace contents; use the analyzer.
 
-   Analyze the new children and same-import remainder, keeping the mandatory
+   Analyze the new children, same-import and same-queue remainders, keeping the mandatory
    external renderer/affinity validation. Use the existing trace processor:
 
    ```fish
@@ -510,11 +632,14 @@ Then, from the repository root:
      --trace-processor /tmp/droiddeck-trace-processor \
      > "$capture_dir/external-summary.json"
    python3 -B tools/panvk/analyze_frame_journal.py "$capture_dir/frame-journal" \
-     > "$capture_dir/shm-summary.json"
+     > "$capture_dir/upload-summary.json"
    ```
 
-   Require new `stage_spans` entries, nonzero `remainder_samples`, inspect any
-   `ambiguous_imports`/`span_diagnostics`, and compare the inclusive stages only
+   Require new proxy/broker `stage_spans`, positive
+   `upload_queue_decomposition.remainder_samples` and `broker_complete_samples`.
+   Inspect unassigned native coverage, per-stage sample counts and
+   `span_diagnostics`. Unsampled attempts are expected to lack a detailed
+   remainder. Compare inclusive stages only
    within this new capture. Do not subtract the old 13.22 ms copy mean from the
    new capture's import mean. The old raw PanVK artifact is reused unchanged.
 
@@ -554,3 +679,13 @@ proposing optimization.
   above, `tools/panvk/test_shm_decomposition.py`, and one Python-only CI test
   invocation in `build.yml`. Native broker/presentation behavior is untouched.
 - CI and procedure: `.github/workflows/build.yml`, this document.
+
+Upload-queue delta (this change): `tools/mali-vulkan/frame_trace_proxy.h`,
+`icd_proxy.c`, `device_icd.h`, `submit_icd.h`, `interop_icd.h`, `renderer_icd.h`,
+canonical `frame_trace.h/.c`, patch 0126, Android `system_broker.c` and
+`interop_commands.h`, `tools/panvk/analyze_frame_journal.py`,
+`tools/panvk/test_upload_queue.py`, `tools/mali-vulkan/test_upload_trace.py`,
+this document and `.github/workflows/build.yml`. No renderer/protocol/sync
+behavior changes. Targeted tests include the small extracted real rpc_exchange
+harness (no Vulkan SDK/Gamescope build), journal/CPU/identity tests and nested
+interval-union/ambiguous namespace/partial transaction tests.

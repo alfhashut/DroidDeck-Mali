@@ -103,6 +103,7 @@ static VkResult interop_upload_mapping_locked(struct proxy_resource *m, uint64_t
     struct proxy_logical *d = m->owner;
     if (!d || d->owner->wire_version < MB_INTEROP_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     struct proxy_instance *s = d->owner;
+    PROXY_TRACE_SCOPE(trace_setup, PROXY_BULK_SETUP, m->id, offset);
     uint32_t limit = mb_interop_write_limit(s->wire_version);
     uint32_t capacity = MB_MEMORY_WRITE_HEADER + (size > limit ? limit : (uint32_t)size);
     VkResult r = VK_SUCCESS;
@@ -111,13 +112,19 @@ static VkResult interop_upload_mapping_locked(struct proxy_resource *m, uint64_t
         if (!request) { r = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
         d->write_request = request; d->write_capacity = capacity;
     }
+    proxy_trace_finish(&trace_setup);
     for (uint64_t n = 0; n < size;) {
+        PROXY_TRACE_SCOPE(trace_pack, PROXY_BULK_PACK, m->id, offset + n);
         uint32_t length = size - n > limit ? limit : (uint32_t)(size - n);
         uint8_t *request = d->write_request, reply[MB_PREFIX_BYTES]; uint32_t bytes = 0;
         mb_put_u32(request, d->id); mb_put_u32(request + 4, m->id);
         mb_put_u64(request + 8, offset + n); mb_put_u32(request + 16, length);
         memcpy(request + MB_MEMORY_WRITE_HEADER, m->mirror + (offset - m->map_offset) + n, length);
+        proxy_trace_finish(&trace_pack);
+        PROXY_TRACE_SCOPE(trace_rpc, PROXY_BULK_RPC, m->id, offset + n);
         r = rpc(s, MB_MEMORY_WRITE, request, MB_MEMORY_WRITE_HEADER + length, reply, &bytes, sizeof(reply));
+        proxy_trace_finish(&trace_rpc);
+        PROXY_TRACE_SCOPE(trace_ack, PROXY_BULK_ACK, m->id, offset + n);
         if ((r == VK_SUCCESS && bytes != sizeof(reply)) ||
             (bytes && (bytes != sizeof(reply) || mb_get_u32(reply + 8) != 0))) {
             shutdown(s->fd, SHUT_RDWR); r = VK_ERROR_INITIALIZATION_FAILED;
@@ -173,6 +180,7 @@ static VkResult interop_copy_upload_locked(struct proxy_resource *m, uint64_t of
     return interop_upload_mapping_locked(m, offset, size);
 }
 static VkResult interop_upload_ring_locked(struct proxy_resource *m, uint32_t command) {
+    PROXY_TRACE_SCOPE(trace_dirty, PROXY_DIRTY, m->id, command);
     struct dd_upload_ring *ring = m->upload_ring;
     unsigned fallback = dd_ring_fallback(ring, command);
     uint64_t transmitted = fallback ? m->map_size : 0;
@@ -180,6 +188,7 @@ static VkResult interop_upload_ring_locked(struct proxy_resource *m, uint32_t co
     if (m->owner->owner->perf_enabled) dd_memory_ring(&m->owner->owner->memory_perf,
         m->id, m->allocation, m->map_offset, m->map_size,
         ring->modified, ring->marks, ring->count, transmitted, fallback);
+    proxy_trace_finish(&trace_dirty);
     VkResult result = VK_SUCCESS;
     if (fallback) result = interop_copy_upload_locked(m, m->map_offset, m->map_size);
     else for (unsigned i = 0; i < ring->count && result == VK_SUCCESS; ++i)

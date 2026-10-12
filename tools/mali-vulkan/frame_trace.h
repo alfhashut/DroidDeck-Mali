@@ -28,11 +28,38 @@ enum dd_ft_stage {
     DD_FT_UPLOAD_FINALIZE_BEGIN, DD_FT_UPLOAD_FINALIZE_END,
     DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END,
     DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END,
-    DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END, DD_FT_COUNT
+    DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END,
+    DD_FT_PROXY_PREPARE_BEGIN, DD_FT_PROXY_PREPARE_END,
+    DD_FT_PROXY_LOCK_BEGIN, DD_FT_PROXY_LOCK_END,
+    DD_FT_PROXY_MIRROR_BEGIN, DD_FT_PROXY_MIRROR_END,
+    DD_FT_PROXY_BULK_SETUP_BEGIN, DD_FT_PROXY_BULK_SETUP_END,
+    DD_FT_PROXY_BULK_PACK_BEGIN, DD_FT_PROXY_BULK_PACK_END,
+    DD_FT_PROXY_BULK_RPC_BEGIN, DD_FT_PROXY_BULK_RPC_END,
+    DD_FT_PROXY_BULK_ACK_BEGIN, DD_FT_PROXY_BULK_ACK_END,
+    DD_FT_PROXY_SUBMIT_PACK_BEGIN, DD_FT_PROXY_SUBMIT_PACK_END,
+    DD_FT_PROXY_SUBMIT_RPC_BEGIN, DD_FT_PROXY_SUBMIT_RPC_END,
+    DD_FT_PROXY_REPLY_HANDLE_BEGIN, DD_FT_PROXY_REPLY_HANDLE_END,
+    DD_FT_PROXY_FINALIZE_BEGIN, DD_FT_PROXY_FINALIZE_END,
+    DD_FT_RPC_HEADER_BEGIN, DD_FT_RPC_HEADER_END,
+    DD_FT_RPC_SEND_BEGIN, DD_FT_RPC_SEND_END,
+    DD_FT_RPC_RECEIVE_BEGIN, DD_FT_RPC_RECEIVE_END,
+    DD_FT_RPC_DECODE_BEGIN, DD_FT_RPC_DECODE_END,
+    DD_FT_BROKER_RECEIVE_BEGIN, DD_FT_BROKER_RECEIVE_END,
+    DD_FT_BROKER_DISPATCH_BEGIN, DD_FT_BROKER_DISPATCH_END,
+    DD_FT_BROKER_REPLY_BEGIN, DD_FT_BROKER_REPLY_END,
+    DD_FT_BROKER_MAPPED_COPY_BEGIN, DD_FT_BROKER_MAPPED_COPY_END,
+    DD_FT_PROXY_DIRTY_BEGIN, DD_FT_PROXY_DIRTY_END,
+    DD_FT_RPC_EXCHANGE_BEGIN, DD_FT_RPC_EXCHANGE_END,
+    DD_FT_PROXY_SUBMIT_LINK, DD_FT_COUNT
 };
 /* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
  * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
 struct dd_ft_id { uint64_t client, attempt, scope; uint32_t frame, key, sync, fence; };
+typedef void (*dd_ft_sink)(enum dd_ft_stage, struct dd_ft_id, uint64_t, uint64_t, int32_t, int);
+/* Private in-process ICD callback. Context is thread-local and cleared after
+ * QueueSubmit. scope becomes a process-local connection pointer identity;
+ * it is never a native fence, FD, or cross-process wire ID. */
+typedef void (*PFN_dd_ft_context)(void *device, dd_ft_sink, const struct dd_ft_id *);
 /* Call init only at normal-session start, after an explicit adb-created arm
  * marker. Disabled calls do no clocks, locks, allocations, or file access. */
 void dd_ft_init(const char *role);

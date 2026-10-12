@@ -4,7 +4,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 
 --- /dev/null
 +++ b/src/frame_trace.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,89 @@
 +/* Development-only journal. No renderer/wire/ownership changes. */
 +#ifndef DD_FRAME_TRACE_H
 +#define DD_FRAME_TRACE_H
@@ -35,11 +35,38 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +    DD_FT_UPLOAD_FINALIZE_BEGIN, DD_FT_UPLOAD_FINALIZE_END,
 +    DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END,
 +    DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END,
-+    DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END, DD_FT_COUNT
++    DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END,
++    DD_FT_PROXY_PREPARE_BEGIN, DD_FT_PROXY_PREPARE_END,
++    DD_FT_PROXY_LOCK_BEGIN, DD_FT_PROXY_LOCK_END,
++    DD_FT_PROXY_MIRROR_BEGIN, DD_FT_PROXY_MIRROR_END,
++    DD_FT_PROXY_BULK_SETUP_BEGIN, DD_FT_PROXY_BULK_SETUP_END,
++    DD_FT_PROXY_BULK_PACK_BEGIN, DD_FT_PROXY_BULK_PACK_END,
++    DD_FT_PROXY_BULK_RPC_BEGIN, DD_FT_PROXY_BULK_RPC_END,
++    DD_FT_PROXY_BULK_ACK_BEGIN, DD_FT_PROXY_BULK_ACK_END,
++    DD_FT_PROXY_SUBMIT_PACK_BEGIN, DD_FT_PROXY_SUBMIT_PACK_END,
++    DD_FT_PROXY_SUBMIT_RPC_BEGIN, DD_FT_PROXY_SUBMIT_RPC_END,
++    DD_FT_PROXY_REPLY_HANDLE_BEGIN, DD_FT_PROXY_REPLY_HANDLE_END,
++    DD_FT_PROXY_FINALIZE_BEGIN, DD_FT_PROXY_FINALIZE_END,
++    DD_FT_RPC_HEADER_BEGIN, DD_FT_RPC_HEADER_END,
++    DD_FT_RPC_SEND_BEGIN, DD_FT_RPC_SEND_END,
++    DD_FT_RPC_RECEIVE_BEGIN, DD_FT_RPC_RECEIVE_END,
++    DD_FT_RPC_DECODE_BEGIN, DD_FT_RPC_DECODE_END,
++    DD_FT_BROKER_RECEIVE_BEGIN, DD_FT_BROKER_RECEIVE_END,
++    DD_FT_BROKER_DISPATCH_BEGIN, DD_FT_BROKER_DISPATCH_END,
++    DD_FT_BROKER_REPLY_BEGIN, DD_FT_BROKER_REPLY_END,
++    DD_FT_BROKER_MAPPED_COPY_BEGIN, DD_FT_BROKER_MAPPED_COPY_END,
++    DD_FT_PROXY_DIRTY_BEGIN, DD_FT_PROXY_DIRTY_END,
++    DD_FT_RPC_EXCHANGE_BEGIN, DD_FT_RPC_EXCHANGE_END,
++    DD_FT_PROXY_SUBMIT_LINK, DD_FT_COUNT
 +};
 +/* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
 + * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
 +struct dd_ft_id { uint64_t client, attempt, scope; uint32_t frame, key, sync, fence; };
++typedef void (*dd_ft_sink)(enum dd_ft_stage, struct dd_ft_id, uint64_t, uint64_t, int32_t, int);
++/* Private in-process ICD callback. Context is thread-local and cleared after
++ * QueueSubmit. scope becomes a process-local connection pointer identity;
++ * it is never a native fence, FD, or cross-process wire ID. */
++typedef void (*PFN_dd_ft_context)(void *device, dd_ft_sink, const struct dd_ft_id *);
 +/* Call init only at normal-session start, after an explicit adb-created arm
 + * marker. Disabled calls do no clocks, locks, allocations, or file access. */
 +void dd_ft_init(const char *role);
@@ -69,7 +96,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +#endif
 --- /dev/null
 +++ b/src/frame_trace.inc
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,185 @@
 +/* Compiled once into maliahb, and once into the normal Gamescope TU.
 + * Armed at startup only. A worker handles control/output off the hot path.
 + * Records stop at capacity; never overwrite and silently lose frame identity.
@@ -91,7 +118,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +#define DD_FT_ROOT "/storage/emulated/0/Download/DroidDeckFrameTrace"
 +#endif
 +#ifndef DD_FT_CAPACITY
-+#define DD_FT_CAPACITY 16384u
++#define DD_FT_CAPACITY 65536u
 +#endif
 +struct dd_ft_record {
 +    uint64_t wall, cpu, object, value;
@@ -116,7 +143,29 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +    "upload_record_begin", "upload_record_end", "upload_prepare_begin", "upload_prepare_end",
 +    "upload_submit_begin", "upload_submit_end", "upload_finalize_begin", "upload_finalize_end",
 +    "upload_queue_begin", "upload_queue_end", "upload_wait_begin", "upload_wait_end",
-+    "shm_cleanup_begin", "shm_cleanup_end"
++    "shm_cleanup_begin", "shm_cleanup_end",
++    "proxy_prepare_begin", "proxy_prepare_end",
++    "proxy_lock_begin", "proxy_lock_end",
++    "proxy_mirror_begin", "proxy_mirror_end",
++    "proxy_bulk_setup_begin", "proxy_bulk_setup_end",
++    "proxy_bulk_pack_begin", "proxy_bulk_pack_end",
++    "proxy_bulk_rpc_begin", "proxy_bulk_rpc_end",
++    "proxy_bulk_ack_begin", "proxy_bulk_ack_end",
++    "proxy_submit_pack_begin", "proxy_submit_pack_end",
++    "proxy_submit_rpc_begin", "proxy_submit_rpc_end",
++    "proxy_reply_handle_begin", "proxy_reply_handle_end",
++    "proxy_finalize_begin", "proxy_finalize_end",
++    "rpc_header_begin", "rpc_header_end",
++    "rpc_send_begin", "rpc_send_end",
++    "rpc_receive_begin", "rpc_receive_end",
++    "rpc_decode_begin", "rpc_decode_end",
++    "broker_receive_begin", "broker_receive_end",
++    "broker_dispatch_begin", "broker_dispatch_end",
++    "broker_reply_begin", "broker_reply_end",
++    "broker_mapped_copy_begin", "broker_mapped_copy_end",
++    "proxy_dirty_begin", "proxy_dirty_end",
++    "rpc_exchange_begin", "rpc_exchange_end",
++    "proxy_submit_link"
 +};
 +static pthread_mutex_t dd_ft_lock = PTHREAD_MUTEX_INITIALIZER;
 +static pthread_t dd_ft_thread;
@@ -386,16 +435,25 @@ No rendering, ownership, pacing, or Vulkan capability changes.
      if (x11) std::printf("Mali Steam Gamescope pid=%d exit=%d; Mali release/drain result=%s\n",
 --- a/src/mali_normal.hpp
 +++ b/src/mali_normal.hpp
-@@ -1,4 +1,6 @@
+@@ -1,4 +1,7 @@
  #pragma once
 +#include "frame_trace.h"
 +extern dd_ft_id g_maliFrameTrace;
++extern PFN_dd_ft_context g_maliProxyFrameTrace;
  #include <cstdint>
  #include <cstdlib>
  #include <cstring>
 --- a/src/mali_normal.inc
 +++ b/src/mali_normal.inc
-@@ -87,27 +87,37 @@
+@@ -43,6 +43,7 @@
+     normalOutput = {}; normalPerf = {}; normalOutput.width = width; normalOutput.height = height;
+     if (!MaliInitializeRenderer(true)) return false;
+     if (maliStaging.backend.resolve() != VK_SUCCESS) { g_device.ShutdownMaliDiagnostic(); return false; }
++    g_maliProxyFrameTrace = (PFN_dd_ft_context)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckFrameTraceMALI");
+     normalOutput.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
+     normalOutput.transport = (PFN_vkDroidDeckWaylandMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckWaylandMALI");
+     normalOutput.performance = (PFN_vkDroidDeckPerformanceMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckPerformance2MALI");
+@@ -87,27 +88,37 @@
      auto &s = normalOutput;
      if (s.stopping) return -1;
      uint64_t acquireStart = dd_perf_now();
@@ -436,7 +494,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
      MaliRequire(s.ownership.presented(index), "normal Ready -> Android-owned");
      unsigned owned = 0;
      for (unsigned i = 0; i < 3; ++i) owned += s.ownership.androidOwned(i);
-@@ -115,7 +125,7 @@
+@@ -115,7 +126,7 @@
      uint64_t commitStart = dd_perf_now();
      mali_normal_commit(index); ++s.presented; slot.committedNs = commitStart;
      normalPerf.currentCommit = dd_perf_now() - commitStart;
@@ -527,7 +585,13 @@ No rendering, ownership, pacing, or Vulkan capability changes.
      X11Unlisten(w->map); X11Unlisten(w->unmap); X11Unlisten(w->commit);
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
-@@ -1377,7 +1377,10 @@
+@@ -1,4 +1,5 @@
+ #include "mali_normal.hpp"
++PFN_dd_ft_context g_maliProxyFrameTrace = nullptr;
+ #include "normal_detail_perf.hpp"
+ // Initialize Vulkan and composite stuff with a compute queue
+ 
+@@ -1377,7 +1378,10 @@
  {
  	MaliCpuScope cpuScope(DD_CPU_SUBMIT);
  
@@ -538,18 +602,21 @@ No rendering, ownership, pacing, or Vulkan capability changes.
  
  	// The seq no of the last submission.
  	const uint64_t lastSubmissionSeqNo = m_submissionSeqNo++;
-@@ -1436,7 +1439,10 @@
+@@ -1436,7 +1440,13 @@
  
      // Explicitly seals even an empty epoch (normal SHM U has no ring stores).
      uploadRingOperation(DD_RING_SEAL, 0, 0, rawCmdBuffer);
 +	DDFrameScope traceQueue(DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END, g_maliFrameTrace,
 +	    uint64_t(uintptr_t(rawCmdBuffer)), nextSeqNo, maliStagingUploadRecording && g_maliFrameTrace.attempt);
++    const bool traceProxy = g_maliProxyFrameTrace && g_maliFrameTrace.attempt && dd_ft_active();
++    if (traceProxy) g_maliProxyFrameTrace((void *)device(), dd_ft_event, &g_maliFrameTrace);
  	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, m_maliDiagnostic ? m_maliProducerFence : VK_NULL_HANDLE ) );
++    if (traceProxy) g_maliProxyFrameTrace((void *)device(), nullptr, nullptr);
 +	traceQueue.finish();
  
  	return nextSeqNo;
  }
-@@ -4883,6 +4889,7 @@
+@@ -4883,6 +4893,7 @@
  gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
  {
  	MaliCpuScope shmScope(DD_CPU_SHM_ACCESS, DD_CPU_SHM);
@@ -557,7 +624,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
  
  
  	struct wlr_dmabuf_attributes dmabuf = {0};
-@@ -4904,7 +4911,9 @@
+@@ -4904,7 +4915,9 @@
  	uint32_t width = buf->width;
  	uint32_t height = buf->height;
  
@@ -567,7 +634,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
  	MaliStagingPool<MaliStagingBackend>::Lease staging;
  	VkBuffer buffer = VK_NULL_HANDLE;
  	VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
-@@ -4970,6 +4979,8 @@
+@@ -4970,6 +4983,8 @@
  
  	}
  
@@ -576,7 +643,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
  	void *dst = staging.slot ? staging.slot->resource.mapped : nullptr;
  	if (staging.slot) {
  		if (!dst || uint64_t(stride) * height > staging.slot->resource.mappedBytes) {
-@@ -4978,7 +4989,9 @@
+@@ -4978,7 +4993,9 @@
  			return nullptr;
  		}
  	} else {
@@ -586,7 +653,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
  		if ( result != VK_SUCCESS )
  		{
  			wlr_buffer_end_data_ptr_access( buf );
-@@ -4987,7 +5000,9 @@
+@@ -4987,7 +5004,9 @@
  		}
  	}
  
@@ -596,7 +663,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
  	memcpy( dst, src, stride * height );
      if (maliCpuDetail.active) maliCpuDetail.shmBytes += uint64_t(stride) * height;
      if (g_device.IsMaliDiagnostic() && (drmFormat == DRM_FORMAT_ARGB8888 || drmFormat == DRM_FORMAT_XRGB8888)) {
-@@ -4999,12 +5014,16 @@
+@@ -4999,12 +5018,16 @@
          }
          drmFormat = DRM_FORMAT_ABGR8888;
      }
@@ -613,7 +680,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
  	gamescope::OwningRc<CVulkanTexture> pTex = new CVulkanTexture();
  	CVulkanTexture::createFlags texCreateFlags;
  	texCreateFlags.bSampled = true;
-@@ -5013,24 +5032,35 @@
+@@ -5013,24 +5036,35 @@
  	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
  		return nullptr;
  

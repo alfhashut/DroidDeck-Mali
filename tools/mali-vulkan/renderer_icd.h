@@ -1,11 +1,16 @@
 /* Narrow real-renderer marshaling. Only explicit fields and broker-owned IDs. */
 static VkResult renderer_rpc(struct proxy_logical *d, uint32_t op, const uint8_t *args, uint32_t n, uint8_t *out, uint32_t expected) {
     if (!d || d->owner->wire_version != MB_RENDERER_VERSION || n > MB_RENDERER_MAX_REQUEST - 4 || expected > 256) return VK_ERROR_FEATURE_NOT_PRESENT;
+    PROXY_TRACE_SCOPE(trace_pack, PROXY_SUBMIT_PACK, 0, 1);
     uint8_t *request = malloc(n + 4), reply[MB_PREFIX_BYTES + 256]; uint32_t bytes = 0;
     if (!request) return VK_ERROR_OUT_OF_HOST_MEMORY;
     mb_put_u32(request, d->id); if (n) memcpy(request + 4, args, n);
+    proxy_trace_finish(&trace_pack);
+    PROXY_TRACE_SCOPE(trace_lock, PROXY_LOCK, 0, 3);
     pthread_mutex_lock(&d->owner->lock);
+    proxy_trace_finish(&trace_lock);
     VkResult r = rpc(d->owner, op, request, n + 4, reply, &bytes, sizeof(reply));
+    PROXY_TRACE_SCOPE(trace_reply, PROXY_REPLY_HANDLE, 0, 0);
     if (bytes && (bytes != MB_PREFIX_BYTES + (r == VK_SUCCESS ? expected : 0) || mb_get_u32(reply + 8) != (r == VK_SUCCESS && expected ? 1u : 0u))) { shutdown(d->owner->fd, SHUT_RDWR); r = VK_ERROR_INITIALIZATION_FAILED; }
     if (r == VK_SUCCESS && expected && out) memcpy(out, reply + MB_PREFIX_BYTES, expected);
     pthread_mutex_unlock(&d->owner->lock); free(request); return r;
@@ -243,6 +248,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DeviceWaitIdle(VkDevice device) {
     return r == VK_SUCCESS && d->submit_failed ? (VkResult)atomic_load(&d->submit_failed) : r;
 }
 static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *si, VkFence fence) {
+    PROXY_TRACE_SCOPE(trace_prepare, PROXY_PREPARE, 0, 0);
     if (!queue || count != 1 || !si || si->sType != VK_STRUCTURE_TYPE_SUBMIT_INFO || !si->pNext || si->waitSemaphoreCount || si->commandBufferCount != 1 || !si->pCommandBuffers || si->signalSemaphoreCount != 1 || !si->pSignalSemaphores) return VK_ERROR_FEATURE_NOT_PRESENT;
     const VkTimelineSemaphoreSubmitInfoKHR *t = si->pNext;
     if (t->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR || t->pNext || t->waitSemaphoreValueCount || t->signalSemaphoreValueCount != 1 || !t->pSignalSemaphoreValues) return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -250,11 +256,20 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
     struct proxy_resource *c = submit_find(d, (uintptr_t)si->pCommandBuffers[0], PROXY_COMMAND), *s = submit_find(d, (uintptr_t)si->pSignalSemaphores[0], PROXY_SEMAPHORE), *f = fence ? submit_find(d, (uintptr_t)fence, PROXY_FENCE) : NULL;
     if (!q->id || !c || !s || (fence && !f)) return VK_ERROR_INITIALIZATION_FAILED;
     if (d->submit_failed) return (VkResult)atomic_load(&d->submit_failed);
+    proxy_trace_finish(&trace_prepare);
+    if (proxy_trace_sink) proxy_trace_id.scope = (uintptr_t)d->owner;
+    if (proxy_trace_sink) {
+        proxy_trace_id.fence = f ? f->id : 0;
+        proxy_trace_sink(DD_FT_PROXY_SUBMIT_LINK, proxy_trace_id, s->id, t->pSignalSemaphoreValues[0], 0, 0);
+    }
     /* Persistently mapped coherent upload data must reach the REAL mapped allocation. */
     uint64_t nodes = 0, live = 0, mapped = 0;
     /* Active links mutate on retirement. Keep the connection lock throughout
      * discovery/uploads; the locked helper uses the identical ACK/range path. */
+    PROXY_TRACE_SCOPE(trace_lock_mirror, PROXY_LOCK, 0, 2);
     pthread_mutex_lock(&d->owner->lock);
+    proxy_trace_finish(&trace_lock_mirror);
+    PROXY_TRACE_SCOPE(trace_mirror, PROXY_MIRROR, 0, 0);
     for (struct proxy_resource *m = d->registry.active; m; m = m->active_next) {
         int is_live = m->live;
         if (d->owner->perf_enabled) {
@@ -273,10 +288,18 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
         }
     }
     pthread_mutex_unlock(&d->owner->lock);
+    proxy_trace_finish(&trace_mirror);
+    PROXY_TRACE_SCOPE(trace_pack, PROXY_SUBMIT_PACK, 0, 0);
     uint8_t args[24]; uint32_t fields[] = {q->id, c->id, f ? f->id : 0, s->id}; for (unsigned i = 0; i < 4; ++i) mb_put_u32(args + i * 4, fields[i]); mb_put_u64(args + 16, t->pSignalSemaphoreValues[0]);
+    proxy_trace_finish(&trace_pack);
+    PROXY_TRACE_SCOPE(trace_rpc, PROXY_SUBMIT_RPC, s->id, t->pSignalSemaphoreValues[0]);
     VkResult result = renderer_rpc(d, MB_RENDERER_SUBMIT, args, 24, NULL, 0);
+    proxy_trace_finish(&trace_rpc);
     if (result == VK_SUCCESS) {
+        PROXY_TRACE_SCOPE(trace_lock_finish, PROXY_LOCK, 0, 4);
         pthread_mutex_lock(&d->owner->lock);
+        proxy_trace_finish(&trace_lock_finish);
+        PROXY_TRACE_SCOPE(trace_finalize, PROXY_FINALIZE, 0, 0);
         if (d->owner->perf_enabled) {
             d->owner->memory_perf.submit_nodes = nodes; d->owner->memory_perf.submit_live = live;
             d->owner->memory_perf.submit_mapped = mapped; ++d->owner->memory_perf.submits;

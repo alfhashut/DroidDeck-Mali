@@ -12,7 +12,14 @@ SHM_CHILD_STAGES = (
     'upload_record', 'upload_prepare', 'upload_submit', 'upload_finalize',
     'upload_queue', 'upload_wait', 'shm_cleanup',
 )
-SPAN_STAGES = frozenset(SHM_CHILD_STAGES) | {
+UPLOAD_QUEUE_CHILD_STAGES = (
+    'proxy_prepare', 'proxy_lock', 'proxy_mirror', 'proxy_dirty', 'proxy_bulk_setup',
+    'proxy_bulk_pack', 'proxy_bulk_rpc', 'proxy_bulk_ack', 'proxy_submit_pack',
+    'proxy_submit_rpc', 'proxy_reply_handle', 'proxy_finalize',
+    'rpc_header', 'rpc_send', 'rpc_receive', 'rpc_decode', 'rpc_exchange',
+)
+BROKER_STAGES = ('broker_receive', 'broker_dispatch', 'broker_reply', 'broker_mapped_copy')
+SPAN_STAGES = frozenset(SHM_CHILD_STAGES + UPLOAD_QUEUE_CHILD_STAGES + BROKER_STAGES) | {
     'frame', 'shm_import', 'ahb_acquire', 'render', 'wait', 'vk_submit', 'android_handoff',
 }
 # These always execute on a successful data-pointer import, including fallback.
@@ -62,7 +69,7 @@ def pair_spans(events):
             continue
         # attempt binds SHM/frame scopes before an output AHB has been acquired.
         identity = ('attempt', event['attempt']) if event['attempt'] else ('frame', event['key'], event['frame'])
-        has_local_identity = scope in ('wait', 'vk_submit') or (scope in SHM_CHILD_STAGES and scope != 'shm_copy')
+        has_local_identity = scope in UPLOAD_QUEUE_CHILD_STAGES + BROKER_STAGES or scope in ('wait', 'vk_submit') or (scope in SHM_CHILD_STAGES and scope != 'shm_copy')
         discriminator = (event.get('scope',0), event['object'], event['value']) if has_local_identity else ()
         key = (event['pid'], event['tid'], scope, identity, discriminator)
         if edge == 'begin':
@@ -178,6 +185,192 @@ def shm_decomposition(frames, issues, clean, all_spans=None):
                 method='same-attempt/thread nested or disjoint child interval union; inclusive stage means overlap and must not be added; absent optional scopes contribute zero on valid imports; no GPU execution timing')
 
 
+def bind_proxy_native(events, joined, game_pub):
+    """Map namespaces by published key/fence AND semaphore/value, never proximity.
+
+    Bulk operations carry no frame/timeline in the wire protocol. Only bind a
+    complete native span contained by exactly one synchronous client RPC with
+    the SAME mapped namespace/memory ID/offset. Containment is a causal bound,
+    not a nearest timestamp match; partial/duplicate/missing evidence stays raw.
+    """
+    game = [e for e in events if e['role']=='gamescope']
+    native = [e for e in events if e['role']=='android']
+    links = [e for e in game if e['stage']=='proxy_submit_link']
+    anchors = defaultdict(set)
+    native_submits = defaultdict(list)
+    for event in native:
+        if event['stage']=='vk_submit_end' and event['status']==0:
+            native_submits[(event['key'],event['frame'],event['fence'],event['object'],event['value'])].append(event)
+    for link in links:
+        pub = game_pub.get((link['key'],link['frame']))
+        if not link['scope'] or (link['key'],link['frame']) not in joined or not pub or link['fence']!=pub['fence']:
+            continue
+        matches = native_submits.get((link['key'],link['frame'],link['fence'],link['object'],link['value']), [])
+        if len(matches)==1 and matches[0]['scope']:
+            anchors[link['scope']].add(matches[0]['scope'])
+    reverse = Counter(scope for values in anchors.values() for scope in values)
+    mapping = {local:next(iter(values)) for local,values in anchors.items()
+               if len(values)==1 and reverse[next(iter(values))]==1}
+    exact = defaultdict(list)
+    for link in links:
+        if link['scope'] in mapping:
+            exact[(mapping[link['scope']],link['object'],link['value'])].append(link)
+    native_spans, _ = pair_spans(native)
+    client_spans, _ = pair_spans(game)
+    bulks = [s for s in client_spans if s['stage']=='proxy_bulk_rpc' and s['scope'] in mapping]
+    submit_rpcs, bulk_rpcs, native_edges, publications = (defaultdict(list) for _ in range(4))
+    for span in client_spans:
+        if span['stage']=='proxy_submit_rpc':
+            submit_rpcs[(span['attempt'],span['scope'],span['object'],span['value'])].append(span)
+    for span in bulks:
+        bulk_rpcs[(mapping[span['scope']],span['object'],span['value'])].append(span)
+    for event in native:
+        native_edges[(event['tid'],event['stage'],event.get('scope',0),event['object'],event['value'])].append(event)
+    for identity, pub in game_pub.items():
+        if identity in joined: publications[(pub['attempt'],pub['client'])].append(pub)
+    unresolved = 0
+    last_dispatch, pending_receive = {}, {}
+    bindings = []
+    for span in sorted(native_spans, key=lambda s:(s["start_ns"], -s["end_ns"])):
+        if span['stage'] not in BROKER_STAGES + ('vk_submit',):
+            continue
+        thread = (span['pid'],span['tid'])
+        if span['stage']=='broker_receive':
+            if thread in pending_receive: unresolved += 1
+            pending_receive[thread] = span
+            continue
+        candidates = exact.get((span['scope'],span['object'],span['value']), [])
+        # memory writes and submits use globally distinct resource IDs within
+        # one broker device. Require complete containment for either match.
+        candidates = [link for link in candidates
+                      if any(s['start_ns']<=span['start_ns']<=span['end_ns']<=s['end_ns']
+                             for s in submit_rpcs[(link['attempt'],link['scope'],link['object'],link['value'])])]
+        bulk_candidates = [s for s in bulk_rpcs[(span['scope'],span['object'],span['value'])]
+                           if s['start_ns']<=span['start_ns']<=span['end_ns']<=s['end_ns']]
+        targets = [(c['attempt'],c['client']) for c in candidates+bulk_candidates]
+        identity_source = 'published namespace anchor + exact resource/value + unique synchronous RPC containment'
+        previous = last_dispatch.get(thread)
+        if span['stage']=='broker_reply' and not targets and previous:
+            dispatch, target = previous
+            if (dispatch['end_ns'] <= span['start_ns'] and
+                (dispatch['scope'],dispatch['object'],dispatch['value']) ==
+                (span['scope'],span['object'],span['value'])):
+                targets = [target]
+                identity_source = 'published namespace anchor + immediately preceding decoded same-thread request dispatch'
+        if span['stage']=='broker_reply':
+            last_dispatch.pop(thread, None)  # one reply per decoded request
+        receive = pending_receive.pop(thread, None) if span['stage']=='broker_dispatch' else None
+        if span['stage']=='broker_dispatch':
+            last_dispatch.pop(thread, None)
+            if len(targets)==1: last_dispatch[thread] = (span, targets[0])
+        if len(targets)!=1:
+            unresolved += 1 + int(receive is not None)
+            continue
+        bindings.append((span, targets[0], identity_source))
+        if receive:
+            if receive['scope']==span['scope'] and receive['end_ns']<=span['start_ns']:
+                bindings.append((receive, targets[0], 'unique normal device namespace + immediately following decoded same-thread request dispatch'))
+            else:
+                unresolved += 1
+    unresolved += len(pending_receive)
+    for span, (attempt, client), identity_source in bindings:
+        pubs = publications[(attempt,client)]
+        if len(pubs)!=1:
+            unresolved += 1
+            continue
+        pub = pubs[0]
+        edges = sum((native_edges[(span['tid'],span['stage']+edge,span['scope'],span['object'],span['value'])] for edge in ('_begin','_end')), [])
+        for event in edges:
+            if span['start_ns']<=event['mono_ns']<=span['end_ns']:
+                event['key'],event['frame'] = pub['key'],pub['frame']
+                # Keep native attempt/client zero: these belong to Gamescope.
+                event['identity_source'] = identity_source
+    return dict(connection_scope_map=mapping, unresolved_native_spans=unresolved,
+                method='no wire changes; key/fence/timeline namespace anchors; unique complete synchronous RPC containment; no nearest-time matching')
+
+
+def upload_queue_decomposition(frames, issues, clean, all_spans):
+    rows = []
+    for frame in frames:
+        for parent in frame['spans']:
+            if parent['role']!='gamescope' or parent['stage']!='upload_queue':
+                continue
+            children = [s for s in all_spans if s['role']=='gamescope' and s['stage'] in UPLOAD_QUEUE_CHILD_STAGES
+                        and s['pid']==parent['pid'] and s['attempt']==parent['attempt']
+                        and parent['start_ns']<=s['start_ns']<=s['end_ns']<=parent['end_ns']]
+            reasons = []
+            if not clean: reasons.append('incomplete/lossy/late-armed capture')
+            required = {'proxy_prepare','proxy_lock','proxy_mirror','proxy_submit_pack','proxy_submit_rpc','proxy_finalize','rpc_exchange'}
+            if not required <= {s['stage'] for s in children}:
+                reasons.append('detail not sampled (attempt % 8 != 0), old build or missing scopes')
+            if any(s['client']!=parent['client'] or s['tid']!=parent['tid'] for s in children):
+                reasons.append('different child client/thread')
+            if any(i['pid']==parent['pid'] and i['attempt']==parent['attempt']
+                   and i['stage'].rsplit('_',1)[0] in set(UPLOAD_QUEUE_CHILD_STAGES)|{'upload_queue'}
+                   and parent['start_ns']<=i['mono_ns']<=parent['end_ns']
+                   and not i['reason'].startswith('invalid CPU') for i in issues):
+                reasons.append('malformed/unpaired upload queue scope')
+            # Only local same-thread coverage can be subtracted. Broker work is
+            # concurrent with client receive waits and MUST NOT be added here.
+            ordered=sorted(children,key=lambda s:(s['start_ns'],-s['end_ns']))
+            stack=[]
+            for child in ordered:
+                while stack and child['start_ns']>=stack[-1]['end_ns']: stack.pop()
+                if stack and child['end_ns']>stack[-1]['end_ns']:
+                    reasons.append('crossing child scopes'); break
+                stack.append(child)
+            if parent['status'] or any(s['status'] for s in children): reasons.append('scope failure')
+            crossing = [s for s in all_spans if s['role']=='gamescope' and s['stage'] in UPLOAD_QUEUE_CHILD_STAGES
+                        and s['pid']==parent['pid'] and s['attempt']==parent['attempt']
+                        and s['start_ns']<parent['end_ns'] and s['end_ns']>parent['start_ns'] and s not in children]
+            if crossing: reasons.append('child crosses queue boundary')
+            covered=interval_union_ns(children) if not reasons else None
+            broker = [s for s in frame['spans'] if s['role']=='android' and s['stage'] in BROKER_STAGES+('vk_submit',)
+                      and parent['start_ns']<=s['start_ns']<=s['end_ns']<=parent['end_ns']]
+            rpcs = [s for s in children if s['stage'] in ('proxy_bulk_rpc','proxy_submit_rpc')]
+            service = [s for s in broker if any(rpc['start_ns']<=s['start_ns']<=s['end_ns']<=rpc['end_ns'] for rpc in rpcs)]
+            # Excludes reply instrumentation which races the client's final read;
+            # that race stays visible in the separately reported broker stages.
+            rpc_coverage = interval_union_ns(rpcs)
+            complete_broker = bool(rpcs) and all(len([b for b in service if b['stage']=='broker_dispatch'
+                and rpc['start_ns']<=b['start_ns']<=b['end_ns']<=rpc['end_ns']
+                and (rpc['object'],rpc['value'])==(b['object'],b['value'])])==1 for rpc in rpcs)
+            broker_coverage = interval_union_ns(service) if complete_broker else None
+            submit = [s for s in children if s['stage']=='proxy_submit_rpc']
+            exchange = [s for s in children if s['stage']=='rpc_exchange' and
+                        any(rpc['start_ns']<=s['start_ns']<=s['end_ns']<=rpc['end_ns'] for rpc in submit)]
+            first_submit = min((s['start_ns'] for s in exchange), default=None)
+            rows.append(dict(attempt=parent['attempt'],client=parent['client'],key=frame['key'],frame=frame['frame'],
+                             start_ns=parent['start_ns'],end_ns=parent['end_ns'],total_ns=parent['wall_ns'],
+                             stage_inclusive_ns={name:interval_union_ns([s for s in children if s['stage']==name]) for name in UPLOAD_QUEUE_CHILD_STAGES},
+                             covered_ns=covered,unattributed_ns=parent['wall_ns']-covered if covered is not None else None,
+                             before_submit_rpc_ns=first_submit-parent['start_ns'] if first_submit is not None else None,
+                             broker_attribution_complete=complete_broker,
+                             broker_stage_span_counts=dict(Counter(s['stage'] for s in broker)),
+                             broker_stage_inclusive_ns={name:interval_union_ns([s for s in broker if s['stage']==name]) if complete_broker and any(s['stage']==name for s in broker) else None for name in BROKER_STAGES+('vk_submit',)},
+                             rpc_wall_ns=rpc_coverage,observed_broker_inside_rpc_ns=broker_coverage,
+                             rpc_outside_observed_broker_ns=rpc_coverage-broker_coverage if complete_broker else None,
+                             remainder_unavailable_reasons=reasons))
+    valid=[r for r in rows if r['unattributed_ns'] is not None]
+    mean=lambda values:statistics.mean(values)/1e6 if values else None
+    broker_valid=[r for r in valid if r['broker_attribution_complete']]
+    return dict(count=len(rows),remainder_samples=len(valid),unavailable_queues=len(rows)-len(valid),
+                total_queue_mean_ms=mean([r['total_ns'] for r in rows]),
+                paired_total_queue_mean_ms=mean([r['total_ns'] for r in valid]),
+                stage_inclusive_mean_ms={name:mean([r['stage_inclusive_ns'][name] for r in valid]) for name in UPLOAD_QUEUE_CHILD_STAGES},
+                covered_queue_mean_ms=mean([r['covered_ns'] for r in valid]),
+                before_submit_rpc_mean_ms=mean([r['before_submit_rpc_ns'] for r in valid if r['before_submit_rpc_ns'] is not None]),
+                broker_complete_samples=len(broker_valid),
+                paired_rpc_wall_mean_ms=mean([r['rpc_wall_ns'] for r in broker_valid]),
+                broker_stage_sample_counts={name:sum(r['broker_stage_inclusive_ns'][name] is not None for r in broker_valid) for name in BROKER_STAGES+('vk_submit',)},
+                broker_stage_inclusive_mean_ms={name:mean([r['broker_stage_inclusive_ns'][name] for r in broker_valid if r['broker_stage_inclusive_ns'][name] is not None]) for name in BROKER_STAGES+('vk_submit',)},
+                rpc_wall_mean_ms=mean([r['rpc_wall_ns'] for r in valid]),
+                observed_broker_inside_rpc_mean_ms=mean([r['observed_broker_inside_rpc_ns'] for r in broker_valid]),
+                rpc_outside_observed_broker_mean_ms=mean([r['rpc_outside_observed_broker_ns'] for r in broker_valid]),
+                unattributed_inside_queue_mean_ms=mean([r['unattributed_ns'] for r in valid]),per_queue=rows,
+                method='attempt % 8 detailed sample; same-thread interval union only; inclusive means overlap; broker spans are concurrent and excluded from subtraction; not GPU execution time')
+
+
 def analyze(paths, window=None):
     captures = [load(path) for path in paths]
     if len(captures) != 2 or sorted(h['role'] for h,_,_ in captures) != ['android','gamescope']:
@@ -222,6 +415,7 @@ def analyze(paths, window=None):
             if submit and event['mono_ns'] >= submit['mono_ns']:
                 event['key'],event['frame'] = submit['key'],submit['frame']
                 event['identity_source'] = 'same native device namespace/timeline semaphore/value as bound submit'
+    proxy_correlation = bind_proxy_native(events, joined, game_pub)
     all_spans, span_issues = pair_spans(events)
     commits = unique_index([e for e in game if e['stage'] == 'client_commit'], lambda e:e['client'])
     frames, durations = [], []
@@ -278,6 +472,8 @@ def analyze(paths, window=None):
                 observed_successful_frame_counts=successful, successful_rates_per_second={k:v/((window[1]-window[0])/1e9) for k,v in successful.items()},
                 observed_counts=counts, rates_per_second={k:v/((window[1]-window[0])/1e9) for k,v in counts.items()},
                 joined_frames=len(frames), frames=frames, stage_spans=summaries,
+                proxy_native_correlation=proxy_correlation,
+                upload_queue_decomposition=upload_queue_decomposition(frames, span_issues, clean, all_spans),
                 span_diagnostics=span_issues, shm_import_decomposition=shm_decomposition(frames, span_issues, clean, all_spans),
                 unmatched_publish_ids=[list(k) for k in sorted((game_pub.keys() | native_pub.keys())-joined)],
                 interpretation='observations only; boundary frames/loss are explicit; nested scopes overlap, never sum them',
@@ -285,8 +481,10 @@ def analyze(paths, window=None):
                                'latch timestamp is not physical scanout; transaction callback time is delivery time',
                                'release fence timestamp is first successful readability observation, not kernel signal time',
                                'same-token Android repeats are application repeats, not physical repeated refreshes',
-                               'native upload submits without an output key/fence remain unassigned; raw journals retained',
-                               'SHM upload_queue includes ICD mirror upload/bulk ACKs, locks and submit RPC; these costs are not independently separated',
+                               'native uploads require unique published namespace anchors and complete synchronous RPC containment; unmatched raw events retained',
+                               'broker header wait has no request identity; body receive needs one normal device and adjacent decoded dispatch, otherwise remains unassigned',
+                               'rpc_receive includes socket blocking and scheduling; exact scheduler wakeup delay is unavailable',
+                               'proxy details sample every eighth attempt; off-CPU includes all descheduling, not lock contention alone',
                                'wait wall/CPU timestamps do not measure GPU execution or exact scheduler wakeup latency'])
 
 

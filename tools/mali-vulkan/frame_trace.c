@@ -19,7 +19,7 @@
 #define DD_FT_ROOT "/storage/emulated/0/Download/DroidDeckFrameTrace"
 #endif
 #ifndef DD_FT_CAPACITY
-#define DD_FT_CAPACITY 16384u
+#define DD_FT_CAPACITY 65536u
 #endif
 struct dd_ft_record {
     uint64_t wall, cpu, object, value;
@@ -44,7 +44,29 @@ static const char *dd_ft_names[] = {
     "upload_record_begin", "upload_record_end", "upload_prepare_begin", "upload_prepare_end",
     "upload_submit_begin", "upload_submit_end", "upload_finalize_begin", "upload_finalize_end",
     "upload_queue_begin", "upload_queue_end", "upload_wait_begin", "upload_wait_end",
-    "shm_cleanup_begin", "shm_cleanup_end"
+    "shm_cleanup_begin", "shm_cleanup_end",
+    "proxy_prepare_begin", "proxy_prepare_end",
+    "proxy_lock_begin", "proxy_lock_end",
+    "proxy_mirror_begin", "proxy_mirror_end",
+    "proxy_bulk_setup_begin", "proxy_bulk_setup_end",
+    "proxy_bulk_pack_begin", "proxy_bulk_pack_end",
+    "proxy_bulk_rpc_begin", "proxy_bulk_rpc_end",
+    "proxy_bulk_ack_begin", "proxy_bulk_ack_end",
+    "proxy_submit_pack_begin", "proxy_submit_pack_end",
+    "proxy_submit_rpc_begin", "proxy_submit_rpc_end",
+    "proxy_reply_handle_begin", "proxy_reply_handle_end",
+    "proxy_finalize_begin", "proxy_finalize_end",
+    "rpc_header_begin", "rpc_header_end",
+    "rpc_send_begin", "rpc_send_end",
+    "rpc_receive_begin", "rpc_receive_end",
+    "rpc_decode_begin", "rpc_decode_end",
+    "broker_receive_begin", "broker_receive_end",
+    "broker_dispatch_begin", "broker_dispatch_end",
+    "broker_reply_begin", "broker_reply_end",
+    "broker_mapped_copy_begin", "broker_mapped_copy_end",
+    "proxy_dirty_begin", "proxy_dirty_end",
+    "rpc_exchange_begin", "rpc_exchange_end",
+    "proxy_submit_link"
 };
 static pthread_mutex_t dd_ft_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t dd_ft_thread;
