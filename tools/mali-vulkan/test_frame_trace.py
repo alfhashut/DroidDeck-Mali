@@ -104,6 +104,15 @@ class JoinTests(unittest.TestCase):
                                  self.write('android',[self.event('publish',10,frame=2)])])
         self.assertEqual(result['joined_frames'],0)
 
+    def test_matching_key_frame_requires_same_broker_fence_and_sync_ids(self):
+        for field in ('fence','sync'):
+            with self.subTest(field=field):
+                native=self.event('publish',10)
+                native[field]=0x9abcdef0
+                result=analyzer.analyze([self.write('gamescope',[self.event('publish',10,attempt=1)]),
+                                         self.write('android',[native])])
+                self.assertEqual(result['joined_frames'],0)
+
     def test_attempt_prepublication_and_previous_release_identity(self):
         game=[self.event('shm_import_begin',5,attempt=1,frame=0,key=0),self.event('shm_import_end',9,attempt=1,frame=0,key=0),self.event('publish',20,attempt=1)]
         native=[self.event('vk_submit_begin',10,frame=0),self.event('vk_submit_end',11,frame=0),self.event('publish',19),self.event('release_callback',60),self.event('pool_return',70)]
@@ -145,6 +154,39 @@ class JoinTests(unittest.TestCase):
 
 
 class ControlTests(unittest.TestCase):
+    def test_gamescope_fence_assignment_with_opaque_vulkan_handle(self):
+        # Compile the actual patched assignment against the private ABI. This
+        # catches using a VkFence pointer as a uint32_t journal identity, without
+        # building Gamescope. The real proxy-ID export is exercised by test_registry.
+        patch=(ROOT.parent/'gamescope/patches/0126-mali-frame-trace.patch').read_text()
+        assignments=[line[1:] for line in patch.splitlines()
+                     if line.startswith('+') and 'g_maliFrameTrace.fence =' in line]
+        self.assertEqual(len(assignments),1)
+        with tempfile.TemporaryDirectory(prefix='dd-frame-fence-') as directory:
+            root=Path(directory);source=root/'fence.cpp';binary=root/'fence'
+            source.write_text('''#include <cassert>
+#include <cstdint>
+typedef struct VkFence_T *VkFence;
+typedef void *VkDevice, *VkImage, *VkDeviceMemory;
+typedef int VkResult;
+#define VKAPI_PTR
+#include "interop_test_api.h"
+#include "frame_trace.h"
+int main() {
+    dd_interop_output producer{};
+    producer.fence = reinterpret_cast<VkFence>(uintptr_t(0x9abcdef0));
+    producer.token = 0x12345678;
+    dd_ft_id g_maliFrameTrace{};
+''' + '\n'.join(assignments) + '''
+    assert(g_maliFrameTrace.fence == 0x12345678);
+    assert(producer.fence == reinterpret_cast<VkFence>(uintptr_t(0x9abcdef0)));
+}
+''')
+            subprocess.run(shlex.split(os.environ.get('HOST_CXX','c++'))+
+                           ['-std=c++20','-Wall','-Wextra','-Werror','-I'+str(ROOT),
+                            str(source),'-o',str(binary)],check=True,timeout=15)
+            subprocess.run([str(binary)],check=True,timeout=3)
+
     def test_unarmed_does_not_create_control(self):
         import steam_frame_journal as controller
         with tempfile.TemporaryDirectory() as directory:

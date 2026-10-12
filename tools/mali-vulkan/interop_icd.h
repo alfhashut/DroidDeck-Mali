@@ -324,7 +324,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_DroidDeckInteropTEST(VkDevice device
             mb_put_u32(args, f->id); mb_put_u32(args + 4, VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT); n = 8; rpc_op = MB_SYNC_EXPORT; kind = PROXY_SYNC;
         }
         r = interop_new(d, rpc_op, kind, args, n, &o);
-        if (r == VK_SUCCESS) { if (kind == PROXY_FENCE) out->fence = (VkFence)(uintptr_t)o; else out->sync = o->id; } return r;
+        if (r == VK_SUCCESS) {
+            if (kind == PROXY_FENCE) {
+                out->fence = (VkFence)(uintptr_t)o;
+                out->token = o->id; /* Existing broker fence ID for diagnostic correlation, not a handle/FD. */
+            } else out->sync = o->id;
+        } return r;
     }
     struct proxy_resource *a = NULL, *sync = NULL;
     pthread_mutex_lock(&d->owner->lock);

@@ -227,7 +227,18 @@ the existing BOOTTIME/Chromium/X11 clock anchors when comparing external traces.
 
 `client` and `attempt` are Gamescope-local diagnostic IDs. They are carried into
 its output-buffer metadata and `outer_release`, but **not added to the wire
-protocol**. Android uses the existing output IDs. Offline matching requires
+protocol**. Android uses the existing output IDs. Journal `fence` is the broker's
+32-bit producer-fence resource ID, returned in `DD_FENCE_CREATE`'s existing
+operation-specific `token` output. The ICD obtains it from the proxy registry
+entry's `id`, which came from `MB_SYNC_FENCE_CREATE` and is passed unchanged to
+`MB_SYNC_EXPORT`; Android stores it as `native_sync.fence`. `producer.fence`
+remains the local opaque `VkFence` proxy handle used for submission, sync export
+and destruction. Its pointer bits are never used for cross-process correlation
+or recorded as the journal fence ID. Neither identity is a native FD: `sync`
+identifies the exported sync wrapper whose FD stays native-side. This adds no
+ABI fields or RPCs and changes no synchronization. An older ICD leaves the
+fence-create token zero, so matching remains unproven rather than guessing an ID.
+Offline matching requires
 exact, unique successful Gamescope **and** Android publications of
 `(run,key,frame)` with equal nonzero `sync/fence`. It then attaches earlier
 Gamescope SHM/render records by `attempt`. Native pre-publication submit records

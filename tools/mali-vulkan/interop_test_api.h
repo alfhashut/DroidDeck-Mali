@@ -12,6 +12,9 @@ struct dd_interop_output {
     VkImage image;
     VkDeviceMemory memory;
     VkFence fence;
+    /* token: AHB ID for DD_AHB_CREATE; producer fence ID for DD_FENCE_CREATE.
+     * The latter is the existing broker resource ID, never VkFence bits or an FD.
+     * Operation-specific output preserves this private ABI's size/layout. */
     uint32_t token, sync, width, height, format, layers, cpu_checked;
     uint64_t usage;
 };

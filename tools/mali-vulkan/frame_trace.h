@@ -16,6 +16,8 @@ enum dd_ft_stage {
     DD_FT_RELEASE_FENCE_OBSERVED, DD_FT_POOL_RETURN, DD_FT_CANCEL,
     DD_FT_TRANSACTION_COMPLETE, DD_FT_LATCH_TIME, DD_FT_COPY_BEGIN, DD_FT_COPY_END, DD_FT_COUNT
 };
+/* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
+ * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
 struct dd_ft_id { uint64_t client, attempt, scope; uint32_t frame, key, sync, fence; };
 /* Call init only at normal-session start, after an explicit adb-created arm
  * marker. Disabled calls do no clocks, locks, allocations, or file access. */

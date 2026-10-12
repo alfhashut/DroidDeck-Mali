@@ -4,7 +4,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 
 --- /dev/null
 +++ b/src/frame_trace.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,42 @@
 +/* Development-only journal. No renderer/wire/ownership changes. */
 +#ifndef DD_FRAME_TRACE_H
 +#define DD_FRAME_TRACE_H
@@ -23,6 +23,8 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +    DD_FT_RELEASE_FENCE_OBSERVED, DD_FT_POOL_RETURN, DD_FT_CANCEL,
 +    DD_FT_TRANSACTION_COMPLETE, DD_FT_LATCH_TIME, DD_FT_COPY_BEGIN, DD_FT_COPY_END, DD_FT_COUNT
 +};
++/* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
++ * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
 +struct dd_ft_id { uint64_t client, attempt, scope; uint32_t frame, key, sync, fence; };
 +/* Call init only at normal-session start, after an explicit adb-created arm
 + * marker. Disabled calls do no clocks, locks, allocations, or file access. */
@@ -203,6 +205,18 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +    pthread_join(dd_ft_thread, NULL);
 +    __atomic_store_n(&dd_ft_running, 0, __ATOMIC_RELEASE);
 +}
+--- a/src/interop_test_api.h
++++ b/src/interop_test_api.h
+@@ -12,6 +12,9 @@
+     VkImage image;
+     VkDeviceMemory memory;
+     VkFence fence;
++    /* token: AHB ID for DD_AHB_CREATE; producer fence ID for DD_FENCE_CREATE.
++     * The latter is the existing broker resource ID, never VkFence bits or an FD.
++     * Operation-specific output preserves this private ABI's size/layout. */
+     uint32_t token, sync, width, height, format, layers, cpu_checked;
+     uint64_t usage;
+ };
 --- a/src/mali_normal.cpp
 +++ b/src/mali_normal.cpp
 @@ -2,6 +2,8 @@
@@ -365,7 +379,7 @@ No rendering, ownership, pacing, or Vulkan capability changes.
 +    g_maliFrameTrace.frame = slot.frame; g_maliFrameTrace.key = slot.key;
 +    dd_ft_event(DD_FT_ACQUIRE_END, g_maliFrameTrace, index, previousFrame, 0, 1);
      auto producer = NormalInterop(DD_FENCE_CREATE); g_device.m_maliProducerFence = producer.fence;
-+    g_maliFrameTrace.fence = producer.fence;
++    g_maliFrameTrace.fence = producer.token; // Broker fence ID, never the local VkFence handle.
      g_device.m_maliReadbackBuffer = VK_NULL_HANDLE;
      FrameInfo_t mutableFrame = *frame;
      uint64_t compositeStart = dd_perf_now();

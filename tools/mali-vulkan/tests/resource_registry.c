@@ -47,6 +47,7 @@ struct proxy_instance { pthread_mutex_t lock; int perf_enabled, fd; uint32_t wir
 struct proxy_logical { struct proxy_instance *owner; struct proxy_registry registry; int fd;
     uint8_t *write_request, *read_reply; uint32_t write_capacity, read_capacity; } device;
 static unsigned rpc_calls, next_id=1, errors, bad_ids, disconnected;
+static uint32_t exported_fence_id;
 static VkResult rpc_result;
 static void set_loader_magic_value(struct proxy_resource *o) { o->loader=1234; }
 static VkResult submit_rpc(struct proxy_logical *d, uint32_t op, const uint32_t *args, unsigned n, uint64_t timeout, uint32_t *id) {
@@ -55,7 +56,8 @@ static VkResult submit_rpc(struct proxy_logical *d, uint32_t op, const uint32_t 
     return rpc_result;
 }
 static VkResult interop_rpc(struct proxy_logical *d, uint32_t op, const uint8_t *args, uint32_t n, uint8_t *out, uint32_t expected) {
-    (void)d; (void)op; (void)args; (void)n; ++rpc_calls;
+    (void)d; (void)n; ++rpc_calls;
+    if (op == MB_SYNC_EXPORT) exported_fence_id = mb_get_u32(args);
     if (rpc_result==VK_SUCCESS) for (unsigned i=0; i<expected; i+=4) mb_put_u32(out+i, bad_ids ? 0 : next_id++);
     return rpc_result;
 }
@@ -220,8 +222,13 @@ static void tokens(void) {
     assert(proxy_DroidDeckInteropTEST(&device, DD_AHB_CREATE, &input, &out)==VK_SUCCESS);
     uint32_t token=out.token; assert(device.registry.active_count==3);
     assert(proxy_DroidDeckInteropTEST(&device, DD_FENCE_CREATE, &input, &out)==VK_SUCCESS);
+    uint32_t fence_id=out.token;
+    struct proxy_resource *f=submit_find(&device, (uintptr_t)out.fence, PROXY_FENCE);
+    assert(f && fence_id && fence_id==f->id);
+    assert((uintptr_t)out.fence!=(uintptr_t)fence_id); /* Handle identity is independent of broker ID. */
     input.fence=out.fence;
     assert(proxy_DroidDeckInteropTEST(&device, DD_SYNC_EXPORT, &input, &out)==VK_SUCCESS);
+    assert(exported_fence_id==fence_id && out.sync && out.sync!=fence_id && !out.token);
     input.sync=out.sync; input.token=token;
     assert(proxy_DroidDeckInteropTEST(&device, DD_SYNC_WAIT, &input, &out)==VK_SUCCESS);
     size_t live=device.registry.active_count;
