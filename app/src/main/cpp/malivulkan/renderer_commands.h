@@ -167,6 +167,8 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         } else {
             value = mb_get_u64(w + 8); uint64_t timeout = mb_get_u64(w + 16); REQUIRE(timeout <= MB_SUBMIT_TIMEOUT_NS);
             VkSemaphoreWaitInfoKHR info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR, .semaphoreCount = 1, .pSemaphores = &sem->handle.semaphore, .pValues = &value};
+            struct dd_ft_id trace = {0}; trace.scope = d->normal.trace_scope;
+            if (d->normal.enabled) dd_ft_event(DD_FT_WAIT_BEGIN, trace, id, value, 0, 1);
             if (profiled) {
                 uint32_t reason = mb_get_u32(w + 24), detail = mb_get_u32(w + 28);
                 if (reason == DD_WAIT_SHM_STAGING_DESTROY) REQUIRE(interop_find_buffer(d, detail));
@@ -187,6 +189,7 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
                 *result = v->WaitSemaphoresKHR(d->handle, &info, timeout);
                 native_perf_end(d, 1, perf_start);
             }
+            if (d->normal.enabled) dd_ft_event(DD_FT_WAIT_END, trace, id, value, *result, 1);
         }
         if (*result == VK_SUCCESS) for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
             struct native_command *c = &d->submit.commands[i];
@@ -355,9 +358,14 @@ static uint32_t native_renderer_command(struct vk_session *s, uint32_t op, const
         REQUIRE(queue && c && c->renderer && c->state == 2 && c->recorded && c->family == d->family && sem && value > sem->last_signal && (!fid || (f && !f->submitted)) && native_renderer_can_submit_ordered(d, c, id, sem->id, value));
         VkTimelineSemaphoreSubmitInfoKHR timeline = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &value};
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &timeline, .commandBufferCount = 1, .pCommandBuffers = &c->handle, .signalSemaphoreCount = 1, .pSignalSemaphores = &sem->handle.semaphore};
+        struct dd_ft_id trace = {0}; trace.scope = d->normal.trace_scope; trace.fence = fid;
+        if (dd_ft_active() && d->normal.enabled) for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
+            if (d->interop.ahbs[i].image == c->image_id) trace.key = d->interop.ahbs[i].normal_key;
+        if (d->normal.enabled) dd_ft_event(DD_FT_SUBMIT_BEGIN, trace, sem->id, value, 0, 1);
         uint64_t perf_start = native_perf_start(d);
         *result = d->submit.QueueSubmit(queue, 1, &si, f ? f->handle : VK_NULL_HANDLE);
         native_perf_end(d, 0, perf_start);
+        if (d->normal.enabled) dd_ft_event(DD_FT_SUBMIT_END, trace, sem->id, value, *result, 1);
         if (*result == VK_SUCCESS) { c->state = 3; c->semaphore = sem->id; c->signal_value = value; sem->last_signal = value; c->fence = fid; c->renderer_submit_queue = id; if (f) f->submitted = 1; }
         if (*result == VK_SUCCESS && d->normal.enabled) {
             struct dd_wait_producer *p = &d->normal.wait_history[d->normal.wait_history_cursor++ % DD_WAIT_HISTORY];

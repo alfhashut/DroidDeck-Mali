@@ -41,7 +41,8 @@ string(SUBSTRING "${WINFG_CHAIN_HASH_FULL}" 0 12 WINFG_CHAIN_HASH)
 message(STATUS "win-fg chain: ${WINFG_UPSTREAM} (src ${WINFG_CHAIN_HASH})")
 
 # Shared Android-local ownership registry. No Vulkan handles cross this boundary.
-add_library(maliahb SHARED malivulkan/normal_ownership.c)
+add_library(maliahb SHARED malivulkan/normal_ownership.c
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/mali-vulkan/frame_trace.c")
 target_compile_features(maliahb PRIVATE c_std_11)
 target_link_libraries(maliahb android)
 add_subdirectory(waylandcomp)

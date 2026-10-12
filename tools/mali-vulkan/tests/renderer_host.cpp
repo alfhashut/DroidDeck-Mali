@@ -8,6 +8,8 @@
 #include <cstring>
 #include <cstdarg>
 #include "rendervulkan.hpp"
+#include "frame_trace.inc"
+dd_ft_id g_maliFrameTrace{};
 #include "reshade_effect_manager.hpp"
 #include "vulkan_renderer_test.hpp"
 #include "Utils/Process.h"

@@ -65,6 +65,7 @@ static struct {
     void (*reparent)(ASurfaceTransaction *, ASurfaceControl *, ASurfaceControl *);
     void (*setOnComplete)(ASurfaceTransaction *, void *, sc_complete_fn);
     int (*prevReleaseFence)(ASurfaceTransactionStats *, ASurfaceControl *);
+    int64_t (*latchTime)(ASurfaceTransactionStats *); /* optional diagnostic query, API 29 */
     /* Display frame-rate vote for the layer (API 30 / 31). Optional: absent on older Android, where
      * the layer simply carries no vote and the app's surface vote is all there is. */
     void (*setFrameRate)(ASurfaceTransaction *, ASurfaceControl *, float, int8_t);
@@ -115,6 +116,7 @@ static int load_api(void) {
     SYM(reparent, "ASurfaceTransaction_reparent");
     SYM(setOnComplete, "ASurfaceTransaction_setOnComplete");
     SYM(prevReleaseFence, "ASurfaceTransactionStats_getPreviousReleaseFenceFd");
+    SYM(latchTime, "ASurfaceTransactionStats_getLatchTime");
     SYM(setFrameRate, "ASurfaceTransaction_setFrameRate");
     SYM(setFrameRateStrategy, "ASurfaceTransaction_setFrameRateWithChangeStrategy");
     SYM(setBufferDataSpace, "ASurfaceTransaction_setBufferDataSpace");
@@ -230,6 +232,7 @@ static struct layer *layer_of(int id) {
 }
 
 struct complete_ctx {
+    struct dd_ft_id trace_current, trace_previous; /* immutable: callback never traverses compositor buffers */
     ASurfaceControl *sc;
     int layer;                  /* which layer's pool prev_slot belongs to */
     int prev_slot;              /* pool buffer this transaction replaced: free once its release fence is known */
@@ -246,6 +249,13 @@ static int64_t now_ns(void) {
 static void on_complete(void *context, ASurfaceTransactionStats *stats) {
     struct complete_ctx *ctx = context;
     pthread_mutex_lock(&g_lock);
+    if (ctx->trace_current.key && dd_ft_active()) {
+        dd_ft_event(DD_FT_TRANSACTION_COMPLETE, ctx->trace_current, g_pending_cb, 0, stats ? 0 : -1, 0);
+        if (stats && api.latchTime) {
+            int64_t latch = api.latchTime(stats);
+            dd_ft_event(DD_FT_LATCH_TIME, ctx->trace_current, 0, latch > 0 ? (uint64_t)latch : 0, latch > 0 ? 0 : -1, 0);
+        }
+    }
     if (ctx->layer >= 0 && ctx->layer < SC_LAYER_COUNT && ctx->prev_slot >= 0 && ctx->prev_slot < POOL_MAX) {
         struct slot *s = &g_layers[ctx->layer].slots[ctx->prev_slot];
         int fd = (stats && ctx->sc) ? api.prevReleaseFence(stats, ctx->sc) : -1;
@@ -257,6 +267,7 @@ static void on_complete(void *context, ASurfaceTransactionStats *stats) {
     pthread_mutex_unlock(&g_lock);
     if (ctx->prev_token) {
         int fd = (stats && ctx->sc) ? api.prevReleaseFence(stats, ctx->sc) : -1;
+        if (ctx->trace_previous.key) dd_ft_event(DD_FT_RELEASE_CALLBACK, ctx->trace_previous, (uint64_t)(uintptr_t)ctx->prev_token, fd >= 0, stats ? 0 : -1, 0);
         ahb_swapchain_layer_released(ctx->prev_token, fd); /* takes the fd */
     }
     if (ctx->retire && ctx->sc) api.release(ctx->sc);
@@ -267,11 +278,13 @@ static void on_complete(void *context, ASurfaceTransactionStats *stats) {
  * composition-recovery swap the outgoing buffer belongs to the old SurfaceControl, and both its
  * release fence and its release must be taken from that one. */
 static int add_complete_on(ASurfaceTransaction *tx, struct layer *l, ASurfaceControl *sc,
-                           int prev_slot, void *prev_token, int retire) {
+                           int prev_slot, void *prev_token, int retire, void *trace_token) {
     struct complete_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return -1;
     ctx->sc = sc; ctx->layer = (int)(l - g_layers); ctx->prev_slot = prev_slot;
     ctx->prev_token = prev_token; ctx->retire = retire;
+    ctx->trace_current = ahb_swapchain_trace_identity(trace_token);
+    ctx->trace_previous = ahb_swapchain_trace_identity(prev_token);
     pthread_mutex_lock(&g_lock);
     g_pending_cb++;
     pthread_mutex_unlock(&g_lock);
@@ -280,7 +293,7 @@ static int add_complete_on(ASurfaceTransaction *tx, struct layer *l, ASurfaceCon
 }
 
 static int add_complete(ASurfaceTransaction *tx, struct layer *l, int prev_slot, void *prev_token, int retire) {
-    return add_complete_on(tx, l, l->sc, prev_slot, prev_token, retire);
+    return add_complete_on(tx, l, l->sc, prev_slot, prev_token, retire, NULL);
 }
 
 /* The stand-in buffer for a hidden/retired layer (allocated once, black, shared by both layers). */
@@ -783,7 +796,7 @@ static int present_slot(struct layer *l, int idx, const int r[8], const struct d
     apply_colour(tx, l, color);
     if (!l->shown) api.setVisibility(tx, l->sc, ASC_VISIBILITY_SHOW);
     if (old) retire_ops(tx, old);
-    if (add_complete_on(tx, l, old ? old : l->sc, l->cur_slot, l->cur_token, old ? 1 : 0) != 0 && old)
+    if (add_complete_on(tx, l, old ? old : l->sc, l->cur_slot, l->cur_token, old ? 1 : 0, NULL) != 0 && old)
         api.release(old); /* no callback to retire it from (out of memory): let it go here */
     pthread_mutex_lock(&g_lock);
     s->busy = 1;
@@ -828,6 +841,8 @@ int sc_layer_present_ahb(AHardwareBuffer *ahb, int w, int h, int acquire_fd, voi
     if (g < 0) goto unavailable;
     if (g == 0) { if (acquire_fd >= 0) close(acquire_fd); sc_layer_hide(); return 1; }
     if (token == l->cur_token && l->shown && !l->recreate_pending) {
+        struct dd_ft_id trace = ahb_swapchain_trace_identity(token);
+        if (trace.key) dd_ft_event(DD_FT_ANDROID_REPEAT, trace, (uint64_t)(uintptr_t)token, 0, 0, 0);
         /* The same frame again (the scene was redrawn for another reason): the display already
          * has it; only the placement may have changed (or, rarely, its description). */
         if (acquire_fd >= 0) close(acquire_fd);
@@ -853,7 +868,7 @@ int sc_layer_present_ahb(AHardwareBuffer *ahb, int w, int h, int acquire_fd, voi
     /* Same buffer, new SurfaceControl: it is NOT free, so no release is reported for it - the swap
      * moved it rather than taking it off screen. */
     if (add_complete_on(tx, l, old ? old : l->sc, l->cur_slot,
-                        l->cur_token == token ? NULL : l->cur_token, old ? 1 : 0) != 0) {
+                        l->cur_token == token ? NULL : l->cur_token, old ? 1 : 0, token) != 0) {
         api.txDelete(tx); /* the fence went with the transaction */
         if (old) api.release(old);
         l->ds_applied = -1; l->md_applied = 0; l->hr_applied = -1.0f; /* the colour tag went with it too: re-send it next time */

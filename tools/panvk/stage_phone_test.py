@@ -206,7 +206,7 @@ def main():
             if swap:
                 names += ('steam_swap_details.py',)
             if args.frame_diagnostics:
-                names += ('steam_frame_details.py',)
+                names += ('steam_frame_details.py', 'steam_frame_journal.py')
             if args.client_affinity:
                 names += ('steam_affinity.py',)
             for name in names:

@@ -25,6 +25,7 @@
  */
 #include <stddef.h>
 #include <stdint.h>
+#include "../../malivulkan/normal_ownership.h"
 #include <wayland-server.h>
 
 struct dmabuf_buffer;
@@ -61,6 +62,8 @@ uint32_t ahb_swapchain_ahb_format(const struct dmabuf_buffer *b);
  * buffer behind `token`; release_fd (owned by the callee, -1 = none) signals when the display is
  * done reading it. */
 void ahb_swapchain_layer_released(void *token, int release_fd);
+/* Diagnostic snapshot: compositor thread ONLY; callbacks retain an immutable copy. */
+struct dd_ft_id ahb_swapchain_trace_identity(void *token);
 
 /* ---- ahb_swapchain.c -> compositor.c (hooks) */
 struct dmabuf_buffer *droiddeck_dmabuf_from_resource(struct wl_resource *buffer);

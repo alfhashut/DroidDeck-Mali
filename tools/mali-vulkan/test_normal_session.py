@@ -36,7 +36,7 @@ class NormalSessionTests(test_renderer.GamescopeRendererFixture):
         java=Path(os.environ.get('JAVA_HOME','/usr/lib/jvm/default'))
         cls.outer=build/'normal-outer'
         cflags=['-std=c11','-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-DWLR_USE_UNSTABLE','-DMB_NORMAL_RELEASE_WAIT_MS=50']+['-I'+str(p) for p in includes+[ROOT,ROOT/'tests',java/'include',java/'include/linux']]
-        subprocess.run(cc+cflags+[str(ROOT/'tests/normal_outer.c'),str(ROOT/'../../app/src/main/cpp/malivulkan/normal_ownership.c'),*[str(build/(name+'-protocol.o')) for name in ('banner-ahb-v1','linux-dmabuf-v1','presentation-time')],'-L'+str(wlr),'-Wl,-rpath,'+str(wlr),'-lwlroots-0.20','-lwayland-server','-lxkbcommon','-lpixman-1','-pthread','-o',str(cls.outer)],check=True)
+        subprocess.run(cc+cflags+[str(ROOT/'tests/normal_outer.c'),str(ROOT/'../../app/src/main/cpp/malivulkan/normal_ownership.c'),str(ROOT/'frame_trace.c'),*[str(build/(name+'-protocol.o')) for name in ('banner-ahb-v1','linux-dmabuf-v1','presentation-time')],'-L'+str(wlr),'-Wl,-rpath,'+str(wlr),'-lwlroots-0.20','-lwayland-server','-lxkbcommon','-lpixman-1','-pthread','-o',str(cls.outer)],check=True)
 
     @contextlib.contextmanager
     def outer_server(self,mode=72):

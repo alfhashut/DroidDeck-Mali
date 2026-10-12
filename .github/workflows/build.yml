@@ -42,6 +42,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Frame journal contracts (small host harness only)
+        working-directory: tools/mali-vulkan
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwayland-dev >/dev/null
+          python3 -B -m unittest -v test_frame_trace
       - name: Build in Arch Linux ARM
         run: |
           set -euo pipefail
@@ -322,6 +328,7 @@ jobs:
           (cd gamescope-component && sha256sum -c gamescope.tzst.sha256)
           mkdir -p app/src/main/assets/linuxfs
           tar --use-compress-program=unzstd -xf gamescope-component/gamescope.tzst -C app/src/main/assets/linuxfs
+          grep -a -q -F -- 'DroidDeckFrameTrace' app/src/main/assets/linuxfs/usr/local/bin/gamescope
           grep -a -q -F -- 'vk-enumerate-only' app/src/main/assets/linuxfs/usr/local/bin/gamescope
           grep -a -q -F -- 'vk-capabilities' app/src/main/assets/linuxfs/usr/local/bin/gamescope
           grep -a -q -F -- 'vk-create-device-test' app/src/main/assets/linuxfs/usr/local/bin/gamescope
@@ -476,7 +483,7 @@ jobs:
           path: |
             app/.cxx
             app/build/intermediates/cxx
-          key: cxx-${{ env.NDK_VERSION }}-${{ hashFiles('app/src/main/cpp/**') }}
+          key: cxx-${{ env.NDK_VERSION }}-${{ hashFiles('app/src/main/cpp/**', 'tools/mali-vulkan/frame_trace.*') }}
           restore-keys: |
             cxx-${{ env.NDK_VERSION }}-
 

@@ -466,6 +466,20 @@ def run(seconds, swap_details=False, client_affinity=None, frame_details=False):
             if trace:
                 trace.close()
             raise
+    journal = None
+    if frame_details:
+        from steam_frame_journal import schedule
+        try:
+            journal = schedule(seconds, emit)
+        except (OSError, ValueError) as error:
+            emit('frame-journal-unavailable', str(error))
+        if journal:
+            while time.monotonic_ns() < journal['start_ns']:
+                if windows:
+                    windows.drain()
+                if sampler:
+                    sampler.poll()
+                time.sleep(0.02)
     if sampler:
         sampler.poll(force=True)
     start = previous_time = time.monotonic()
@@ -537,6 +551,9 @@ def run(seconds, swap_details=False, client_affinity=None, frame_details=False):
                 detail.report(windows)
         if restore_error:
             raise restore_error
+    if journal:
+        from steam_frame_journal import finish
+        finish(journal, emit)
     emit('diagnostic-gaps', dict(
          xwayland_commits='XDamage batches observed; exact wlroots buffer commit/coalescing counter unavailable in the dynamic helper',
          frame_drops_repeats='no shared end-to-end frame ID or physical scanout feedback; do not subtract unrelated counters or call MaliPerf missed dropped frames',

@@ -82,6 +82,27 @@ class PerformanceCapture:
                     stream.flush()
                 self.stop.wait(1)
 
+    def pull_journal(self):
+        report = self.directory / 'guest-report.txt'
+        if not report.is_file():
+            return
+        controls = [json.loads(line.split('=', 1)[1]) for line in report.read_text().splitlines()
+                    if line.startswith('frame-journal-control=')]
+        if not controls:
+            return
+        from steam_frame_journal import ROOT
+        target = self.directory / 'frame-journal'
+        target.mkdir(exist_ok=False)
+        for config in controls:
+            run = config['run']
+            names = [f'capture-{run}.json'] + [f"trace-{run}-{row['pid']}-{row['role']}.jsonl" for row in config['ready']]
+            for name in names:
+                result = subprocess.run(self.adb + ['pull', str(ROOT / name), str(target / name)],
+                                        capture_output=True, text=True, timeout=15)
+                if result.returncode:
+                    (target / (name + '.pull-error.txt')).write_text(result.stderr)
+        print('Internal frame journals=' + str(target), flush=True)
+
     def __exit__(self, *args):
         try:
             if self.system:
@@ -99,3 +120,5 @@ class PerformanceCapture:
                     self.logcat.wait(timeout=3)
             if self.log:
                 self.log.close()
+            if self.frame_seconds:
+                self.pull_journal()

@@ -99,6 +99,8 @@ static uint32_t native_normal_command(struct vk_session *s, uint32_t op, const u
     if (!d || !d->renderer.enabled || !d->interop.ahb_enabled || d->session.enabled) return MB_PROTOCOL_ERROR;
     if (op == MB_NORMAL_BEGIN) {
         if (d->normal.enabled || mb_get_u32(w + 4) > 1) return MB_PROTOCOL_ERROR;
+        dd_ft_shutdown(); dd_ft_init("android");
+        d->normal.trace_scope = dd_ft_new_scope();
         d->normal.enabled = 1; d->normal.verbose = mb_get_u32(w + 4);
         d->normal.cpu_start_ns = dd_perf_cpu_now();
         native_session_log(d, "normal start (connection baseline zero)"); session_quiet = !d->normal.verbose;
@@ -122,7 +124,10 @@ static uint32_t native_normal_command(struct vk_session *s, uint32_t op, const u
         for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i)
             if (d->submit.commands[i].id && d->submit.commands[i].fence == sync->fence && d->submit.commands[i].image_id == im->id) producer = 1;
         if (!producer) return MB_PROTOCOL_ERROR;
+        struct dd_ft_id trace = {0}; trace.scope = d->normal.trace_scope; trace.key = a->normal_key; trace.frame = mb_get_u32(w + 12); trace.sync = sync->id; trace.fence = sync->fence;
+        dd_ft_event(DD_FT_WAIT_BEGIN, trace, sync->id, 5000, 0, 1);
         *result = interop_wait_sync(d, sync, 5000);
+        dd_ft_event(DD_FT_WAIT_END, trace, sync->id, 5000, *result, 1);
         if (*result != VK_SUCCESS) return *result < 0 ? MB_VULKAN_ERROR : MB_OK;
         if (!im->foreign || im->layout != VK_IMAGE_LAYOUT_GENERAL || !mb_normal_publish(a->normal_key, mb_get_u32(w + 12), sync->id, sync->fence)) return MB_PROTOCOL_ERROR;
     } else if (op == MB_NORMAL_END) {

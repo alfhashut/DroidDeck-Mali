@@ -5,7 +5,8 @@
 # (add_subdirectory from ../CMakeLists.txt) and on its own by standalone/ for
 # build-waylandcomp.yml.
 if (NOT TARGET maliahb)
-    add_library(maliahb SHARED ../malivulkan/normal_ownership.c)
+    add_library(maliahb SHARED ../malivulkan/normal_ownership.c
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/mali-vulkan/frame_trace.c")
     target_link_libraries(maliahb android)
 endif()
 add_library(droiddeckwayland SHARED

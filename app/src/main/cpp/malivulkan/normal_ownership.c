@@ -20,6 +20,31 @@ static struct record *find(uint32_t key) {
     for (unsigned i = 0; i < NORMAL_MAX_BUFFERS; ++i) if (records[i].state.key == key) return &records[i];
     return NULL;
 }
+static struct dd_ft_id trace_identity(const struct record *r) {
+    struct dd_ft_id id = {0};
+    if (r) { id.frame = r->state.frame; id.key = r->state.key; id.sync = r->state.sync; id.fence = r->state.fence; }
+    return id;
+}
+/* Caller holds normal_lock. Only diagnostic state is examined/recorded. */
+static void trace_ownership(struct record *r, enum dd_ft_stage event, int status) {
+    if (!dd_ft_active()) return;
+    unsigned owned = 0, submitted = 0;
+    for (unsigned i = 0; i < NORMAL_MAX_BUFFERS; ++i) {
+        owned += !!records[i].state.owned; submitted += !!records[i].state.submitted;
+    }
+    dd_ft_event(event, trace_identity(r), owned, submitted, status, 0);
+}
+struct dd_ft_id mb_normal_trace_identity(uint32_t key) {
+    struct dd_ft_id id = {0};
+    if (!dd_ft_active() || !key) return id;
+    pthread_mutex_lock(&normal_lock); id = trace_identity(find(key)); pthread_mutex_unlock(&normal_lock);
+    return id;
+}
+void mb_normal_trace(uint32_t key, enum dd_ft_stage event, uint64_t object, uint64_t value, int status) {
+    if (!dd_ft_active() || !key) return;
+    struct dd_ft_id id = mb_normal_trace_identity(key);
+    if (id.key) dd_ft_event(event, id, object, value, status, 1);
+}
 static void collect(struct record *r) {
     if (r && r->state.retired == 2 && !r->state.owned && !r->state.consumers) {
         AHardwareBuffer_release(r->buffer); memset(r, 0, sizeof(*r));
@@ -49,7 +74,7 @@ AHardwareBuffer *mb_normal_import(uint32_t key, uint32_t width, uint32_t height)
 int mb_normal_publish(uint32_t key, uint32_t frame, uint32_t sync, uint32_t fence) {
     pthread_mutex_lock(&normal_lock); struct record *r = find(key);
     int ok = r && !r->state.retired && r->state.consumers && !r->state.owned && frame && sync && fence;
-    if (ok) { r->state.owned = 1; r->state.submitted = 0; r->state.frame = frame; r->state.sync = sync; r->state.fence = fence; r->state.published_ns = normal_now(); }
+    if (ok) { r->state.owned = 1; r->state.submitted = 0; r->state.frame = frame; r->state.sync = sync; r->state.fence = fence; r->state.published_ns = normal_now(); trace_ownership(r, DD_FT_PUBLISH, 0); }
     pthread_mutex_unlock(&normal_lock); return ok;
 }
 int mb_normal_submit(uint32_t key) {
@@ -58,10 +83,12 @@ int mb_normal_submit(uint32_t key) {
     /* Retirement stops the producer. Already queued commits may still reach Android
      * while the broker waits for their real release. */
     int ok = r && r->state.retired < 2 && r->state.owned && r->state.consumers;
+    int repeated = ok && r->state.submitted;
     if (ok && !r->state.submitted) {
         r->state.submitted = 1; ++r->state.presented; r->state.submitted_ns = normal_now();
         r->state.timing.queue_ns += r->state.submitted_ns - r->state.published_ns;
     }
+    if (ok) trace_ownership(r, DD_FT_ANDROID_SUBMIT, repeated);
     pthread_mutex_unlock(&normal_lock); return ok;
 }
 void mb_normal_present_timing(uint32_t key, uint64_t ns) {
@@ -73,13 +100,13 @@ void mb_normal_release(uint32_t key) {
     pthread_mutex_lock(&normal_lock); struct record *r = find(key);
     if (r && r->state.owned && r->state.submitted) {
         r->state.timing.held_ns += normal_now() - r->state.submitted_ns;
-        r->state.owned = 0; r->state.submitted = 0; ++r->state.released; collect(r); pthread_cond_broadcast(&normal_changed);
+        r->state.owned = 0; r->state.submitted = 0; ++r->state.released; trace_ownership(r, DD_FT_POOL_RETURN, 0); collect(r); pthread_cond_broadcast(&normal_changed);
     }
     pthread_mutex_unlock(&normal_lock);
 }
 void mb_normal_not_submitted(uint32_t key) {
     pthread_mutex_lock(&normal_lock); struct record *r = find(key);
-    if (r && !r->state.submitted) { r->state.owned = 0; collect(r); pthread_cond_broadcast(&normal_changed); }
+    if (r && !r->state.submitted) { r->state.owned = 0; trace_ownership(r, DD_FT_CANCEL, 0); collect(r); pthread_cond_broadcast(&normal_changed); }
     pthread_mutex_unlock(&normal_lock);
 }
 void mb_normal_detach(uint32_t key) {

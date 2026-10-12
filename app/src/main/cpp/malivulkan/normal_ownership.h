@@ -4,6 +4,7 @@
 #define DROIDDECK_NORMAL_OWNERSHIP_H
 #include <android/hardware_buffer.h>
 #include <stdint.h>
+#include "../../../../../tools/mali-vulkan/frame_trace.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -13,6 +14,8 @@ struct mb_normal_state {
     uint64_t published_ns, submitted_ns;
     struct mb_normal_timing timing;
 };
+struct dd_ft_id mb_normal_trace_identity(uint32_t key);
+void mb_normal_trace(uint32_t key, enum dd_ft_stage stage, uint64_t object, uint64_t value, int status);
 uint32_t mb_normal_register(AHardwareBuffer *buffer);
 AHardwareBuffer *mb_normal_import(uint32_t key, uint32_t width, uint32_t height);
 int mb_normal_publish(uint32_t key, uint32_t frame, uint32_t sync, uint32_t fence);
