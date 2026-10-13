@@ -125,6 +125,13 @@ class UploadQueueTests(unittest.TestCase):
         self.assertIn('android/broker_reply',out['stage_spans'])
         self.assertEqual(d['broker_complete_samples'],1)
 
+    def test_per_selected_queue_reports_actual_memory_write_RPC_and_copy_counts(self):
+        self.transport_fixture()
+        row=self.analyze()['upload_queue_decomposition']['per_queue'][0]
+        self.assertEqual(row['client_stage_span_counts']['proxy_bulk_rpc'],1)
+        self.assertEqual(row['broker_stage_span_counts']['broker_mapped_copy'],1)
+        self.assertEqual(row['client_stage_span_counts']['proxy_submit_rpc'],1)
+
     def test_different_native_namespace_not_joined(self):
         self.transport_fixture()
         for row in self.native:

@@ -1,9 +1,17 @@
 /* v7: isolated real Gamescope BLIT renderer subset. LE scalars; no native handles. */
 #ifndef DD_RENDERER_PROTOCOL_H
 #define DD_RENDERER_PROTOCOL_H
+#include "interop_protocol.h"
 #define MB_RENDERER_VERSION 7u
 #define MB_RENDERER_MAX_SHADER (512u * 1024u)
 #define MB_RENDERER_MAX_REQUEST (MB_RENDERER_MAX_SHADER + 256u)
+/* Transport storage, independent of shader/other opcode limits. Only normal
+ * memory writes can use the extra space; the decoded handler checks mode. */
+#define MB_BROKER_MAX_REQUEST (MB_MEMORY_WRITE_HEADER + MB_INTEROP_STAGING_WRITE_MAX)
+static inline uint32_t mb_broker_request_limit(uint32_t version, uint32_t op) {
+    return version == MB_RENDERER_VERSION && op == MB_MEMORY_WRITE ?
+        MB_BROKER_MAX_REQUEST : MB_RENDERER_MAX_REQUEST;
+}
 #define MB_RENDERER_MAX_OBJECTS 128u
 #define MB_RENDERER_MAX_DESCRIPTORS 64u
 #define MB_RENDERER_SEMAPHORE_CREATE 60u /* device,u64 initial -> ID */

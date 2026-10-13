@@ -38,7 +38,7 @@ class BulkMemoryTests(unittest.TestCase):
         names.update(re.findall(r'DEVICE_ENTRY\((\w+)\)', dispatch))
         for table in ('submit_entries.def', 'interop_entries.def', 'renderer_entries.def'):
             names.update(re.findall(r'ENTRY\((\w+)\)', (ROOT / table).read_text()))
-        real = {'n', 'GetDeviceProcAddr', 'logical', 'MapMemory', 'UnmapMemory', 'DroidDeckStagingMALI', 'DroidDeckMapStagingMALI', 'DroidDeckUploadRingMALI'}
+        real = {'n', 'GetDeviceProcAddr', 'logical', 'MapMemory', 'UnmapMemory', 'DroidDeckStagingMALI', 'DroidDeckMapStagingMALI', 'DroidDeckUploadRingMALI', 'DroidDeckFrameTraceMALI'}
         stubs = ''.join('static void proxy_' + name + '(void) {}\n' for name in sorted(names - real))
         version = next(line for line in (ROOT / 'submit_protocol.h').read_text().splitlines() if line.startswith('#define MB_SUBMIT_VERSION '))
         (build / 'device_dispatch.inc').write_text(version + '\n' + stubs + dispatch)
@@ -70,6 +70,36 @@ class BulkMemoryTests(unittest.TestCase):
 
     def test_bulk_counts_bytes_large_ranges_and_request_reuse(self):
         self.run_case('bulk')
+
+    def test_staging_four_MiB_uses_two_writes_not_eight_exact_bytes_offsets_reuse(self):
+        self.run_case('staging_bulk')
+
+    def test_staging_large_allocation_ACK_and_partial_chunk_failure_prevent_submit(self):
+        self.run_case('staging_bulk_errors')
+
+    def test_staging_large_payload_bounds_modes_versions_and_unchanged_shader_cap(self):
+        self.run_case('staging_bulk_bounds')
+
+    def test_staging_two_large_writes_over_small_stream_socket_and_fragmented_ACK(self):
+        self.run_case('staging_bulk_socket')
+
+    def test_protocol_patch_applies_zero_fuzz_and_matches_canonical_headers(self):
+        patches = ROOT.parent / 'gamescope/patches'
+        original = (patches / '0121-mali-normal-wayland-session.patch').read_text()
+        with tempfile.TemporaryDirectory(prefix='mali-bulk-patch-') as directory:
+            root = Path(directory); (root / 'src').mkdir()
+            for name in ('interop_protocol.h', 'renderer_protocol.h'):
+                section = original.split('+++ b/src/' + name + '\n', 1)[1].splitlines()
+                count = int(re.fullmatch(r'@@ -0,0 \+1,(\d+) @@', section[0])[1])
+                self.assertTrue(all(line.startswith('+') for line in section[1:count+1]))
+                (root / 'src' / name).write_text(''.join(line[1:]+'\n' for line in section[1:count+1]))
+            result = subprocess.run(['patch', '-p1', '--batch', '--fuzz=0', '-i',
+                str(patches / '0127-mali-staging-bulk-writes.patch')], cwd=root,
+                capture_output=True, text=True, check=True)
+            self.assertNotIn('fuzz', result.stdout.lower())
+            self.assertNotIn('offset', result.stdout.lower())
+            for name in ('interop_protocol.h', 'renderer_protocol.h'):
+                self.assertEqual((root / 'src' / name).read_bytes(), (ROOT / name).read_bytes())
 
     def test_all_coherent_uploads_acknowledged_before_each_submit(self):
         self.run_case('ordering')

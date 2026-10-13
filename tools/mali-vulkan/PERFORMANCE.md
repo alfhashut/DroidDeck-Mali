@@ -79,7 +79,7 @@ no open sync FDs after each frame. Those observations do not identify GPU/RPC
 time or rule out short pool stalls: the old build samples after its waits.
 No APK was installed and no phone configuration/session was changed.
 
-## Bulk mapped-memory writes
+## Bulk mapped-memory writes (original 512-KiB implementation)
 
 Old path: `renderer_QueueSubmit()` walks coherent mappings, calls
 `interop_copy_mapping()`, then `interop_rpc()` for each 4 KiB chunk. Opcode
@@ -453,3 +453,16 @@ safe unmapping/resize, map errors, the private staging contract and map counters
 `test_bulk` additionally checks actual proxy map/unmap helpers over 40 U/R pairs:
 only initial reads, exact coherent uploads before U, no staging re-upload during
 pending U, ordinary coherent upload semantics, and error/ACK propagation.
+
+## Persistent SHM staging: 2-MiB write granularity
+
+The first post-journal performance patch restricts larger writes to registered
+persistent staging mirrors in the experimental normal Gamescope path. Ordinary
+maps/ring dirty ranges retain the original 512-KiB policy above; reads, shader
+limits and all submission/reuse synchronization remain unchanged. Android's
+fixed request storage is now 2 MiB +20 bytes; only normal-session v7 memory-write
+handlers accept the larger bound. One contiguous >3.5-MiB through 4-MiB staging
+range changes from eight synchronous writes/ACKs to two, followed by the same
+submit RPC. Bytes, allocation padding, offsets and dirty semantics are unchanged.
+See `STEAM_FRAME_TRACE.md` for the audit, bounds, matched CI build and exact fish
+A/B commands. Performance improvement remains pending phone evidence.

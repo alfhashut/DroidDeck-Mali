@@ -15,6 +15,9 @@ typedef struct {
 #include "interop_protocol.h"
 #include "renderer_protocol.h"
 #include "normal_memory_perf.h"
+#include "frame_trace_proxy.h"
+/* Registry tests leave the real diagnostic guards disabled. */
+static uint64_t proxy_trace_upload_completed(void *device) { (void)device; return 0; }
 typedef int VkResult;
 typedef uintptr_t VK_LOADER_DATA;
 typedef void *VkDevice, *VkCommandPool, *VkCommandBuffer, *VkEvent, *VkFence;
@@ -70,6 +73,7 @@ static int test_shutdown(int fd, int how) { (void)fd; (void)how; ++disconnected;
 #include "lifecycle.inc"
 
 static void setup(void) {
+    (void)proxy_trace_read; (void)proxy_trace_write; (void)proxy_DroidDeckFrameTraceMALI;
     assert(!pthread_mutex_init(&connection.lock, NULL));
     connection.perf_enabled=1; device.owner=&connection;
 }

@@ -104,7 +104,7 @@ static VkResult interop_upload_mapping_locked(struct proxy_resource *m, uint64_t
     if (!d || d->owner->wire_version < MB_INTEROP_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     struct proxy_instance *s = d->owner;
     PROXY_TRACE_SCOPE(trace_setup, PROXY_BULK_SETUP, m->id, offset);
-    uint32_t limit = mb_interop_write_limit(s->wire_version);
+    uint32_t limit = mb_interop_upload_limit(s->wire_version, m->staging_managed);
     uint32_t capacity = MB_MEMORY_WRITE_HEADER + (size > limit ? limit : (uint32_t)size);
     VkResult r = VK_SUCCESS;
     if (d->write_capacity < capacity) {

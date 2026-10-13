@@ -373,6 +373,7 @@ def upload_queue_decomposition(frames, issues, clean, all_spans):
                              sampling_state=state,
                              detail_policy=policies[0] if len(policies)==1 else None,
                              start_ns=parent['start_ns'],end_ns=parent['end_ns'],total_ns=parent['wall_ns'],
+                             client_stage_span_counts=dict(Counter(s['stage'] for s in children)),
                              stage_inclusive_ns={name:interval_union_ns([s for s in children if s['stage']==name]) for name in UPLOAD_QUEUE_CHILD_STAGES},
                              covered_ns=covered,unattributed_ns=parent['wall_ns']-covered if covered is not None else None,
                              before_submit_rpc_ns=first_submit-parent['start_ns'] if first_submit is not None else None,

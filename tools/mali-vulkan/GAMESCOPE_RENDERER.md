@@ -274,8 +274,9 @@ pipelines, query pools, pipeline-cache objects or unrelated API forwarding.
 Unknown pNext is rejected. SPIR-V is word-aligned, size-bounded to **512 KiB**,
 validated for header/version and copied as exact bytes, not text. Existing BLIT
 compiled here is **62,940 bytes**, default Vulkan1.0/SPIR-V1.0. Total request limit
-is 512 KiB +256 bytes; 128 typed renderer objects per device. Session/large request
-storage is on the heap: Android NDK worker stack frame is **198,048 bytes**.
+is 512 KiB +256 bytes for shader/other renderer requests; normal persistent
+staging memory writes have a separate 2 MiB +20-byte transport bound. There are
+128 typed renderer objects per device. Session/large request storage is on the heap: Android NDK worker stack frame is **198,048 bytes**.
 
 Void-operation transport errors retain the first exact VkResult and fail command
 completion or teardown. Native errors, timeouts and device loss are logged;

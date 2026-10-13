@@ -7,13 +7,18 @@ phone capture. The reported 129 joined frames identify SHM import as the largest
 measured downstream scope in that capture; its internal costs remain unresolved.
 The subsequent SHM decomposition capture reports ~35.8 ms import, ~21.2 ms
 upload_submit, ~20.3 ms upload_queue and ~11.0 ms copy, with no upload wait.
-Those are user-provided same-capture results, not a local reanalysis. The new
-upload-queue subscopes below await a matched CI build and phone evidence.
+Those are user-provided same-capture results, not a local reanalysis. Two later
+clean, lossless upload-queue captures have now isolated the pre-submit coherent
+mirror transfer: selected queue means 16.05/20.60 ms, bulk RPC 11.82/17.72 ms,
+native vkQueueSubmit only 0.195/0.336 ms. Each selected queue had eight mapped
+copies and one native submit. The first performance patch below increases only
+persistent staging write granularity; its performance benefit awaits phone A/B.
 Missing stages are emitted as unavailable, not inferred timings.
 
 The original external-only diagnostic requires no build. The new internal
-journal requires a matched CI Gamescope/APK build, with no renderer, capability,
-Steam-owned file, PanVK, or permanent scheduling changes.
+journal requires a matched CI Gamescope/APK build. The current performance patch
+preserves renderer behavior, capabilities, Steam-owned files, PanVK and the
+existing temporary-affinity experiment.
 
 ## No-rebuild phone command
 
@@ -421,7 +426,8 @@ CVulkanDevice::submit / upload_queue
       [upload ring: fallback/dirty ranges, when present]
       interop_copy_upload_locked -> interop_upload_mapping_locked
         acquire/reuse bounded request storage
-        for each <=512-KiB chunk: serialize + memcpy mirror into request
+        for each bounded chunk: serialize + memcpy mirror into request
+          [persistent SHM staging: <=2 MiB; ordinary/ring writes: <=512 KiB]
           rpc -> rpc_exchange -> header/write header/write payload
                               -> read reply header/read ACK/decode
         check ACK/accounting
@@ -565,8 +571,9 @@ when the connection has one normal device; otherwise it stays unassigned.
 No broker timestamps are backdated or guessed. Driver-internal locks, kernel
 socket-ready-to-running delay, and GPU execution remain unobservable. The
 journal cannot assign unsampled/partial native requests by timing proximity.
-No optimization recommendation follows until the next capture has complete
-sampled decomposition and sufficient exact native attribution.
+The two lossless captures now support reducing memory-write round trips.
+Native vkQueueSubmit is unchanged. The first bounded staging performance patch
+must be evaluated with the same journal and workload.
 
 ### Exact CI build and phone procedure
 
@@ -587,7 +594,7 @@ gh workflow run build.yml --ref mali-gpu-experiment
 ```
 
 Its `gamescope` job (**Build experimental Gamescope**, ARM runner) applies patch
-0126 and produces `gamescope-patched`; its dependent `build` job (**Build APK**)
+0126/0127 and produces `gamescope-patched`; its dependent `build` job (**Build APK**)
 embeds that same binary, compiles the Android hooks and glibc proxy ICD, checks the diagnostic
 marker in the embedded Gamescope and produces `droiddeck-apk`. Use both jobs from
 the same SHA/run. The standalone `build-gamescope.yml` artifact alone lacks the
@@ -755,3 +762,128 @@ join/decomposition/control tests and zero-fuzz patch application only. Native
 harness execution/compilation and the matched Gamescope/proxy/APK build remain
 in GitHub Actions. Journal locking and rendering/RPC/synchronization remain
 unchanged. Phone zero-loss acceptance is pending.
+
+## First performance patch: bounded 2-MiB persistent staging writes
+
+Audit: `wlr_surface_get_texture` -> `vulkan_create_texture_from_wlr_buffer`
+acquires a persistent coherent staging slot, copies the SHM bytes, and arms its
+command. The allocation is mapped as a whole (including any existing allocation
+padding). `renderer_QueueSubmit` walks coherent mirrors under the connection
+mutex; only staging maps armed for this command are uploaded. The separate
+scratch/uniform ring merges overlapping/adjacent dirty ranges, uploads each
+selected range, and conservatively falls back to its full mapping on uncertainty.
+There was no multi-write transaction or batch ACK. `interop_upload_mapping_locked`
+split each contiguous selected range at 524,288 bytes, serialized opcode 41,
+and waited for its 12-byte ACK before moving to the next offset. All uploads
+finish before the unchanged opcode-76 submit. The previous cap followed the
+524,544-byte shader-sized broker buffer, not a stream-socket or wire-field limit.
+
+Eight writes from ONE contiguous range imply 3.5 MiB < length <= 4 MiB;
+3,686,400-byte 1280x720 RGBA data, for example, takes eight. The provided aggregate
+counts do not establish the actual image dimensions or prove every write used
+one resource. If the eight include separate dirty/uniform ranges, count those
+separately; this patch does not merge resources or fill dirty-range gaps.
+
+Chosen change: preserve opcode 41 and wire v7 schema
+`device:u32, memory:u32, offset:u64, length:u32, exact bytes`, but send up to
+2,097,152 data bytes for `staging_managed` mappings. The decoded Android handler
+allows this larger bound only on v7 in an enabled normal session. The native
+protocol has no staging flag; normal-session mode gates acceptance, while the
+proxy restricts generation to registered staging resources. Ordinary/ring writes
+retain 512 KiB, v6 writes retain 4 KiB, reads retain 131,060 bytes, shaders retain
+512 KiB and other request caps remain 524,544 bytes. There is no new opcode,
+batching, async send, extra wait or capability. The existing stream send/recv
+loops handle partial I/O and EINTR with unchanged order and ACK checks.
+
+A single contiguous range that previously needed eight writes now needs two:
+`ceil(length / 2097152)`, plus the same final submit RPC. Expected selected-sample
+counts for that case are two `proxy_bulk_rpc`, two `broker_mapped_copy`, three
+`broker_receive`/`broker_dispatch`, and one native `vk_submit`. Separately selected
+mappings/ranges can add requests. These are expectations, not phone results.
+The reusable proxy request buffer grows to at most 2,097,172 bytes per device.
+The broker allocates a fixed 2,097,172-byte request buffer per connection,
+independent of guest lengths; 16 connection slots bound these buffers to
+33,554,752 bytes total. The 128-KiB reply buffer remains unchanged. Before body
+read, only v7 opcode 41 gets the larger request cap; after decoding, non-normal
+sessions still reject >512-KiB writes. Existing pending-memory, host-visible,
+AHB exclusion, exact payload length and subtraction-based allocation/mapped-range
+checks remain. Each completed memcpy is ACKed before the next write or submit;
+any allocation/native/socket/ACK error stops submission. Dirty-range clearing,
+staging reuse and all synchronization retain the existing success conditions.
+
+Use matched proxy/broker assets. A new proxy with an old broker will fail closed
+on the larger request, never submit partially mirrored data. No negotiation or
+silent fallback is introduced. Patch 0127 keeps Gamescope's vendored protocol
+headers equal to the canonical headers; Gamescope render code is unchanged.
+The existing every-16-upload journal selector is unchanged. The analyzer adds
+only `per_queue.client_stage_span_counts`, so write RPC counts can be compared
+with existing broker span counts without another instrumentation layer.
+
+### Fish A/B procedure
+
+Heavy compilation stays in GitHub Actions: commit/push to `mali-gpu-experiment`,
+then `gh workflow run build.yml --ref mali-gpu-experiment`. Use `gamescope-patched`
+and the dependent `droiddeck-apk` from that same SHA/run (jobs `gamescope` and
+`build`). The proxy and Android broker must both be rebuilt; the APK packages
+the matched Gamescope headers/binary. No PanVK build/artifact change is needed.
+
+First collect A on the existing clean 512-KiB build BEFORE installing B. Keep the
+same Steam page/window size and scrolling workload for both; leave the proven
+client PanVK option and atom stride unchanged. From the repo root in fish:
+
+```fish
+set -l ab_dir (mktemp -d /tmp/steam-staging-bulk-ab-XXXXXX)
+mkdir "$ab_dir/A" "$ab_dir/B"
+python3 -B tools/panvk/frame_journal.py arm --serial E68DS8U4IVYTKJXK
+```
+
+Use normal **Stop before arm**, then **Mali Steam Launch** after arm. Once open:
+
+```fish
+python3 -B tools/panvk/frame_journal.py status --serial E68DS8U4IVYTKJXK
+```
+
+Require exactly one fresh worker for each role. Keep Steam moving through the
+10-second capture, then disarm even if collection fails:
+
+```fish
+python3 -B tools/panvk/stage_phone_test.py --serial E68DS8U4IVYTKJXK \
+  --frame-diagnostics --perf-seconds 10 --perf-output "$ab_dir/A" --run
+python3 -B tools/panvk/frame_journal.py disarm --serial E68DS8U4IVYTKJXK
+```
+
+Normal **Stop**. Download the matched B APK artifact to the path below and
+install without erasing Steam/runtime data, then arm BEFORE Launch:
+
+```fish
+adb -s E68DS8U4IVYTKJXK install -r /tmp/droiddeck-frame-apk/app-release-unsigned.apk
+python3 -B tools/panvk/frame_journal.py arm --serial E68DS8U4IVYTKJXK
+```
+
+Use **Mali Steam Launch**, confirm exactly one fresh worker per role, and repeat
+while moving the same Steam UI:
+
+```fish
+python3 -B tools/panvk/frame_journal.py status --serial E68DS8U4IVYTKJXK
+python3 -B tools/panvk/stage_phone_test.py --serial E68DS8U4IVYTKJXK \
+  --frame-diagnostics --perf-seconds 10 --perf-output "$ab_dir/B" --run
+python3 -B tools/panvk/frame_journal.py disarm --serial E68DS8U4IVYTKJXK
+
+for arm in A B
+  python3 -B tools/panvk/analyze_frame_journal.py "$ab_dir/$arm/frame-journal" > "$ab_dir/$arm/upload-summary.json"
+  python3 -B tools/panvk/analyze_steam_frames.py "$ab_dir/$arm" \
+    --trace-processor /tmp/droiddeck-trace-processor > "$ab_dir/$arm/external-summary.json"
+  python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); d=s["upload_queue_decomposition"]; print(sys.argv[1],s["capture_quality"]); assert s["lossless_complete_window"] and s["joined_frames"]>0 and not s["unmatched_publish_ids"]; assert d["complete_selected_samples"]>0 and d["broker_complete_samples"]>0; print(d["complete_selected_samples"],d["paired_total_queue_mean_ms"]); print([{"attempt":r["attempt"],"writes":r["client_stage_span_counts"].get("proxy_bulk_rpc",0),"copies":r["broker_stage_span_counts"].get("broker_mapped_copy",0),"submits":r["broker_stage_span_counts"].get("vk_submit",0)} for r in d["per_queue"] if r["unattributed_ns"] is not None and r["broker_attribution_complete"]])' "$ab_dir/$arm/upload-summary.json"
+end
+```
+
+Both exact trace footers must show `"dropped":0,"complete":true`, ready before
+start, joined frames and positive complete selected/broker sample counts. The
+external analyzer continues to require live ANGLE_VULKAN/PanVK/Mali-G52 proof,
+no active llvmpipe, temporary 0xff and successful exact mixed-affinity restoration.
+Record selected per-queue write/copy/submit counts; compare `proxy_bulk_rpc`,
+`proxy_mirror`, exchange/send/receive, broker receive/mapped-copy, queue, SHM
+import, and CEF/X11/Android rates. Do not add overlapping scopes or infer GPU
+execution time. Repeat B in a fresh directory, then normal Stop/Launch to verify
+restart. The patch's benefit is not established until these new phone results
+show fewer transfers and improved latency/output at the same correctness.

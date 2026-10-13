@@ -29,7 +29,10 @@
 #include "normal_ownership.h"
 #include "normal_perf.h"
 _Static_assert(MB_MEMORY_WRITE_HEADER + MB_INTEROP_WRITE_MAX <= MB_RENDERER_MAX_REQUEST,
-               "bulk mapped writes must fit the bounded broker request buffer");
+               "ordinary bulk mapped writes retain their existing request bound");
+_Static_assert(MB_MEMORY_WRITE_HEADER + MB_INTEROP_STAGING_WRITE_MAX <= MB_BROKER_MAX_REQUEST &&
+               MB_RENDERER_MAX_REQUEST <= MB_BROKER_MAX_REQUEST,
+               "all requests must fit the fixed bounded broker buffer");
 _Static_assert(MB_PREFIX_BYTES + MB_INTEROP_READ_MAX <= MB_CAP_MAX_PAYLOAD,
                "bulk mapped reads must fit the existing broker reply buffer");
 
@@ -284,7 +287,7 @@ static struct dd_ft_id broker_trace_request(struct vk_session *s, uint32_t op,
 }
 static void serve(int fd) {
     struct vk_session *s = calloc(1, sizeof(*s));
-    uint8_t *request = malloc(MB_RENDERER_MAX_REQUEST);
+    uint8_t *request = malloc(MB_BROKER_MAX_REQUEST);
     if (!s || !request) { free(s); free(request); ERROR("client allocation failed"); return; }
     for (;;) {
         broker_trace_detailed = 0;
@@ -302,7 +305,7 @@ static void serve(int fd) {
         /* Excludes idle waiting for a header. Includes payload read, validation
          * and native execution; excludes reply write and log formatting. */
         uint64_t service_start = measured ? dd_perf_now() : 0;
-        if (mb_get_u32(header) != MB_MAGIC || request_bytes > MB_RENDERER_MAX_REQUEST) {
+        if (mb_get_u32(header) != MB_MAGIC || request_bytes > mb_broker_request_limit(version, op)) {
             finish = 1;
         } else if (version == MB_VERSION && op == MB_ENUMERATE && !request_bytes && !s->library) {
             bytes = query_devices(payload);

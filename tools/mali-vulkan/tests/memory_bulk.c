@@ -6,9 +6,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "protocol.h"
 #include "interop_protocol.h"
 #include "renderer_protocol.h"
+#include "normal_protocol.h"
 #include "normal_perf.h"
 #include "normal_memory_perf.h"
 typedef int VkResult;
@@ -41,11 +43,20 @@ typedef void (*PFN_vkVoidFunction)(void);
 typedef struct { int sType; const void *pNext; unsigned waitSemaphoreValueCount, signalSemaphoreValueCount; const uint64_t *pSignalSemaphoreValues; } VkTimelineSemaphoreSubmitInfoKHR;
 typedef struct { int sType; const void *pNext; unsigned waitSemaphoreCount, commandBufferCount, signalSemaphoreCount; void **pCommandBuffers, **pSignalSemaphores; } VkSubmitInfo;
 typedef struct { int sType; void *memory; uint64_t offset, size; } VkMappedMemoryRange;
-struct proxy_instance { pthread_mutex_t lock; uint32_t wire_version; int fd, perf_enabled; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; } connection;
+struct proxy_instance { pthread_mutex_t lock; uint32_t wire_version; int fd, perf_enabled; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; uint64_t trace_upload_completed; } connection;
 typedef uintptr_t VK_LOADER_DATA;
 #include "resource_registry.h"
 struct proxy_logical { struct proxy_instance *owner; uint32_t id; struct proxy_registry registry; uint8_t *write_request, *read_reply; uint32_t write_capacity, read_capacity; uint64_t map_alignment; atomic_int submit_failed; } device;
 struct proxy_queue { uint32_t id; struct proxy_logical *owner; } queue;
+#include "frame_trace_proxy.h"
+static uint64_t proxy_trace_upload_completed(void *d) {
+    return ((struct proxy_logical *)d)->owner->trace_upload_completed;
+}
+void dd_ft_event(enum dd_ft_stage stage, struct dd_ft_id id, uint64_t object,
+        uint64_t value, int32_t status, int cpu) {
+    (void)stage; (void)id; (void)object; (void)value; (void)status; (void)cpu;
+}
+static int broker_trace_detailed;
 struct native_memory { uint32_t id, ahb, type; uint64_t size, map_offset, map_size; void *map, *handle; } memories[3];
 struct native_interop {
     struct { struct { uint32_t propertyFlags; } memoryTypes[1]; } properties;
@@ -55,10 +66,14 @@ struct native_interop {
     VkResult (*FlushMappedMemoryRanges)(void *, unsigned, const VkMappedMemoryRange *);
     VkResult (*InvalidateMappedMemoryRanges)(void *, unsigned, const VkMappedMemoryRange *);
 };
-struct native_device { void *handle; struct native_interop interop; } native;
+struct native_device { void *handle; struct native_interop interop;
+    struct { int enabled; uint64_t trace_scope; } normal; } native;
 static int pending, fail_submit, fail_write, fail_read, bad_ack, bad_read, fail_alloc, disconnects;
 static uint32_t pending_memory;
 static unsigned writes, reads, submits, allocations, memory_maps, memory_unmaps;
+static uint64_t write_offsets[64];
+static uint32_t write_lengths[64];
+static int socket_transport;
 static struct proxy_resource *command_ptr, *semaphore_ptr;
 static struct native_memory *interop_find_memory(struct native_device *d, uint32_t id) {
     (void)d; for (unsigned i = 0; i < 3; ++i) if (memories[i].id == id && id) return &memories[i]; return NULL;
@@ -96,7 +111,19 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
     assert(op == MB_MEMORY_WRITE || op == MB_MEMORY_READ || op == MB_MEMORY_MAP || op == MB_MEMORY_UNMAP);
     if (op == MB_MEMORY_MAP) ++memory_maps;
     if (op == MB_MEMORY_UNMAP) ++memory_unmaps;
-    if (op == MB_MEMORY_WRITE && ++writes == (unsigned)fail_write) return VK_ERROR_DEVICE_LOST;
+    if (op == MB_MEMORY_WRITE) {
+        ++writes;
+        if (writes <= 64) { write_offsets[writes-1] = mb_get_u64(request+8); write_lengths[writes-1] = mb_get_u32(request+16); }
+        assert(bytes <= mb_broker_request_limit(s->wire_version, op));
+        if (writes == (unsigned)fail_write) return VK_ERROR_DEVICE_LOST;
+        if (socket_transport) {
+            uint8_t header[MB_HEADER_BYTES]; mb_session_header(header, op, bytes); mb_put_u32(header+4, s->wire_version);
+            assert(!mb_write(s->fd, header, sizeof(header)) && !mb_write(s->fd, request, bytes));
+            assert(!mb_read(s->fd, header, sizeof(header)) && mb_get_u32(header+12) == MB_PREFIX_BYTES);
+            assert(!mb_read(s->fd, reply, MB_PREFIX_BYTES)); *reply_bytes = MB_PREFIX_BYTES;
+            assert(mb_get_u32(reply) == MB_OK); return (VkResult)mb_get_u32(reply+4);
+        }
+    }
     if (op == MB_MEMORY_READ) {
         assert(bytes == 20 && capacity == MB_PREFIX_BYTES + mb_get_u32(request + 16));
         assert(capacity <= MB_CAP_MAX_PAYLOAD);
@@ -191,6 +218,113 @@ static void bulk(void) {
     assert(!memcmp(m->mirror + 7, (uint8_t *)memories[0].map + 7, 511u * 1024u));
     assert(((uint8_t *)memories[0].map)[6] == 0 && ((uint8_t *)memories[0].map)[7 + 511u * 1024u] == 0);
     finish();
+}
+static struct proxy_resource *large_staging(uint64_t size) {
+    setup(7); native.normal.enabled = 1;
+    struct proxy_resource *m = mapping(0, size, 0);
+    m->allocation = m->map_size; memories[0].size = m->allocation;
+    assert(proxy_DroidDeckStagingMALI(&device, m, NULL) == VK_SUCCESS);
+    return m;
+}
+static void staging_bulk(void) {
+    struct proxy_resource *m = large_staging(4u * 1024u * 1024u);
+    // Same bytes, old ordinary limit then persistent staging limit.
+    m->staging_managed = 0;
+    assert(interop_copy_mapping(m, 0, m->map_size, 1) == VK_SUCCESS && writes == 8);
+    m->staging_managed = 1; writes = 0; memset(memories[0].map, 0, (size_t)m->map_size);
+    assert(proxy_DroidDeckStagingMALI(&device, m, command_ptr) == VK_SUCCESS);
+    assert(submit() == VK_SUCCESS && writes == 2 && submits == 1 && !m->staging_command);
+    assert(write_offsets[0] == 0 && write_offsets[1] == 2u*1024u*1024u);
+    assert(write_lengths[0] == 2u*1024u*1024u && write_lengths[1] == write_lengths[0]);
+    assert(device.write_capacity == MB_MEMORY_WRITE_HEADER + MB_INTEROP_STAGING_WRITE_MAX);
+    assert(!memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
+    uint8_t *request = device.write_request; unsigned reused = allocations;
+    // Existing R path skips the unarmed staging slot even while GPU-pending.
+    pending_memory = m->id; assert(submit() == VK_SUCCESS && writes == 2 && submits == 2);
+    pending_memory = 0;
+    // Nonzero range, exact final short chunk, no bytes outside range touched.
+    memset(memories[0].map, 0xa7, (size_t)m->map_size);
+    assert(interop_copy_mapping(m, 7, MB_INTEROP_STAGING_WRITE_MAX+19u, 1) == VK_SUCCESS);
+    assert(writes == 4 && write_offsets[2] == 7 && write_offsets[3] == 7u+MB_INTEROP_STAGING_WRITE_MAX);
+    assert(write_lengths[2] == MB_INTEROP_STAGING_WRITE_MAX && write_lengths[3] == 19);
+    assert(((uint8_t *)memories[0].map)[6] == 0xa7 && ((uint8_t *)memories[0].map)[7u+MB_INTEROP_STAGING_WRITE_MAX+19u] == 0xa7);
+    assert(!memcmp(m->mirror+7, (uint8_t *)memories[0].map+7, MB_INTEROP_STAGING_WRITE_MAX+19u));
+    assert(device.write_request == request && allocations == reused);
+    finish();
+}
+static void staging_bulk_errors(void) {
+    struct proxy_resource *m = large_staging(MB_INTEROP_STAGING_WRITE_MAX+1u);
+    assert(proxy_DroidDeckStagingMALI(&device, m, command_ptr) == VK_SUCCESS);
+    fail_alloc = 1; assert(submit() == VK_ERROR_OUT_OF_HOST_MEMORY && !writes && !submits);
+    fail_alloc = 0; fail_write = 2;
+    assert(submit() == VK_ERROR_DEVICE_LOST && writes == 2 && !submits && m->staging_command);
+    assert(!memcmp(m->mirror, memories[0].map, MB_INTEROP_STAGING_WRITE_MAX));
+    assert(((uint8_t *)memories[0].map)[MB_INTEROP_STAGING_WRITE_MAX] == 0);
+    fail_write = 0;
+    for (bad_ack = 1; bad_ack <= 3; ++bad_ack)
+        assert(submit() == VK_ERROR_INITIALIZATION_FAILED && !submits && m->staging_command);
+    assert(disconnects == 3); bad_ack = 0;
+    pending_memory = m->id; assert(submit() == VK_ERROR_INITIALIZATION_FAILED && !submits);
+    pending_memory = 0; assert(submit() == VK_SUCCESS && submits == 1 && !m->staging_command);
+    finish();
+}
+static void staging_bulk_bounds(void) {
+    struct proxy_resource *m = large_staging(MB_INTEROP_STAGING_WRITE_MAX+1u);
+    uint32_t length = MB_INTEROP_STAGING_WRITE_MAX, bytes = MB_MEMORY_WRITE_HEADER+length;
+    uint8_t *w = calloc(1, bytes+1u), reply[MB_PREFIX_BYTES]; assert(w);
+    mb_put_u32(w, device.id); mb_put_u32(w+4, m->id); mb_put_u32(w+16, length);
+    uint32_t extra = 0, count = 0; VkResult result = VK_SUCCESS;
+    assert(mb_broker_request_limit(7, MB_MEMORY_WRITE) == bytes);
+    assert(mb_broker_request_limit(6, MB_MEMORY_WRITE) == MB_RENDERER_MAX_REQUEST);
+    assert(mb_broker_request_limit(7, MB_RENDERER_SHADER) == MB_RENDERER_MAX_REQUEST);
+    assert(MB_RENDERER_MAX_SHADER == 512u*1024u);
+    native.normal.enabled = 0;
+    assert(native_transfer(7, MB_MEMORY_WRITE, w, bytes, reply, &extra, &count, &result) == MB_PROTOCOL_ERROR);
+    native.normal.enabled = 1;
+    assert(native_transfer(7, MB_MEMORY_WRITE, w, bytes, reply, &extra, &count, &result) == MB_OK);
+    assert(native_transfer(6, MB_MEMORY_WRITE, w, bytes, reply, &extra, &count, &result) == MB_PROTOCOL_ERROR);
+#define REJECT_LARGE(BYTES) assert(native_transfer(7, MB_MEMORY_WRITE, w, BYTES, reply, &extra, &count, &result) == MB_PROTOCOL_ERROR)
+    REJECT_LARGE(bytes-1); REJECT_LARGE(bytes+1);
+    mb_put_u32(w+16, length+1u); REJECT_LARGE(bytes+1);
+    mb_put_u32(w+16, UINT32_MAX); REJECT_LARGE(bytes);
+    mb_put_u32(w+16, 0); REJECT_LARGE(20);
+    mb_put_u32(w+16, length); mb_put_u64(w+8, UINT64_MAX-7); REJECT_LARGE(bytes);
+    mb_put_u64(w+8, 2); REJECT_LARGE(bytes); // exceeds mapped/allocation end
+    mb_put_u64(w+8, 0); memories[0].ahb = 1; REJECT_LARGE(bytes); memories[0].ahb = 0;
+    pending_memory = m->id; REJECT_LARGE(bytes); pending_memory = 0;
+    native.interop.properties.memoryTypes[0].propertyFlags = 0; REJECT_LARGE(bytes);
+    assert(!mb_interop_write_size_for_mode(7, 1, UINT32_MAX, UINT64_MAX));
+    assert(mb_interop_upload_limit(6, 1) == 4096u && mb_interop_upload_limit(7, 0) == 524288u);
+#undef REJECT_LARGE
+    free(w); finish();
+}
+static void *socket_bulk_worker(void *arg) {
+    int fd = *(int *)arg; uint8_t *request = malloc(MB_BROKER_MAX_REQUEST); assert(request);
+    for (unsigned i = 0; i < 2; ++i) {
+        uint8_t header[MB_HEADER_BYTES], reply[MB_PREFIX_BYTES] = {0};
+        assert(!mb_read(fd, header, sizeof(header)));
+        uint32_t bytes = mb_get_u32(header+12), op = mb_get_u32(header+8);
+        assert(mb_get_u32(header+4) == 7 && op == MB_MEMORY_WRITE && bytes <= mb_broker_request_limit(7, op));
+        assert(!mb_read(fd, request, bytes));
+        uint32_t extra = 0, count = 0; VkResult result = VK_SUCCESS;
+        uint32_t status = native_transfer(7, op, request, bytes, reply+MB_PREFIX_BYTES, &extra, &count, &result);
+        assert(status == MB_OK && !extra && !count && result == VK_SUCCESS);
+        mb_put_u32(reply, status); mb_session_header(header, op, sizeof(reply)); mb_put_u32(header+4, 7);
+        // Deliberately fragmented ACK; actual mb_read must reassemble it.
+        for (unsigned j = 0; j < sizeof(header); ++j) assert(!mb_write(fd, header+j, 1));
+        for (unsigned j = 0; j < sizeof(reply); ++j) assert(!mb_write(fd, reply+j, 1));
+    }
+    free(request); return NULL;
+}
+static void staging_bulk_socket(void) {
+    struct proxy_resource *m = large_staging(4u*1024u*1024u);
+    int sockets[2], small = 4096; assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, sockets));
+    assert(!setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)));
+    connection.fd = sockets[0]; socket_transport = 1;
+    pthread_t worker; assert(!pthread_create(&worker, NULL, socket_bulk_worker, &sockets[1]));
+    assert(interop_copy_mapping(m, 0, m->map_size, 1) == VK_SUCCESS);
+    assert(!pthread_join(worker, NULL)); assert(writes == 2 && !memcmp(m->mirror, memories[0].map, (size_t)m->map_size));
+    close(sockets[0]); close(sockets[1]); finish();
 }
 static void ordering(void) {
     setup(7); struct proxy_resource *m = mapping(0, MB_INTEROP_WRITE_MAX, 0);
@@ -690,8 +824,15 @@ static void legacy(void) {
     assert(!mb_interop_write_size(7, UINT32_MAX, UINT32_MAX - 20u)); finish();
 }
 int main(int argc, char **argv) {
+    /* The extracted transfer uses the real trace guards; transport helpers and
+     * local context dispatch are tested separately by test_upload_trace. */
+    (void)proxy_trace_read; (void)proxy_trace_write; (void)proxy_DroidDeckFrameTraceMALI;
     assert(argc == 2);
     if (!strcmp(argv[1], "bulk")) bulk();
+    else if (!strcmp(argv[1], "staging_bulk")) staging_bulk();
+    else if (!strcmp(argv[1], "staging_bulk_errors")) staging_bulk_errors();
+    else if (!strcmp(argv[1], "staging_bulk_bounds")) staging_bulk_bounds();
+    else if (!strcmp(argv[1], "staging_bulk_socket")) staging_bulk_socket();
     else if (!strcmp(argv[1], "ring_frame")) ring_frame();
     else if (!strcmp(argv[1], "ring_ranges")) ring_ranges();
     else if (!strcmp(argv[1], "ring_failures")) ring_failures();

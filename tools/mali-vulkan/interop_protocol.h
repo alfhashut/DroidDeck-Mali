@@ -13,6 +13,9 @@
 /* Per-message bound, not an allocation/mapped-range limit. Fits the existing
  * renderer request buffer (512 KiB + 256); larger ranges use multiple writes. */
 #define MB_INTEROP_WRITE_MAX (512u * 1024u)
+/* Matched normal-session proxy/broker: persistent SHM staging only. Ordinary
+ * mappings/ring ranges and v6 retain their old limits. Still one ACK per write. */
+#define MB_INTEROP_STAGING_WRITE_MAX (2u * 1024u * 1024u)
 /* Existing broker reply bound, minus its 12-byte status/result/count prefix.
  * This is a message limit; larger mapped ranges use multiple bulk reads. */
 #define MB_INTEROP_READ_MAX (128u * 1024u - 12u)
@@ -51,6 +54,10 @@
 static inline uint32_t mb_interop_write_limit(uint32_t version) {
     return version >= MB_INTEROP_BULK_VERSION ? MB_INTEROP_WRITE_MAX : MB_INTEROP_CHUNK;
 }
+static inline uint32_t mb_interop_upload_limit(uint32_t version, int staging) {
+    return version >= MB_INTEROP_BULK_VERSION && staging ?
+        MB_INTEROP_STAGING_WRITE_MAX : mb_interop_write_limit(version);
+}
 static inline uint32_t mb_interop_read_limit(uint32_t version) {
     return version >= MB_INTEROP_BULK_VERSION ? MB_INTEROP_READ_MAX : MB_INTEROP_CHUNK;
 }
@@ -61,8 +68,12 @@ static inline int mb_interop_mapped_range(uint64_t allocation, uint64_t map_offs
         offset >= map_offset && offset - map_offset <= map_size &&
         length <= map_size - (offset - map_offset);
 }
-static inline int mb_interop_write_size(uint32_t version, uint32_t bytes, uint64_t length) {
-    return bytes >= MB_MEMORY_WRITE_HEADER && length && length <= mb_interop_write_limit(version) &&
+static inline int mb_interop_write_size_for_mode(uint32_t version, int normal,
+        uint32_t bytes, uint64_t length) {
+    return bytes >= MB_MEMORY_WRITE_HEADER && length && length <= mb_interop_upload_limit(version, normal) &&
         length == bytes - MB_MEMORY_WRITE_HEADER;
+}
+static inline int mb_interop_write_size(uint32_t version, uint32_t bytes, uint64_t length) {
+    return mb_interop_write_size_for_mode(version, 0, bytes, length);
 }
 #endif
