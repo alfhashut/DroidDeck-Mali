@@ -50,8 +50,15 @@ enum dd_ft_stage {
     DD_FT_BROKER_MAPPED_COPY_BEGIN, DD_FT_BROKER_MAPPED_COPY_END,
     DD_FT_PROXY_DIRTY_BEGIN, DD_FT_PROXY_DIRTY_END,
     DD_FT_RPC_EXCHANGE_BEGIN, DD_FT_RPC_EXCHANGE_END,
-    DD_FT_PROXY_SUBMIT_LINK, DD_FT_COUNT
+    DD_FT_PROXY_SUBMIT_LINK, DD_FT_PROXY_DETAIL_POLICY, DD_FT_COUNT
 };
+/* Diagnostic-only ordered-stream sampler. Both endpoints count fence-less
+ * MB_RENDERER_SUBMIT requests since MB_NORMAL_BEGIN. Bulk writes precede that
+ * submit, so select the NEXT ordinal. No wire metadata, locks or RPC changes. */
+#define DD_FT_UPLOAD_DETAIL_STRIDE 16u
+static inline int dd_ft_upload_detail_selected(uint64_t completed) {
+    return completed % DD_FT_UPLOAD_DETAIL_STRIDE == DD_FT_UPLOAD_DETAIL_STRIDE - 1;
+}
 /* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
  * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
 struct dd_ft_id { uint64_t client, attempt, scope; uint32_t frame, key, sync, fence; };

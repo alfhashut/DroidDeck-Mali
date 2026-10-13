@@ -225,9 +225,10 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
             uint8_t *ptr = (uint8_t *)m->map + offset - m->map_offset;
             if (op == MB_MEMORY_WRITE) {
                 struct dd_ft_id trace = {0}; trace.scope = d->normal.trace_scope;
-                if (d->normal.enabled) dd_ft_event(DD_FT_BROKER_MAPPED_COPY_BEGIN, trace, m->id, offset, 0, 1);
+                const int trace_copy = broker_trace_detailed && d->normal.enabled;
+                if (trace_copy) dd_ft_event(DD_FT_BROKER_MAPPED_COPY_BEGIN, trace, m->id, offset, 0, 1);
                 memcpy(ptr, w + 20, (size_t)size);
-                if (d->normal.enabled) dd_ft_event(DD_FT_BROKER_MAPPED_COPY_END, trace, m->id, offset, 0, 1);
+                if (trace_copy) dd_ft_event(DD_FT_BROKER_MAPPED_COPY_END, trace, m->id, offset, 0, 1);
             }
             else { memcpy(reply, ptr, (size_t)size); *extra = (uint32_t)size; *count = 1; } break;
         }

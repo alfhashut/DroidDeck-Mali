@@ -6,13 +6,18 @@ import test_shm_decomposition as fixture
 
 # Reuse only the fixture helpers, without rediscovering its test methods.
 class UploadQueueTests(unittest.TestCase):
-    setUp = fixture.ShmDecompositionTests.setUp
+    def setUp(self):
+        fixture.ShmDecompositionTests.setUp(self)
+        self.game.append(self.event('proxy_detail_policy',93.15,scope=31,
+                                    object=0,value=16,status=0))
     event = fixture.ShmDecompositionTests.event
     add = fixture.ShmDecompositionTests.add
     paths = fixture.ShmDecompositionTests.paths
     analyze = fixture.ShmDecompositionTests.analyze
 
     def details(self):
+        policy=next(e for e in self.game if e['stage']=='proxy_detail_policy')
+        policy.update(object=15,status=1)
         for name,start,end in [
             ('proxy_prepare',92,93),('proxy_lock',92.2,92.3),
             ('proxy_lock',93,93.1),('proxy_mirror',93.2,98),
@@ -199,5 +204,68 @@ class UploadQueueTests(unittest.TestCase):
         summary=self.analyze()['stage_spans']['gamescope/rpc_receive']
         self.assertEqual(summary['cpu_samples'],0)
         self.assertIsNone(summary['off_cpu_mean_ms'])
+
+    def test_intentionally_unsampled_attempt_is_not_error(self):
+        out=self.analyze();d=out['upload_queue_decomposition']
+        self.assertEqual(out['span_diagnostics'],[])
+        self.assertTrue(out['lossless_complete_window'])
+        self.assertEqual(d['intentionally_unsampled_queues'],1)
+        self.assertEqual(d['ambiguous_or_incomplete_queues'],0)
+        self.assertEqual(d['incomplete_selected_queues'],0)
+        self.assertEqual(d['selected_queues'],0)
+        self.assertEqual(d['per_queue'][0]['sampling_state'],'intentionally_unsampled')
+
+    def test_explicit_selected_counts_and_loss(self):
+        self.transport_fixture()
+        d=self.analyze()['upload_queue_decomposition']
+        self.assertEqual((d['selected_queues'],d['complete_selected_samples'],d['broker_complete_samples']),(1,1,1))
+        out=self.analyze(dropped=1);d=out['upload_queue_decomposition']
+        self.assertFalse(out['lossless_complete_window'])
+        self.assertEqual((d['selected_queues'],d['complete_selected_samples'],d['broker_complete_samples']),(1,0,0))
+        self.assertEqual(d['incomplete_selected_queues'],1)
+
+    def test_unsampled_submit_keeps_exact_native_identity(self):
+        self.transport_fixture()
+        self.game=[e for e in self.game if e['stage'].rsplit('_',1)[0] not in journal.UPLOAD_QUEUE_CHILD_STAGES]
+        next(e for e in self.game if e['stage']=='proxy_detail_policy').update(object=16,status=0)
+        self.native=[e for e in self.native if e['stage'].rsplit('_',1)[0] not in journal.BROKER_STAGES]
+        out=self.analyze()
+        uploads=[s for s in out['frames'][0]['spans'] if s['role']=='android' and s['stage']=='vk_submit' and s['value']==99]
+        self.assertEqual(len(uploads),1)
+        self.assertEqual(uploads[0]['joined_frame'],1)
+        self.assertEqual(out['span_diagnostics'],[])
+        self.assertEqual(out['unmatched_publish_ids'],[])
+        self.assertEqual(out['upload_queue_decomposition']['intentionally_unsampled_queues'],1)
+
+    def test_missing_whole_pair_marks_selected_incomplete(self):
+        self.details()
+        self.game=[e for e in self.game if not e['stage'].startswith('rpc_decode_')]
+        d=self.analyze()['upload_queue_decomposition']
+        self.assertEqual(d['complete_selected_samples'],0)
+        self.assertEqual(d['incomplete_selected_queues'],1)
+        self.assertTrue(any('incomplete sampled RPC' in reason for reason in d['per_queue'][0]['remainder_unavailable_reasons']))
+
+    def test_invalid_or_duplicate_policy_is_not_unsampled(self):
+        self.details()
+        policy=next(e for e in self.game if e['stage']=='proxy_detail_policy')
+        policy['status']=0  # ordinal 16 must be selected
+        d=self.analyze()['upload_queue_decomposition']
+        self.assertEqual(d['remainder_samples'],0)
+        self.assertEqual(d['intentionally_unsampled_queues'],0)
+        self.assertEqual(d['ambiguous_or_incomplete_queues'],1)
+        policy['status']=1;self.game.append(dict(policy))
+        self.assertEqual(self.analyze()['upload_queue_decomposition']['remainder_samples'],0)
+
+    def test_selected_and_unsampled_queue_counts_are_separate(self):
+        import copy
+        self.details();out=self.analyze();frame=out['frames'][0]
+        unsampled=copy.deepcopy(frame);unsampled.update(attempt=9,client=19,frame=2)
+        unsampled['spans']=[dict(s,attempt=9,client=19) for s in frame['spans'] if s['stage']=='upload_queue']
+        policy=next(e for e in unsampled['events'] if e['stage']=='proxy_detail_policy')
+        policy.update(attempt=9,client=19,object=16,status=0)
+        unsampled['events']=[policy]
+        all_spans=frame['spans']+unsampled['spans']
+        d=journal.upload_queue_decomposition([frame,unsampled],[],True,all_spans)
+        self.assertEqual((d['count'],d['selected_queues'],d['complete_selected_samples'],d['intentionally_unsampled_queues']),(2,1,1,1))
 
 if __name__=='__main__': unittest.main()

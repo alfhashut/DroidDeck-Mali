@@ -34,6 +34,7 @@ _Static_assert(MB_PREFIX_BYTES + MB_INTEROP_READ_MAX <= MB_CAP_MAX_PAYLOAD,
                "bulk mapped reads must fit the existing broker reply buffer");
 
 static _Thread_local int session_quiet;
+static _Thread_local int broker_trace_detailed; /* frozen for one request/set */
 #define LOG(...) do { if (!session_quiet) __android_log_print(ANDROID_LOG_INFO, "MaliVulkanBroker", __VA_ARGS__); } while (0)
 #define ERROR(...) __android_log_print(ANDROID_LOG_ERROR, "MaliVulkanBroker", __VA_ARGS__)
 #define MAX_CLIENTS 16
@@ -61,6 +62,7 @@ struct vk_session {
     uint32_t count;
     int listed;
     uint32_t wire_version, next_device_id, next_queue_id, next_resource_id;
+    uint64_t trace_upload_completed; /* same fence-less submit stream as ICD */
     struct native_device {
         struct {
             struct mb_consumer_session *consumer;
@@ -252,7 +254,8 @@ static uint32_t query_devices(uint8_t *payload) {
 static int broker_trace_read_request(struct vk_session *s, int fd, uint8_t *request,
         uint32_t bytes, uint32_t op) {
     struct dd_ft_id trace = {0}; unsigned devices = 0;
-    if (dd_ft_active() && (op == MB_MEMORY_WRITE || op == MB_RENDERER_SUBMIT)) {
+    broker_trace_detailed = dd_ft_upload_detail_selected(s->trace_upload_completed);
+    if (broker_trace_detailed && dd_ft_active() && (op == MB_MEMORY_WRITE || op == MB_RENDERER_SUBMIT)) {
         for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
             if (s->logical[i].normal.enabled) { trace.scope = s->logical[i].normal.trace_scope; ++devices; }
     }
@@ -265,7 +268,7 @@ static int broker_trace_read_request(struct vk_session *s, int fd, uint8_t *requ
 static struct dd_ft_id broker_trace_request(struct vk_session *s, uint32_t op,
         const uint8_t *request, uint32_t bytes, uint64_t *object, uint64_t *value) {
     struct dd_ft_id id = {0};
-    if (!dd_ft_active() || bytes < 4) return id;
+    if (!broker_trace_detailed || !dd_ft_active() || bytes < 4) return id;
     for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i) {
         struct native_device *d = &s->logical[i];
         if (!d->normal.enabled || d->id != mb_get_u32(request)) continue;
@@ -284,6 +287,7 @@ static void serve(int fd) {
     uint8_t *request = malloc(MB_RENDERER_MAX_REQUEST);
     if (!s || !request) { free(s); free(request); ERROR("client allocation failed"); return; }
     for (;;) {
+        broker_trace_detailed = 0;
         uint8_t header[MB_HEADER_BYTES], payload[MB_CAP_MAX_PAYLOAD] = {0};
         if (mb_read(fd, header, sizeof(header))) break;
         uint32_t version = mb_get_u32(header + 4), op = mb_get_u32(header + 8);
@@ -417,6 +421,11 @@ static void serve(int fd) {
             ERROR("write response: %s", strerror(errno)); break;
         }
         if (trace_id.scope) dd_ft_event(DD_FT_BROKER_REPLY_END, trace_id, trace_object, trace_value, result, 1);
+        /* Diagnostic counters only. Count after the complete request/reply set
+         * so changing ordinal never half-samples the just-completed operation. */
+        if (op == MB_NORMAL_BEGIN && status == MB_OK && result == VK_SUCCESS) s->trace_upload_completed = 0;
+        else if (op == MB_RENDERER_SUBMIT && request_bytes == 28 && !mb_get_u32(request + 12))
+            ++s->trace_upload_completed;
         if (finish) break;
     }
     if (close_session(s)) free(s);

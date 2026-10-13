@@ -26,6 +26,9 @@ struct proxy_logical {
 _Static_assert(offsetof(struct proxy_logical, loader) == 0, "device dispatch word");
 _Static_assert(offsetof(struct proxy_queue, loader) == 0, "queue dispatch word");
 
+static uint64_t proxy_trace_upload_completed(void *device) {
+    return __atomic_load_n(&((struct proxy_logical *)device)->owner->trace_upload_completed, __ATOMIC_RELAXED);
+}
 static void proxy_free_resources(struct proxy_logical *d);
 
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo *info,

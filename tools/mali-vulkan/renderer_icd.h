@@ -260,6 +260,10 @@ static VkResult renderer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubm
     if (proxy_trace_sink) proxy_trace_id.scope = (uintptr_t)d->owner;
     if (proxy_trace_sink) {
         proxy_trace_id.fence = f ? f->id : 0;
+        /* One policy record per submit, including intentional omissions. The
+         * ordinal is diagnostic-only; existing semaphore/fence links stay intact. */
+        proxy_trace_sink(DD_FT_PROXY_DETAIL_POLICY, proxy_trace_id, proxy_trace_completed,
+            DD_FT_UPLOAD_DETAIL_STRIDE, proxy_trace_detailed, 0);
         proxy_trace_sink(DD_FT_PROXY_SUBMIT_LINK, proxy_trace_id, s->id, t->pSignalSemaphoreValues[0], 0, 0);
     }
     /* Persistently mapped coherent upload data must reach the REAL mapped allocation. */

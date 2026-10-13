@@ -46,6 +46,7 @@ struct proxy_instance {
     int perf_enabled;
     struct dd_perf_rpc perf;
     struct dd_memory_profile memory_perf;
+    uint64_t trace_upload_completed; /* diagnostic-only ordered stream counter */
     VkResult device_destroy_result;
     struct proxy_logical *logical;
     struct proxy_device devices[MB_MAX_DEVICES];
@@ -119,6 +120,11 @@ static VkResult rpc(struct proxy_instance *s, uint32_t op, const uint8_t *reques
                     uint32_t request_bytes, uint8_t *reply, uint32_t *reply_bytes, uint32_t capacity) {
     uint64_t start = s->perf_enabled ? dd_perf_now() : 0;
     VkResult r = rpc_exchange(s, op, request, request_bytes, reply, reply_bytes, capacity);
+    /* Count the actual ordered RPC stream, even outside the recording window.
+     * A fixed QueueSubmit context keeps all its detail pairs selected together. */
+    if (op == MB_NORMAL_BEGIN && r == VK_SUCCESS) __atomic_store_n(&s->trace_upload_completed, 0, __ATOMIC_RELAXED);
+    else if (op == MB_RENDERER_SUBMIT && request_bytes == 28 && !mb_get_u32(request + 12))
+        __atomic_add_fetch(&s->trace_upload_completed, 1, __ATOMIC_RELAXED);
     if (s->perf_enabled) {
         dd_perf_add(&s->perf, op, dd_perf_now() - start);
         if (r == VK_SUCCESS && request_bytes >= 20 && op == MB_MEMORY_WRITE) s->perf.upload_bytes += mb_get_u32(request + 16);

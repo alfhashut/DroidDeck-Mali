@@ -160,7 +160,7 @@ foreign-recorder isolation, affinity restoration, ambiguous timestamp/queue
 matches, and renderer fallback rejection. `git diff --check`, Python AST parsing,
 and whitespace checks for untracked diagnostic files passed.
 
-## Internal frame journal: SHM decomposed, upload queue awaiting phone evidence
+## Internal frame journal: SHM decomposed, upload queue detail sampling
 
 The external-only limitations above describe the previous capture. Patch
 `0126-mali-frame-trace.patch` and the Android hooks now add an **opt-in internal
@@ -442,12 +442,43 @@ use the Android system Vulkan device. No client PanVK code or artifact changes.
 The Gamescope-owned journal sink is passed through the private **local-only**
 `vkDroidDeckFrameTraceMALI` callback entrypoint around the existing QueueSubmit,
 and cleared immediately afterward. It sends no RPC, creates no worker and
-advertises no Vulkan extension. Proxy details are sampled for `attempt % 8 == 0`
-to avoid emitting twenty events for every 512-KiB chunk of every frame. The
-existing frame/queue scopes and `proxy_submit_link` remain recorded for all
-attempts. CPU sampling still follows the existing journal control stride.
-Native broker request scopes are recorded during the active window, and remain
-raw when the corresponding detailed client RPC is not sampled. The larger
+advertises no Vulkan extension. Detailed proxy and broker scopes now use a
+shared deterministic stride of **16 fence-less renderer submissions**. The
+previous proxy-only `attempt % 8` sampler left Android recording every bulk
+request. Two 10-second phone captures dropped 1 and 5 Android events at only
+13,650 and 13,597 accepted events, far below capacity. The journal's nonblocking
+`trylock` can reject an event while another callback/broker thread is writing;
+the footer alone cannot prove the exact lost event or contention site. This
+change reduces observer traffic; capacity, try-lock behavior and all rendering,
+RPC and synchronization operations remain unchanged. Zero loss still requires
+phone validation.
+
+Both endpoints count the actual ordered connection stream from successful
+`MB_NORMAL_BEGIN`, including outside the capture window. Only an existing
+28-byte `MB_RENDERER_SUBMIT` with wire fence ID zero advances the counter (the
+normal pooled upload U); nonzero-fence compositor R submits and memory chunks
+do not. With 15, 31, 47, ... completed U requests, both sides select the next U
+and its preceding bulk writes/ACKs. Android cannot see a Gamescope attempt ID
+before reading those bodies, so this is a truthful equivalent stream sampler,
+**not a claim of every 16th CEF frame or Gamescope attempt**. A preceding R
+submit/transfer can also be selected while awaiting that U. The existing normal
+path serializes QueueSubmit on this connection. There is no new wire field or
+cross-process ID.
+
+The proxy freezes one decision for the whole QueueSubmit context; Android
+freezes one per request before body read. Begin/end selection never re-evaluates
+the modulo after submit increments the counter. A journal loss or a capture
+boundary can still truncate a selected pair; the analyzer excludes it. Default
+CPU sampling remains every eighth attempt/frame/fence/timeline value.
+
+Every-attempt frame/queue/publication events, `proxy_submit_link`, and existing
+native `vk_submit_begin/end` remain unsampled. A small `proxy_detail_policy`
+record is added for every observed valid QueueSubmit: original client/attempt
+and connection scope, `object=completed_U_count`, `value=16`, `status=0|1`
+(unselected/selected, **not** VkResult), CPU sampling disabled. This explicitly
+identifies intentional omissions. All proxy detailed scopes below and the new
+broker receive/dispatch/mapped-copy/reply scopes use the shared selector.
+Essential Android presentation/release events are unchanged. The larger
 bounded journal allocation exists only in armed sessions; no JSON/log I/O occurs
 inside a scope. Observer overhead still needs phone validation.
 
@@ -485,7 +516,10 @@ semaphore ID/signal value and a **process-local** connection pointer in `scope`.
 Android retains its existing device `trace_scope`. A successfully published R
 with exactly matching key/frame/fence AND semaphore/value anchors those two
 namespaces; conflicting/many-to-one anchors are rejected. U submissions then use
-the same namespace/semaphore/value, without a new wire ID.
+the same namespace/semaphore/value, without a new wire ID. Native `vk_submit`
+uses the unique exact submit link even when detailed RPC scopes are intentionally
+absent, preserving every-submit attribution. Detailed broker stages additionally
+require the complete synchronous RPC bounds described below.
 
 Memory writes have no frame/timeline on the wire. Attribution requires the
 mapped namespace, exact memory ID/offset, and **exactly one complete synchronous
@@ -506,7 +540,16 @@ per-queue identities, inclusive stage interval-union means, real pre-submit
 exchange time, RPC wall time, observed broker coverage, and
 `unattributed_inside_queue_mean_ms`. Remainder subtracts **only same-thread
 client interval union**. Native work runs concurrently with client receive and
-is never added to client coverage. Unsampled/malformed/lossy/old-build queues
+is never added to client coverage. Explicitly unselected queues have
+`sampling_state=intentionally_unsampled`, no remainder, and no malformed/lost
+classification. `selected_queues`, `intentionally_unsampled_queues`,
+`complete_selected_samples`, `incomplete_selected_queues`, and
+`ambiguous_or_incomplete_queues` expose the sample population. Only complete
+selected detail enters new-build decomposition means; missing/ambiguous selected
+scopes are excluded. Legacy traces with a complete old detail set are reported
+separately as `legacy_complete_samples`; they do not satisfy new-build phone
+acceptance. `dropped>0` on either footer invalidates exact decomposition for the
+whole capture even if the loss seems unrelated. Incomplete/malformed/lossy queues
 have an unavailable remainder with a reason. `broker_complete_samples` requires
 one decoded handler for every observed client bulk/submit RPC; absent native
 coverage remains null rather than zero. Native per-stage counts distinguish
@@ -530,7 +573,7 @@ sampled decomposition and sufficient exact native attribution.
 The journal **Python control fix alone needs no new APK/Gamescope build** if the matched
 native hooks below are already installed. `frame_journal.py` runs on the host;
 `--frame-diagnostics` dynamically pushes `steam_frame_journal.py` into the guest.
-The **new SHM/upload-queue stages and local ICD callback require a new matched Gamescope/APK CI build** because the
+The **SHM/upload-queue hooks and shared 16-submit sampler require a new matched Gamescope/proxy/APK CI build** because the
 canonical event table is compiled into both processes. Normal Stop/Launch is
 still required after re-arm so both workers recreate their ready markers for
 the new cycle.
@@ -601,7 +644,7 @@ Then, from the repository root:
    automatic.
 
    ```fish
-   set -l capture_dir (mktemp -d /tmp/steam-upload-queue-XXXXXX)
+   set -l capture_dir (mktemp -d /tmp/steam-upload-sampled-XXXXXX)
    python3 -B tools/panvk/stage_phone_test.py \
      --serial E68DS8U4IVYTKJXK \
      --frame-diagnostics --perf-seconds 10 \
@@ -636,7 +679,20 @@ Then, from the repository root:
    ```
 
    Require new proxy/broker `stage_spans`, positive
-   `upload_queue_decomposition.remainder_samples` and `broker_complete_samples`.
+   `upload_queue_decomposition.complete_selected_samples`, `remainder_samples`
+   and `broker_complete_samples`. Both exact current-run footers must contain
+   `"dropped":0,"complete":true`; `selected_queues` must be positive and
+   `incomplete_selected_queues` must be investigated rather than counted as
+   complete. `intentionally_unsampled_queues` should account for ordinary
+   omitted detail and must not be treated as loss. Repeat a second 10-second
+   moving capture in another fresh directory to check repeatability.
+   The following fish-compatible check prints both quality records and fails
+   on loss, missing joined publications, or no complete selected/broker samples:
+
+   ```fish
+   python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); d=s["upload_queue_decomposition"]; print(s["capture_quality"]); print({k:d[k] for k in ("selected_queues","intentionally_unsampled_queues","complete_selected_samples","broker_complete_samples","incomplete_selected_queues")}); assert s["lossless_complete_window"] and s["joined_frames"]>0 and not s["unmatched_publish_ids"]; assert d["complete_selected_samples"]>0 and d["broker_complete_samples"]>0' "$capture_dir/upload-summary.json"
+   ```
+
    Inspect unassigned native coverage, per-stage sample counts and
    `span_diagnostics`. Unsampled attempts are expected to lack a detailed
    remainder. Compare inclusive stages only
@@ -680,7 +736,7 @@ proposing optimization.
   invocation in `build.yml`. Native broker/presentation behavior is untouched.
 - CI and procedure: `.github/workflows/build.yml`, this document.
 
-Upload-queue delta (this change): `tools/mali-vulkan/frame_trace_proxy.h`,
+Initial upload-queue instrumentation delta: `tools/mali-vulkan/frame_trace_proxy.h`,
 `icd_proxy.c`, `device_icd.h`, `submit_icd.h`, `interop_icd.h`, `renderer_icd.h`,
 canonical `frame_trace.h/.c`, patch 0126, Android `system_broker.c` and
 `interop_commands.h`, `tools/panvk/analyze_frame_journal.py`,
@@ -689,3 +745,13 @@ this document and `.github/workflows/build.yml`. No renderer/protocol/sync
 behavior changes. Targeted tests include the small extracted real rpc_exchange
 harness (no Vulkan SDK/Gamescope build), journal/CPU/identity tests and nested
 interval-union/ambiguous namespace/partial transaction tests.
+
+Sampling/loss-control delta: `frame_trace.h/.c`, `frame_trace_proxy.h`,
+`icd_proxy.c`, `device_icd.h`, `renderer_icd.h`, patch 0126, Android
+`system_broker.c`/`interop_commands.h`, analyzer, `test_upload_queue.py`, new
+Python-only `test_upload_sampling.py`, CI-only `test_upload_trace.py`, this
+document and `build.yml`. Local validation runs Python model/source-contract,
+join/decomposition/control tests and zero-fuzz patch application only. Native
+harness execution/compilation and the matched Gamescope/proxy/APK build remain
+in GitHub Actions. Journal locking and rendering/RPC/synchronization remain
+unchanged. Phone zero-loss acceptance is pending.

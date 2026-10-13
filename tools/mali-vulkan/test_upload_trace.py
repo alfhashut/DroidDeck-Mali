@@ -45,6 +45,8 @@ static int mb_read(int fd, void *p, size_t n) {
     if (reads==1) { mb_session_header(p,777,MB_PREFIX_BYTES);if(bad_header)mb_put_u32(p,0); }
     return 0;
 }
+static uint64_t upload_completed;
+static uint64_t proxy_trace_upload_completed(void *device) { (void)device;return upload_completed; }
 #include "frame_trace_proxy.h"
 static void sink(enum dd_ft_stage stage, struct dd_ft_id id, uint64_t object,
                  uint64_t value, int32_t status, int cpu) {
@@ -63,8 +65,8 @@ static int exchange(void) {
     return rpc_exchange(&s,777,request,sizeof(request),reply,&n,sizeof(reply));
 }
 int main(void) {
-    struct dd_ft_id id={0};id.attempt=8;
-    proxy_DroidDeckFrameTraceMALI(NULL,sink,&id);
+    struct dd_ft_id id={0};id.attempt=8;upload_completed=15;
+    proxy_DroidDeckFrameTraceMALI(&id,sink,&id);
     reset();assert(exchange()==VK_SUCCESS);assert(writes==2&&reads==2);
     assert(begin_count[DD_FT_RPC_SEND_BEGIN]==2&&end_count[DD_FT_RPC_SEND_END]==2);
     assert(begin_count[DD_FT_RPC_RECEIVE_BEGIN]==2&&end_count[DD_FT_RPC_RECEIVE_END]==2);
@@ -73,7 +75,13 @@ int main(void) {
     assert(end_count[DD_FT_RPC_DECODE_END]==0&&end_count[DD_FT_RPC_EXCHANGE_END]==1);
     reset();bad_header=1;assert(exchange()!=VK_SUCCESS);assert(reads==1);
     assert(end_count[DD_FT_RPC_DECODE_END]==0&&end_count[DD_FT_RPC_EXCHANGE_END]==1);
-    reset();id.attempt=7;proxy_DroidDeckFrameTraceMALI(NULL,sink,&id);
+    /* Advancing the live counter cannot suppress an already selected end. */
+    reset();upload_completed=15;proxy_DroidDeckFrameTraceMALI(&id,sink,&id);
+    struct proxy_trace_guard guard={DD_FT_RPC_EXCHANGE_END,0,0};
+    proxy_trace(DD_FT_RPC_EXCHANGE_BEGIN,0,0,0);upload_completed=16;proxy_trace_finish(&guard);
+    assert(begin_count[DD_FT_RPC_EXCHANGE_BEGIN]==1&&end_count[DD_FT_RPC_EXCHANGE_END]==1);
+    for (unsigned n=0;n<64;++n) assert(dd_ft_upload_detail_selected(n)==(n%16==15));
+    reset();upload_completed=14;id.attempt=7;proxy_DroidDeckFrameTraceMALI(&id,sink,&id);
     assert(exchange()==VK_SUCCESS);assert(writes==2&&reads==2&&records==0);
     reset();proxy_DroidDeckFrameTraceMALI(NULL,NULL,NULL);
     assert(exchange()==VK_SUCCESS);assert(writes==2&&reads==2&&records==0);
@@ -98,7 +106,8 @@ int main(void) {
 #include "frame_trace.h"
 enum { MB_MAX_LOGICAL_DEVICES=4, MB_MEMORY_WRITE=42, MB_RENDERER_SUBMIT=100 };
 struct native_device { struct { int enabled; uint64_t trace_scope; } normal; uint32_t id; };
-struct vk_session { struct native_device logical[4]; };
+struct vk_session { struct native_device logical[4]; uint64_t trace_upload_completed; };
+static int broker_trace_detailed;
 static int active=1, reads, result, events;static uint64_t scope, object, value;static int status;
 int dd_ft_active(void) { return active; }
 void dd_ft_event(enum dd_ft_stage stage, struct dd_ft_id id, uint64_t obj, uint64_t val, int32_t code, int cpu) {
@@ -109,7 +118,7 @@ static uint32_t mb_get_u32(const uint8_t *p) { uint32_t x;memcpy(&x,p,4);return 
 static uint64_t mb_get_u64(const uint8_t *p) { uint64_t x;memcpy(&x,p,8);return x; }
 FUNCTIONS
 int main(void) {
-    struct vk_session s={0};uint8_t request[28]={0};uint32_t device=3, resource=77;uint64_t offset=524288;
+    struct vk_session s={0};s.trace_upload_completed=15;uint8_t request[28]={0};uint32_t device=3, resource=77;uint64_t offset=524288;
     assert(!broker_trace_read_request(&s,-1,request,28,MB_MEMORY_WRITE));assert(reads==1&&events==0);
     s.logical[0].normal.enabled=1;s.logical[0].normal.trace_scope=9;s.logical[0].id=device;
     reads=events=0;assert(!broker_trace_read_request(&s,-1,request,28,MB_MEMORY_WRITE));
@@ -121,6 +130,9 @@ int main(void) {
     assert(id.scope==9&&object==77&&value==offset); /* exact device, not first measured device guess */
     s.logical[1].normal.enabled=0;reads=events=0;result=-1;
     assert(broker_trace_read_request(&s,-1,request,28,MB_MEMORY_WRITE)==-1);assert(reads==1&&events==2&&status==-1);
+    s.trace_upload_completed=16;reads=events=0;
+    assert(broker_trace_read_request(&s,-1,request,28,MB_MEMORY_WRITE)==-1);
+    assert(reads==1&&events==0);assert(!broker_trace_request(&s,MB_MEMORY_WRITE,request,20,&object,&value).scope);
     active=0;reads=events=0;assert(broker_trace_read_request(&s,-1,request,28,MB_MEMORY_WRITE)==-1);
     assert(reads==1&&events==0);assert(!broker_trace_request(&s,MB_MEMORY_WRITE,request,20,&object,&value).scope);
     return 0;

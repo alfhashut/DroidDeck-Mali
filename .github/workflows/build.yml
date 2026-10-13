@@ -50,6 +50,7 @@ jobs:
           python3 -B -m unittest -v test_frame_trace test_upload_trace
           python3 -B -m unittest discover -s ../panvk -p test_shm_decomposition.py -v
           python3 -B -m unittest discover -s ../panvk -p test_upload_queue.py -v
+          python3 -B -m unittest discover -s ../panvk -p test_upload_sampling.py -v
       - name: Build in Arch Linux ARM
         run: |
           set -euo pipefail
