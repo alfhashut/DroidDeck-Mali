@@ -27,6 +27,7 @@ class BulkMemoryTests(unittest.TestCase):
         (build / 'mapping.inc').write_text('static VkResult interop_map_memory' + mappings)
         native = (ROOT.parents[1] / 'app/src/main/cpp/malivulkan/interop_commands.h').read_text()
         memory = native.split('    case MB_MEMORY_MAP: case MB_MEMORY_UNMAP:', 1)[1].split('    case MB_COMMAND_FILL:', 1)[0]
+        (build / 'native_shared.inc').write_text((ROOT.parents[1] / 'app/src/main/cpp/malivulkan/shared_staging_commands.h').read_text())
         (build / 'native_memory.inc').write_text('    case MB_MEMORY_MAP: case MB_MEMORY_UNMAP:' + memory)
         renderer = (ROOT / 'renderer_icd.h').read_text().split('static VkResult renderer_QueueSubmit', 1)[1].split('static void renderer_Barrier', 1)[0]
         (build / 'submit.inc').write_text('static VkResult renderer_QueueSubmit' + renderer)
@@ -70,6 +71,17 @@ class BulkMemoryTests(unittest.TestCase):
 
     def test_bulk_counts_bytes_large_ranges_and_request_reuse(self):
         self.run_case('bulk')
+
+    def test_shared_mirror_direct_pointer_exact_frames_and_zero_pixel_payloads(self): self.run_case('shared_direct')
+    def test_shared_registration_decline_retains_two_MiB_bulk(self): self.run_case('shared_fallback')
+    def test_shared_local_mapping_failure_drops_region_before_bulk_fallback(self): self.run_case('shared_map_failure')
+    def test_shared_connection_region_cap_falls_back_for_fourth_slot(self): self.run_case('shared_cap')
+    def test_shared_notification_failure_never_submits_or_sends_bulk(self): self.run_case('shared_failure')
+    def test_shared_bad_ACK_never_submits_or_sends_bulk(self): self.run_case('shared_bad_ack')
+    def test_shared_native_ranges_generations_pending_and_lengths(self): self.run_case('shared_bounds')
+    def test_shared_unmap_remap_restarts_generation_and_releases_regions(self): self.run_case('shared_restart')
+    def test_shared_exact_subranges_leave_other_bytes_untouched(self): self.run_case('shared_ranges')
+    def test_shared_oversized_mapping_uses_bounded_bulk_without_registration(self): self.run_case('shared_oversized')
 
     def test_staging_four_MiB_uses_two_writes_not_eight_exact_bytes_offsets_reuse(self):
         self.run_case('staging_bulk')

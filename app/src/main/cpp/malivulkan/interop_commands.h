@@ -87,6 +87,7 @@ static void native_interop_close(struct native_device *d) {
         if (v->images[i].id && !interop_normal_reference(d, v->images[i].id)) v->DestroyImage(d->handle, v->images[i].handle, NULL);
     }
     for (unsigned i = 0; i < MB_SUBMIT_MAX_OBJECTS; ++i) {
+        mb_shared_release(&v->memories[i].shared);
         if (v->memories[i].id && !interop_normal_reference(d, v->memories[i].id)) {
             if (v->memories[i].map) v->UnmapMemory(d->handle, v->memories[i].handle);
             v->FreeMemory(d->handle, v->memories[i].handle, NULL);
@@ -209,6 +210,7 @@ static uint32_t native_interop_command(struct vk_session *s, uint32_t op, const 
         uint64_t offset = bytes >= 16 ? mb_get_u64(w + 8) : 0, size = 0;
         if (op == MB_MEMORY_UNMAP) {
             if (!m->map) return MB_PROTOCOL_ERROR;
+            mb_shared_release(&m->shared);
             v->UnmapMemory(d->handle, m->handle); m->map = NULL; m->map_size = 0; break;
         }
         size = op == MB_MEMORY_READ || op == MB_MEMORY_WRITE ? mb_get_u32(w + 16) : mb_get_u64(w + 16);

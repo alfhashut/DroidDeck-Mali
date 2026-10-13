@@ -17,6 +17,7 @@
 #include "normal_api.h"
 #include "normal_memory_perf.h"
 #include "frame_trace_proxy.h"
+#include "shared_staging.h"
 #ifndef __GLIBC__
 #error This ICD must be built against glibc, not Bionic
 #endif
@@ -43,7 +44,7 @@ struct proxy_instance {
     pthread_mutex_t lock;
     uint32_t count;
     uint32_t wire_version;
-    int perf_enabled;
+    int perf_enabled, shared_enabled, shared_received_fd;
     struct dd_perf_rpc perf;
     struct dd_memory_profile memory_perf;
     uint64_t trace_upload_completed; /* diagnostic-only ordered stream counter */
@@ -85,7 +86,13 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
         if (setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &normal_timeout, sizeof(normal_timeout))) goto broken;
     }
     *reply_bytes = bytes;
-    if (mb_get_u32(reply) == MB_OK && mb_get_u32(reply + 4) == VK_SUCCESS) return VK_SUCCESS;
+    if (mb_get_u32(reply) == MB_OK && mb_get_u32(reply + 4) == VK_SUCCESS) {
+        if (op == MB_SHARED_REGISTER) {
+            s->shared_received_fd = mb_shared_recv_fd(s->fd);
+            if (s->shared_received_fd < 0) goto broken;
+        }
+        return VK_SUCCESS;
+    }
     session_frames = 0;
     ERROR("broker opcode=%u status=%u VkResult bits=0x%x", op, mb_get_u32(reply), mb_get_u32(reply + 4));
     /* Preserve the native submission result, including statuses and device loss. */
@@ -200,6 +207,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL proxy_CreateInstance(const VkInstanceCreat
     if (result == VK_SUCCESS && (bytes != MB_PREFIX_BYTES || mb_get_u32(reply + 8)))
         result = VK_ERROR_INITIALIZATION_FAILED;
     if (result != VK_SUCCESS) { close(s->fd); pthread_mutex_destroy(&s->lock); free(s); return result; }
+    const char *shared = getenv("MALI_VULKAN_SHARED_STAGING");
+    s->shared_received_fd = -1;
+    s->shared_enabled = s->perf_enabled && shared && !strcmp(shared, "1") && mb_shared_probe(path);
+    if (shared && !strcmp(shared,"1")) fprintf(stderr,"MaliProxyICD CPU shared staging: capable=%s; bulk fallback retained\n",s->shared_enabled?"yes":"no");
     set_loader_magic_value(s);
     *out = (VkInstance)s;
     LOG("created local proxy instance; Android instance stays in broker");

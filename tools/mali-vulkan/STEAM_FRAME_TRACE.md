@@ -1,5 +1,14 @@
 # Development Steam → Gamescope → Android tracing
 
+The default-off [CPU shared staging experiment](SHARED_STAGING.md) retains this
+journal and adds `proxy_shared_rpc_begin/end` and `broker_shared_copy_begin/end`.
+The analyzer accepts these instead of pixel-bearing bulk scopes with the same
+namespace anchors, sampled request attribution and interval-union rules. Shared
+notification bodies are 32 bytes; ordinary maps still use bulk writes. The
+linked guide includes protocol/lifetime bounds, legacy-counter coverage limits,
+matched CI requirements and fish-compatible fallback/shared phone A/B commands.
+This optimization has not yet been validated on the phone.
+
 The external dynamic capture is implemented and phone-tested. Its original
 captures do not provide private Gamescope stages or a shared frame identity.
 The opt-in internal journal below has now produced a successful synchronized

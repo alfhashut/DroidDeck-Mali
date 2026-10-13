@@ -66,7 +66,7 @@ Subject: [PATCH] Mali Steam client Xwayland compatibility around validated SHM r
 +            // The narrow compute-only ICD is compositor-local, never Steam/CEF's driver.
 +            for (const char *key : {"VK_DRIVER_FILES", "VK_ICD_FILENAMES", "BL_VK_DRIVER",
 +                "MALI_VULKAN_BROKER_SOCKET", "MALI_VULKAN_NORMAL_SESSION",
-+                "MALI_VULKAN_RENDERER_TEST", "MALI_VULKAN_AHB_TEST"}) unsetenv(key);
++                "MALI_VULKAN_RENDERER_TEST", "MALI_VULKAN_AHB_TEST", "MALI_VULKAN_SHARED_STAGING"}) unsetenv(key);
 +            setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
 +            setenv("MESA_LOADER_DRIVER_OVERRIDE", "swrast", 1);
 +            setenv("GALLIUM_DRIVER", "llvmpipe", 1);

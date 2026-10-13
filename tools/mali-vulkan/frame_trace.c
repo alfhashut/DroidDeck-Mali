@@ -66,7 +66,9 @@ static const char *dd_ft_names[] = {
     "broker_mapped_copy_begin", "broker_mapped_copy_end",
     "proxy_dirty_begin", "proxy_dirty_end",
     "rpc_exchange_begin", "rpc_exchange_end",
-    "proxy_submit_link", "proxy_detail_policy"
+    "proxy_submit_link", "proxy_detail_policy",
+    "proxy_shared_rpc_begin", "proxy_shared_rpc_end",
+    "broker_shared_copy_begin", "broker_shared_copy_end"
 };
 static pthread_mutex_t dd_ft_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t dd_ft_thread;

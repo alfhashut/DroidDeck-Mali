@@ -56,12 +56,13 @@ static void sink(enum dd_ft_stage stage, struct dd_ft_id id, uint64_t object,
         stage==DD_FT_RPC_RECEIVE_BEGIN || stage==DD_FT_RPC_DECODE_BEGIN) ++begin_count[stage];
     else ++end_count[stage];
 }
-struct proxy_instance { uint32_t wire_version; int fd; };
+struct proxy_instance { uint32_t wire_version; int fd, shared_received_fd; };
+static int mb_shared_recv_fd(int fd) { (void)fd;return -1; }
 #define ERROR(...) ((void)0)
 FUNCTION
 static void reset(void) { writes=reads=records=fail_write=bad_header=0;memset(begin_count,0,sizeof(begin_count));memset(end_count,0,sizeof(end_count)); }
 static int exchange(void) {
-    struct proxy_instance s={2,-1};uint8_t request[4]={0}, reply[12];uint32_t n=0;
+    struct proxy_instance s={2,-1,-1};uint8_t request[4]={0}, reply[12];uint32_t n=0;
     return rpc_exchange(&s,777,request,sizeof(request),reply,&n,sizeof(reply));
 }
 int main(void) {
@@ -104,7 +105,7 @@ int main(void) {
 #include <stdint.h>
 #include <string.h>
 #include "frame_trace.h"
-enum { MB_MAX_LOGICAL_DEVICES=4, MB_MEMORY_WRITE=42, MB_RENDERER_SUBMIT=100 };
+enum { MB_MAX_LOGICAL_DEVICES=4, MB_MEMORY_WRITE=42, MB_SHARED_WRITE=94, MB_RENDERER_SUBMIT=100 };
 struct native_device { struct { int enabled; uint64_t trace_scope; } normal; uint32_t id; };
 struct vk_session { struct native_device logical[4]; uint64_t trace_upload_completed; };
 static int broker_trace_detailed;

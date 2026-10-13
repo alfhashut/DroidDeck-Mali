@@ -17,10 +17,10 @@ SHM_CHILD_STAGES = (
 UPLOAD_QUEUE_CHILD_STAGES = (
     'proxy_prepare', 'proxy_lock', 'proxy_mirror', 'proxy_dirty', 'proxy_bulk_setup',
     'proxy_bulk_pack', 'proxy_bulk_rpc', 'proxy_bulk_ack', 'proxy_submit_pack',
-    'proxy_submit_rpc', 'proxy_reply_handle', 'proxy_finalize',
+    'proxy_submit_rpc', 'proxy_reply_handle', 'proxy_finalize', 'proxy_shared_rpc',
     'rpc_header', 'rpc_send', 'rpc_receive', 'rpc_decode', 'rpc_exchange',
 )
-BROKER_STAGES = ('broker_receive', 'broker_dispatch', 'broker_reply', 'broker_mapped_copy')
+BROKER_STAGES = ('broker_receive', 'broker_dispatch', 'broker_reply', 'broker_mapped_copy', 'broker_shared_copy')
 SPAN_STAGES = frozenset(SHM_CHILD_STAGES + UPLOAD_QUEUE_CHILD_STAGES + BROKER_STAGES) | {
     'frame', 'shm_import', 'ahb_acquire', 'render', 'wait', 'vk_submit', 'android_handoff',
 }
@@ -219,7 +219,7 @@ def bind_proxy_native(events, joined, game_pub):
             exact[(mapping[link['scope']],link['object'],link['value'])].append(link)
     native_spans, _ = pair_spans(native)
     client_spans, _ = pair_spans(game)
-    bulks = [s for s in client_spans if s['stage']=='proxy_bulk_rpc' and s['scope'] in mapping]
+    bulks = [s for s in client_spans if s['stage'] in ('proxy_bulk_rpc','proxy_shared_rpc') and s['scope'] in mapping]
     submit_rpcs, bulk_rpcs, native_edges, publications = (defaultdict(list) for _ in range(4))
     for span in client_spans:
         if span['stage']=='proxy_submit_rpc':
@@ -328,7 +328,7 @@ def upload_queue_decomposition(frames, issues, clean, all_spans):
                     reasons.append('missing required sampled detail scopes or legacy policy unavailable')
                 elif state=='legacy_unknown':
                     state='legacy_complete'
-                for rpc in (s for s in children if s['stage'] in ('proxy_bulk_rpc','proxy_submit_rpc')):
+                for rpc in (s for s in children if s['stage'] in ('proxy_bulk_rpc','proxy_shared_rpc','proxy_submit_rpc')):
                     nested={s['stage'] for s in children if rpc['start_ns']<=s['start_ns']<=s['end_ns']<=rpc['end_ns']}
                     if not {'rpc_exchange','rpc_header','rpc_send','rpc_receive','rpc_decode'} <= nested:
                         reasons.append('incomplete sampled RPC scope set'); break
@@ -356,7 +356,7 @@ def upload_queue_decomposition(frames, issues, clean, all_spans):
             covered=interval_union_ns(children) if not reasons and state in ('selected','legacy_complete') else None
             broker = [s for s in frame['spans'] if s['role']=='android' and s['stage'] in BROKER_STAGES+('vk_submit',)
                       and parent['start_ns']<=s['start_ns']<=s['end_ns']<=parent['end_ns']]
-            rpcs = [s for s in children if s['stage'] in ('proxy_bulk_rpc','proxy_submit_rpc')]
+            rpcs = [s for s in children if s['stage'] in ('proxy_bulk_rpc','proxy_shared_rpc','proxy_submit_rpc')]
             service = [s for s in broker if any(rpc['start_ns']<=s['start_ns']<=s['end_ns']<=rpc['end_ns'] for rpc in rpcs)]
             # Excludes reply instrumentation which races the client's final read;
             # that race stays visible in the separately reported broker stages.

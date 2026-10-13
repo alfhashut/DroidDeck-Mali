@@ -103,6 +103,20 @@ static VkResult interop_upload_mapping_locked(struct proxy_resource *m, uint64_t
     struct proxy_logical *d = m->owner;
     if (!d || d->owner->wire_version < MB_INTEROP_VERSION) return VK_ERROR_FEATURE_NOT_PRESENT;
     struct proxy_instance *s = d->owner;
+    if (m->shared.map) {
+        if (!m->staging_managed || m->shared.sequence==UINT64_MAX) return VK_ERROR_INITIALIZATION_FAILED;
+        uint8_t request[32], reply[MB_PREFIX_BYTES]; uint32_t bytes=0;
+        mb_put_u32(request,d->id); mb_put_u32(request+4,m->id); mb_put_u64(request+8,offset); mb_put_u64(request+16,size);
+        uint64_t sequence=++m->shared.sequence; mb_put_u64(request+24,sequence);
+        __atomic_store_n(mb_shared_sequence(m->shared.map,m->shared.bytes),sequence,__ATOMIC_RELEASE);
+        PROXY_TRACE_SCOPE(trace_shared,PROXY_SHARED_RPC,m->id,offset);
+        VkResult result=rpc(s,MB_SHARED_WRITE,request,sizeof(request),reply,&bytes,sizeof(reply));
+        if ((result==VK_SUCCESS && bytes!=sizeof(reply)) || (bytes && (bytes!=sizeof(reply) || mb_get_u32(reply+8)))) {
+            shutdown(s->fd,SHUT_RDWR); result=VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if(s->perf_enabled) dd_memory_write(&s->memory_perf,DD_WRITE_STAGING,m->id,m->allocation,m->map_offset,m->map_size,offset,size,result==VK_SUCCESS);
+        return result; /* Failed/ambiguous notification never falls back or submits. */
+    }
     PROXY_TRACE_SCOPE(trace_setup, PROXY_BULK_SETUP, m->id, offset);
     uint32_t limit = mb_interop_upload_limit(s->wire_version, m->staging_managed);
     uint32_t capacity = MB_MEMORY_WRITE_HEADER + (size > limit ? limit : (uint32_t)size);
@@ -214,14 +228,45 @@ static VkResult interop_map_memory(VkDevice device, VkDeviceMemory memory, VkDev
     if (size == VK_WHOLE_SIZE) size = m->allocation - offset;
     size_t align = d->map_alignment < sizeof(void *) ? sizeof(void *) : d->map_alignment;
     if (!size || size > SIZE_MAX || size > m->allocation - offset || (align & (align - 1)) || offset % align) return VK_ERROR_MEMORY_MAP_FAILED;
-    void *ptr = NULL; if (posix_memalign(&ptr, align, (size_t)size)) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    int try_shared=!download && d->owner->shared_enabled && !offset && size==m->allocation && mb_shared_file_bytes(size);
+    void *ptr = NULL;
+    if(!try_shared && posix_memalign(&ptr,align,(size_t)size)) return VK_ERROR_OUT_OF_HOST_MEMORY;
     uint8_t args[20]; mb_put_u32(args, m->id); mb_put_u64(args + 4, offset); mb_put_u64(args + 12, size);
     VkResult r = interop_rpc(d, MB_MEMORY_MAP, args, 20, NULL, 0);
     if (r != VK_SUCCESS) { free(ptr); return r; }
+    /* Private staging map only, before the pointer is returned to Gamescope. */
+    if (try_shared) {
+        uint8_t request[16], reply[MB_PREFIX_BYTES]; uint32_t bytes=0;
+        mb_put_u32(request,d->id); mb_put_u32(request+4,m->id); mb_put_u64(request+8,size);
+        pthread_mutex_lock(&d->owner->lock);
+        d->owner->shared_received_fd=-1;
+        VkResult registered=rpc(d->owner,MB_SHARED_REGISTER,request,sizeof(request),reply,&bytes,sizeof(reply));
+        int fd=d->owner->shared_received_fd; d->owner->shared_received_fd=-1;
+        if ((registered==VK_SUCCESS && (bytes!=sizeof(reply) || fd<0)) ||
+            (bytes && (bytes!=sizeof(reply) || mb_get_u32(reply+8)))) {
+            if(fd>=0) close(fd);
+            shutdown(d->owner->fd,SHUT_RDWR); pthread_mutex_unlock(&d->owner->lock); return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (registered==VK_SUCCESS) ptr=mb_shared_map_writer(fd,size,align);
+        if(fd>=0)close(fd);
+        pthread_mutex_unlock(&d->owner->lock);
+        if (ptr) m->shared=(struct mb_shared_region){ptr,size,0};
+        else if(registered==VK_SUCCESS) {
+            uint8_t id[4]; mb_put_u32(id,m->id);
+            VkResult dropped=interop_rpc(d,MB_SHARED_DROP,id,4,NULL,0);
+            if(dropped!=VK_SUCCESS)return dropped;
+        } else if(registered!=VK_ERROR_FEATURE_NOT_PRESENT) return registered;
+        fprintf(stderr,"MaliProxyICD CPU shared staging: memory=%u bytes=%llu transport=%s\n",m->id,
+            (unsigned long long)size,ptr?"shared mmap":"2 MiB bulk fallback");
+    }
+    if (!ptr && posix_memalign(&ptr, align, (size_t)size)) {
+        (void)interop_rpc(d,MB_MEMORY_UNMAP,args,4,NULL,0);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     m->mirror = ptr; m->map_offset = offset; m->map_size = size; memset(ptr, 0, (size_t)size);
     if (download && (m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) r = interop_copy_mapping(m, offset, size, 0);
     if (r == VK_SUCCESS) *out = ptr;
-    else { mb_put_u32(args, m->id); (void)interop_rpc(d, MB_MEMORY_UNMAP, args, 4, NULL, 0); free(m->mirror); m->mirror = NULL; }
+    else { mb_put_u32(args, m->id); (void)interop_rpc(d, MB_MEMORY_UNMAP, args, 4, NULL, 0); proxy_mirror_release(m); }
     return r;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL proxy_MapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void **out) {
@@ -233,7 +278,7 @@ static VKAPI_ATTR void VKAPI_CALL proxy_UnmapMemory(VkDevice device, VkDeviceMem
     if (m && m->mirror) {
         r = m->pool & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? interop_copy_mapping(m, m->map_offset, m->map_size, 1) : VK_SUCCESS;
         if (r == VK_SUCCESS) { uint8_t args[4]; mb_put_u32(args, m->id); r = interop_rpc(d, MB_MEMORY_UNMAP, args, 4, NULL, 0); }
-        if (r == VK_SUCCESS) { free(m->upload_ring); m->upload_ring = NULL; free(m->mirror); m->mirror = NULL; m->map_size = 0; m->staging_managed = m->staging_command = 0; }
+        if (r == VK_SUCCESS) { free(m->upload_ring); m->upload_ring = NULL; proxy_mirror_release(m); m->map_size = 0; m->staging_managed = m->staging_command = 0; }
     }
     submit_void_error(d, "vkUnmapMemory", r);
 }

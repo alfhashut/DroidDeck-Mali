@@ -132,6 +132,24 @@ class UploadQueueTests(unittest.TestCase):
         self.assertEqual(row['broker_stage_span_counts']['broker_mapped_copy'],1)
         self.assertEqual(row['client_stage_span_counts']['proxy_submit_rpc'],1)
 
+    def test_shared_notify_and_copy_join_without_bulk_pixel_stages(self):
+        self.transport_fixture()
+        self.game=[e for e in self.game if e['stage'].rsplit('_',1)[0] not in ('proxy_bulk_setup','proxy_bulk_pack','proxy_bulk_ack')]
+        for event in self.game:
+            event['stage']=event['stage'].replace('proxy_bulk_rpc','proxy_shared_rpc')
+        for event in self.native:
+            event['stage']=event['stage'].replace('broker_mapped_copy','broker_shared_copy')
+            if event['stage'].startswith('broker_receive') and event['value']==524308:
+                event.update(object=94,value=32)
+        out=self.analyze();d=out['upload_queue_decomposition'];row=d['per_queue'][0]
+        self.assertEqual((d['complete_selected_samples'],d['broker_complete_samples']),(1,1))
+        self.assertEqual(row['client_stage_span_counts']['proxy_shared_rpc'],1)
+        self.assertEqual(row['broker_stage_span_counts']['broker_shared_copy'],1)
+        self.assertNotIn('proxy_bulk_rpc',row['client_stage_span_counts'])
+        self.assertNotIn('broker_mapped_copy',row['broker_stage_span_counts'])
+        self.assertIn('android/broker_shared_copy',out['stage_spans'])
+        self.assertAlmostEqual(d['unattributed_inside_queue_mean_ms'],0.8)
+
     def test_different_native_namespace_not_joined(self):
         self.transport_fixture()
         for row in self.native:

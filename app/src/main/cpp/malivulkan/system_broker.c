@@ -17,6 +17,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_android.h>
 #include "protocol.h"
+#include "shared_staging.h"
 #include "capabilities.h"
 #include "submit_protocol.h"
 #include "submit_objects.h"
@@ -214,6 +215,7 @@ static void get_properties(struct vk_session *s, uint32_t index, VkPhysicalDevic
 
 #include "capability_queries.h"
 #include "interop_commands.h"
+#include "shared_staging_commands.h"
 #include "submit_commands.h"
 #include "normal_wait_native.h"
 #include "renderer_commands.h"
@@ -258,7 +260,7 @@ static int broker_trace_read_request(struct vk_session *s, int fd, uint8_t *requ
         uint32_t bytes, uint32_t op) {
     struct dd_ft_id trace = {0}; unsigned devices = 0;
     broker_trace_detailed = dd_ft_upload_detail_selected(s->trace_upload_completed);
-    if (broker_trace_detailed && dd_ft_active() && (op == MB_MEMORY_WRITE || op == MB_RENDERER_SUBMIT)) {
+    if (broker_trace_detailed && dd_ft_active() && (op == MB_MEMORY_WRITE || op == MB_SHARED_WRITE || op == MB_RENDERER_SUBMIT)) {
         for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
             if (s->logical[i].normal.enabled) { trace.scope = s->logical[i].normal.trace_scope; ++devices; }
     }
@@ -275,7 +277,7 @@ static struct dd_ft_id broker_trace_request(struct vk_session *s, uint32_t op,
     for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i) {
         struct native_device *d = &s->logical[i];
         if (!d->normal.enabled || d->id != mb_get_u32(request)) continue;
-        if (op == MB_MEMORY_WRITE && bytes >= 20) {
+        if ((op == MB_MEMORY_WRITE && bytes >= 20) || (op == MB_SHARED_WRITE && bytes == 32)) {
             id.scope = d->normal.trace_scope; *object = mb_get_u32(request+4); *value = mb_get_u64(request+8);
         } else if (op == MB_RENDERER_SUBMIT && bytes == 28) {
             id.scope = d->normal.trace_scope; id.fence = mb_get_u32(request+12);
@@ -297,7 +299,7 @@ static void serve(int fd) {
         uint32_t request_bytes = mb_get_u32(header + 12), bytes = MB_PREFIX_BYTES;
         uint32_t status = MB_PROTOCOL_ERROR, count = 0;
         VkResult result = VK_SUCCESS;
-        int finish = 0;
+        int finish = 0, reply_fd = -1;
         struct dd_ft_id trace_id = {0}; uint64_t trace_object = 0, trace_value = 0;
         struct native_device *measured = NULL;
         for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i)
@@ -317,6 +319,11 @@ static void serve(int fd) {
                    (s->wire_version && version != s->wire_version) ||
                    (request_bytes && broker_trace_read_request(s, fd, request, request_bytes, op))) {
             finish = 1;
+        } else if (version == MB_RENDERER_VERSION && op == MB_SHARED_PROBE && !request_bytes && !s->library) {
+            mb_put_u32(payload+MB_PREFIX_BYTES,MB_SHARED_VERSION);
+            mb_put_u32(payload+MB_PREFIX_BYTES+4,MB_SHARED_MAX_BYTES);
+            mb_put_u32(payload+MB_PREFIX_BYTES+8,MB_SHARED_MAX_REGIONS);
+            bytes+=12; count=1; status=MB_OK; finish=1;
         } else if (version >= MB_CAP_VERSION && op == MB_GLOBAL && !request_bytes && !s->library) {
             void *library = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
             uint32_t api = 0;
@@ -402,6 +409,11 @@ static void serve(int fd) {
             uint32_t extra = 0;
             status = native_normal_command(s, op, request, request_bytes, payload + MB_PREFIX_BYTES, &extra, &count, &result);
             if (status == MB_OK) bytes += extra;
+        } else if (version == MB_RENDERER_VERSION && op >= MB_SHARED_REGISTER && op <= MB_SHARED_DROP && s->instance && s->listed) {
+            trace_id=broker_trace_request(s,op,request,request_bytes,&trace_object,&trace_value);
+            if(trace_id.scope) dd_ft_event(DD_FT_BROKER_DISPATCH_BEGIN,trace_id,trace_object,trace_value,0,1);
+            status=native_shared_command(s,op,request,request_bytes,&reply_fd,&result);
+            if(trace_id.scope) dd_ft_event(DD_FT_BROKER_DISPATCH_END,trace_id,trace_object,trace_value,result,1);
         } else if (op == MB_DESTROY && !request_bytes && s->instance) {
             if (!close_session(s)) result = VK_TIMEOUT;
             status = MB_OK; finish = 1;
@@ -420,9 +432,12 @@ static void serve(int fd) {
         int verbose = 1;
         for (unsigned i = 0; i < MB_MAX_LOGICAL_DEVICES; ++i) if ((s->logical[i].session.enabled || s->logical[i].normal.enabled) && !native_verbose(&s->logical[i])) verbose = 0;
         if (verbose || status != MB_OK || result != VK_SUCCESS) LOG("query RPC opcode=%u status=%u VkResult=%d count=%u", op, status, (int)result, count);
-        if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes)) {
+        if (mb_write(fd, header, sizeof(header)) || mb_write(fd, payload, bytes) ||
+            (reply_fd>=0 && mb_shared_send_fd(fd,reply_fd))) {
+            if(reply_fd>=0) close(reply_fd);
             ERROR("write response: %s", strerror(errno)); break;
         }
+        if(reply_fd>=0) close(reply_fd);
         if (trace_id.scope) dd_ft_event(DD_FT_BROKER_REPLY_END, trace_id, trace_object, trace_value, result, 1);
         /* Diagnostic counters only. Count after the complete request/reply set
          * so changing ordinal never half-samples the just-completed operation. */
@@ -431,6 +446,11 @@ static void serve(int fd) {
             ++s->trace_upload_completed;
         if (finish) break;
     }
+    /* No GPU ever reads these CPU source mappings. All broker copies execute
+     * synchronously on this worker; disconnect can release them even if native
+     * GPU allocations must be quarantined by the existing drain policy. */
+    for(unsigned i=0;i<MB_MAX_LOGICAL_DEVICES;++i)
+        for(unsigned j=0;j<MB_SUBMIT_MAX_OBJECTS;++j) mb_shared_release(&s->logical[i].interop.memories[j].shared);
     if (close_session(s)) free(s);
     else {
         pthread_mutex_lock(&lock); s->quarantined_next = quarantined_sessions;

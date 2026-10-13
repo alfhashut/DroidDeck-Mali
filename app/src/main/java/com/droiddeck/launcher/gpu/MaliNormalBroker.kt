@@ -1,6 +1,7 @@
 package com.droiddeck.launcher.gpu
 
 import android.content.Context
+import android.util.Log
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.SystemClock
@@ -82,7 +83,10 @@ object MaliNormalBroker {
             val elf = library.inputStream().use { input -> ByteArray(20).also { check(input.read(it) == it.size) } }
             check(elf[0] == 0x7f.toByte() && elf[1] == 'E'.code.toByte() && elf[2] == 'L'.code.toByte() && elf[3] == 'F'.code.toByte() &&
                 elf[4] == 2.toByte() && elf[5] == 1.toByte() && elf[18] == 0xb7.toByte() && elf[19] == 0.toByte()) { "Mali proxy asset is not an AArch64 ELF library" }
-            return MaliSessionSelection.environment(manifest.path, socket)
+            val sharedStaging = File(LinuxRuntime.debugLogDir(), "shared-staging.enabled").isFile
+            Log.i("MaliNormalBroker", "Development CPU shared staging: ${if (sharedStaging) "enabled" else "disabled"}; bulk fallback retained")
+            return MaliSessionSelection.environment(manifest.path, socket) +
+                "MALI_VULKAN_SHARED_STAGING=${if (sharedStaging) "1" else "0"}"
         } catch (error: Throwable) {
             runCatching { SystemVulkanBroker.stopNormal() }.exceptionOrNull()?.let { error.addSuppressed(it) }
             throw error

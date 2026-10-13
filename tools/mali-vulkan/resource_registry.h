@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "upload_ring.h"
+#include "shared_staging_types.h"
 enum proxy_resource_kind { PROXY_POOL, PROXY_COMMAND, PROXY_EVENT, PROXY_FENCE, PROXY_BUFFER, PROXY_MEMORY, PROXY_IMAGE, PROXY_AHB, PROXY_SYNC, PROXY_SEMAPHORE, PROXY_VIEW, PROXY_SAMPLER, PROXY_SET_LAYOUT, PROXY_PIPELINE_LAYOUT, PROXY_DESCRIPTOR_POOL, PROXY_DESCRIPTOR_SET, PROXY_SHADER, PROXY_PIPELINE };
 struct proxy_resource {
     VK_LOADER_DATA loader;
@@ -21,6 +22,7 @@ struct proxy_resource {
     atomic_int live;
     uint8_t *mirror;
     uint64_t allocation, map_offset, map_size;
+    struct mb_shared_region shared; /* mirror aliases shared.map when registered */
     /* Explicit normal staging opt-in; ordinary coherent mappings are unchanged. */
     uint32_t staging_managed, staging_command;
     /* Explicit ring opt-in; allocated only for the one known compositor map. */
@@ -89,9 +91,13 @@ static inline void proxy_registry_retire_children(struct proxy_registry *r,
         if (child->kind == child_kind && child->pool == o->id) proxy_registry_retire(r, child);
     }
 }
+static inline void proxy_mirror_release(struct proxy_resource *o) {
+    if (o->shared.map) mb_shared_release(&o->shared); else free(o->mirror);
+    o->mirror = NULL;
+}
 static inline void proxy_registry_cleanup(struct proxy_registry *r) {
     for (struct proxy_resource *o = r->owned, *next; o; o = next) {
-        next = o->next; free(o->upload_ring); free(o->mirror); free(o);
+        next = o->next; free(o->upload_ring); proxy_mirror_release(o); free(o);
     }
     memset(r, 0, sizeof(*r));
 }

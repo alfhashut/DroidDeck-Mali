@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* Compile only extracted transfer/submit helpers with in-memory RPC/Vulkan stubs.
  * Native mapped-memory switch and proxy profiling wrapper are real source. */
 #include <assert.h>
@@ -8,6 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "protocol.h"
+#include "shared_staging.h"
 #include "interop_protocol.h"
 #include "renderer_protocol.h"
 #include "normal_protocol.h"
@@ -43,7 +45,7 @@ typedef void (*PFN_vkVoidFunction)(void);
 typedef struct { int sType; const void *pNext; unsigned waitSemaphoreValueCount, signalSemaphoreValueCount; const uint64_t *pSignalSemaphoreValues; } VkTimelineSemaphoreSubmitInfoKHR;
 typedef struct { int sType; const void *pNext; unsigned waitSemaphoreCount, commandBufferCount, signalSemaphoreCount; void **pCommandBuffers, **pSignalSemaphores; } VkSubmitInfo;
 typedef struct { int sType; void *memory; uint64_t offset, size; } VkMappedMemoryRange;
-struct proxy_instance { pthread_mutex_t lock; uint32_t wire_version; int fd, perf_enabled; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; uint64_t trace_upload_completed; } connection;
+struct proxy_instance { pthread_mutex_t lock; uint32_t wire_version; int fd, perf_enabled, shared_enabled, shared_received_fd; struct dd_perf_rpc perf; struct dd_memory_profile memory_perf; uint64_t trace_upload_completed; } connection;
 typedef uintptr_t VK_LOADER_DATA;
 #include "resource_registry.h"
 struct proxy_logical { struct proxy_instance *owner; uint32_t id; struct proxy_registry registry; uint8_t *write_request, *read_reply; uint32_t write_capacity, read_capacity; uint64_t map_alignment; atomic_int submit_failed; } device;
@@ -57,8 +59,9 @@ void dd_ft_event(enum dd_ft_stage stage, struct dd_ft_id id, uint64_t object,
     (void)stage; (void)id; (void)object; (void)value; (void)status; (void)cpu;
 }
 static int broker_trace_detailed;
-struct native_memory { uint32_t id, ahb, type; uint64_t size, map_offset, map_size; void *map, *handle; } memories[3];
+struct native_memory { uint32_t id, ahb, type; uint64_t size, map_offset, map_size; void *map, *handle; struct mb_shared_region shared; } memories[4];
 struct native_interop {
+    struct native_memory *memories; int enabled;
     struct { struct { uint32_t propertyFlags; } memoryTypes[1]; } properties;
     uint64_t atom;
     void (*UnmapMemory)(void *, void *);
@@ -66,20 +69,26 @@ struct native_interop {
     VkResult (*FlushMappedMemoryRanges)(void *, unsigned, const VkMappedMemoryRange *);
     VkResult (*InvalidateMappedMemoryRanges)(void *, unsigned, const VkMappedMemoryRange *);
 };
-struct native_device { void *handle; struct native_interop interop;
+struct native_device { void *handle; uint32_t id; struct { int lost; } submit; struct native_interop interop;
     struct { int enabled; uint64_t trace_scope; } normal; } native;
 static int pending, fail_submit, fail_write, fail_read, bad_ack, bad_read, fail_alloc, disconnects;
 static uint32_t pending_memory;
 static unsigned writes, reads, submits, allocations, memory_maps, memory_unmaps;
 static uint64_t write_offsets[64];
 static uint32_t write_lengths[64];
-static int socket_transport;
+static int socket_transport, reject_registration, reject_shared_map, bad_shared_ack, fail_shared_write;
+static unsigned shared_writes, shared_registers, shared_drops;
 static struct proxy_resource *command_ptr, *semaphore_ptr;
 static struct native_memory *interop_find_memory(struct native_device *d, uint32_t id) {
-    (void)d; for (unsigned i = 0; i < 3; ++i) if (memories[i].id == id && id) return &memories[i]; return NULL;
+    (void)d; for (unsigned i = 0; i < 4; ++i) if (memories[i].id == id && id) return &memories[i]; return NULL;
 }
 static int interop_memory_pending(struct native_device *d, struct native_memory *m) { (void)d; return pending || pending_memory == m->id; }
 static int interop_range(uint64_t total, uint64_t offset, uint64_t size) { return size && offset <= total && size <= total - offset; }
+#define MB_MAX_LOGICAL_DEVICES 1u
+#define MB_SUBMIT_MAX_OBJECTS 4u
+struct vk_session { struct native_device *logical; };
+#include "native_shared.inc"
+
 static uint32_t native_transfer(uint32_t version, uint32_t op, const uint8_t *w, uint32_t bytes,
         uint8_t *reply, uint32_t *extra, uint32_t *count, VkResult *result) {
     uint32_t minimum = op == MB_MEMORY_MAP ? 24u : op == MB_MEMORY_UNMAP ? 8u : 20u;
@@ -107,6 +116,23 @@ static VkResult rpc_exchange(struct proxy_instance *s, uint32_t op, const uint8_
         }
         if (fail_submit) return VK_ERROR_DEVICE_LOST;
         ++submits; memset(reply, 0, MB_PREFIX_BYTES); *reply_bytes = MB_PREFIX_BYTES; return VK_SUCCESS;
+    }
+    if (op>=MB_SHARED_REGISTER && op<=MB_SHARED_DROP) {
+        if(op==MB_SHARED_REGISTER) ++shared_registers;
+        if(op==MB_SHARED_WRITE) { ++shared_writes; assert(bytes==32); if(fail_shared_write)return VK_ERROR_DEVICE_LOST; }
+        if(op==MB_SHARED_DROP) ++shared_drops;
+        struct vk_session session={&native}; VkResult result=VK_SUCCESS; int fd=-1;
+        uint32_t status;
+        if(op==MB_SHARED_REGISTER && reject_registration) { status=MB_UNSUPPORTED; result=VK_ERROR_FEATURE_NOT_PRESENT; }
+        else status=native_shared_command(&session,op,request,bytes,&fd,&result);
+        if(fd>=0) {
+            int sockets[2]; assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
+            assert(!mb_shared_send_fd(sockets[0],fd)); s->shared_received_fd=mb_shared_recv_fd(sockets[1]);
+            assert(s->shared_received_fd>=0);close(fd);close(sockets[0]);close(sockets[1]);
+        }
+        memset(reply,0,MB_PREFIX_BYTES); mb_put_u32(reply,status);mb_put_u32(reply+4,(uint32_t)result);
+        if(op==MB_SHARED_WRITE && bad_shared_ack)mb_put_u32(reply+8,1);
+        *reply_bytes=MB_PREFIX_BYTES; return status==MB_OK ? result : status==MB_UNSUPPORTED ? VK_ERROR_FEATURE_NOT_PRESENT : VK_ERROR_INITIALIZATION_FAILED;
     }
     assert(op == MB_MEMORY_WRITE || op == MB_MEMORY_READ || op == MB_MEMORY_MAP || op == MB_MEMORY_UNMAP);
     if (op == MB_MEMORY_MAP) ++memory_maps;
@@ -168,12 +194,18 @@ static VkResult renderer_rpc(struct proxy_logical *d, uint32_t op, const uint8_t
 static void submit_void_error(struct proxy_logical *d, const char *name, VkResult result) {
     (void)name; if (result != VK_SUCCESS) atomic_store(&d->submit_failed, result);
 }
+static void *test_shared_map_writer(int fd, uint64_t bytes, size_t align) {
+    return reject_shared_map ? NULL : mb_shared_map_writer(fd,bytes,align);
+}
+#define mb_shared_map_writer test_shared_map_writer
 #include "mapping.inc"
+#undef mb_shared_map_writer
 #include "submit.inc"
 #include "device_dispatch.inc"
 #include "cleanup.inc"
 static void setup(uint32_t version) {
     connection.wire_version = version; connection.perf_enabled = 1; assert(!pthread_mutex_init(&connection.lock, NULL));
+    native.id=1;native.handle=&native;native.interop.enabled=1;native.interop.memories=memories;
     device.owner = &connection; device.id = 1; queue.owner = &device; queue.id = 1;
     native.interop.properties.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     command_ptr = calloc(1, sizeof(*command_ptr)); semaphore_ptr = calloc(1, sizeof(*semaphore_ptr));
@@ -202,7 +234,7 @@ static void finish(void) {
     proxy_free_resources(&device); assert(!device.registry.owned && !device.write_request && !device.write_capacity);
     assert(!device.read_reply && !device.read_capacity);
     proxy_free_resources(&device); // Repeated cleanup also leaves no scratch buffer.
-    for (unsigned i = 0; i < 3; ++i) free(memories[i].handle ? memories[i].handle : memories[i].map);
+    for (unsigned i = 0; i < 4; ++i) { mb_shared_release(&memories[i].shared); free(memories[i].handle ? memories[i].handle : memories[i].map); }
     assert(!pthread_mutex_destroy(&connection.lock));
 }
 static void bulk(void) {
@@ -225,6 +257,124 @@ static struct proxy_resource *large_staging(uint64_t size) {
     m->allocation = m->map_size; memories[0].size = m->allocation;
     assert(proxy_DroidDeckStagingMALI(&device, m, NULL) == VK_SUCCESS);
     return m;
+}
+static VkResult shared_native_map(void *d, void *handle, uint64_t offset, uint64_t size, unsigned flags, void **out) {
+    (void)d; assert(!offset && !flags);
+    for(unsigned i=0;i<4;++i) if(memories[i].handle==handle) { assert(size==memories[i].size);*out=handle;return VK_SUCCESS; }
+    assert(0);return VK_ERROR_MEMORY_MAP_FAILED;
+}
+static void shared_native_unmap(void *d, void *handle) { (void)d;(void)handle;assert(!pending_memory); }
+static void shared_setup(void) {
+    setup(7);connection.shared_enabled=1;native.normal.enabled=1;
+    native.interop.properties.memoryTypes[0].propertyFlags=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    native.interop.MapMemory=shared_native_map; native.interop.UnmapMemory=shared_native_unmap;
+}
+static struct proxy_resource *shared_mapping(unsigned index, uint64_t size) {
+    struct proxy_resource *m=mapping(index,size,0);
+    m->allocation=size;memories[index].size=size;memories[index].handle=memories[index].map;memories[index].map=NULL;
+    free(m->mirror);m->mirror=NULL;
+    void *out=NULL;assert(proxy_DroidDeckMapStagingMALI(&device,m,&out)==VK_SUCCESS && out==m->mirror && m->staging_managed);
+    return m;
+}
+static void shared_direct(void) {
+    shared_setup();struct proxy_resource *m=shared_mapping(0,4u*1024u*1024u);
+    assert(shared_registers==1 && m->mirror==m->shared.map && memories[0].shared.map && m->mirror!=memories[0].shared.map);
+    for(unsigned frame=1;frame<=20;++frame) {
+        memset(m->mirror,frame,(size_t)m->map_size);
+        assert(proxy_DroidDeckStagingMALI(&device,m,command_ptr)==VK_SUCCESS);
+        assert(submit()==VK_SUCCESS && shared_writes==frame && submits==frame && !writes);
+        assert(memories[0].shared.sequence==frame && m->shared.sequence==frame);
+        assert(!memcmp(m->mirror,memories[0].map,(size_t)m->map_size));
+    }
+    assert(!device.write_request && !connection.perf.upload_bytes && shared_registers==1);
+    proxy_UnmapMemory(&device,m);
+    assert(!m->mirror && !m->shared.map && !memories[0].shared.map && memory_unmaps==1);
+    finish();
+}
+static void shared_fallback(void) {
+    shared_setup(); reject_registration=1;struct proxy_resource *m=shared_mapping(0,4u*1024u*1024u);
+    assert(!m->shared.map && !memories[0].shared.map);
+    assert(proxy_DroidDeckStagingMALI(&device,m,command_ptr)==VK_SUCCESS);
+    assert(submit()==VK_SUCCESS && writes==2 && !shared_writes);
+    finish();
+}
+static void shared_map_failure(void) {
+    shared_setup(); reject_shared_map=1;struct proxy_resource *m=shared_mapping(0,230400);
+    assert(!m->shared.map && !memories[0].shared.map && shared_drops==1);
+    assert(proxy_DroidDeckStagingMALI(&device,m,command_ptr)==VK_SUCCESS);
+    assert(submit()==VK_SUCCESS && writes==1 && !shared_writes);finish();
+}
+static void shared_cap(void) {
+    shared_setup();for(unsigned i=0;i<4;++i) {
+        struct proxy_resource *m=shared_mapping(i,230400);
+        assert((m->shared.map!=NULL)==(i<3));
+        memset(m->mirror,17+i,(size_t)m->map_size);
+        assert(proxy_DroidDeckStagingMALI(&device,m,command_ptr)==VK_SUCCESS);
+    }
+    assert(submit()==VK_SUCCESS && shared_writes==3 && writes==1 && submits==1);
+    finish();
+}
+static void shared_failure(void) {
+    shared_setup();struct proxy_resource *m=shared_mapping(0,230400);
+    memset(m->mirror,91,(size_t)m->map_size);
+    assert(proxy_DroidDeckStagingMALI(&device,m,command_ptr)==VK_SUCCESS);
+    fail_shared_write=1;assert(submit()==VK_ERROR_DEVICE_LOST && !writes && !submits);
+    assert(m->staging_command && shared_writes==1);finish();
+}
+static void shared_bad_ack(void) {
+    shared_setup();struct proxy_resource *m=shared_mapping(0,230400);
+    assert(proxy_DroidDeckStagingMALI(&device,m,command_ptr)==VK_SUCCESS);
+    bad_shared_ack=1;assert(submit()==VK_ERROR_INITIALIZATION_FAILED && !writes && !submits && disconnects==1);
+    assert(m->staging_command);finish();
+}
+static void shared_bounds(void) {
+    shared_setup();struct proxy_resource *m=shared_mapping(0,230400);
+    struct vk_session session={&native};uint8_t w[32]={0};int fd=-1;VkResult result=VK_SUCCESS;
+    mb_put_u32(w,device.id);mb_put_u32(w+4,m->id);mb_put_u64(w+16,1);mb_put_u64(w+24,1);
+#define REJECT_SHARED() assert(native_shared_command(&session,MB_SHARED_WRITE,w,32,&fd,&result)==MB_PROTOCOL_ERROR)
+    REJECT_SHARED(); // no release-published sequence
+    __atomic_store_n(mb_shared_sequence(m->shared.map,m->shared.bytes),1,__ATOMIC_RELEASE);
+    mb_put_u64(w+8,UINT64_MAX);REJECT_SHARED();
+    mb_put_u64(w+8,230399);mb_put_u64(w+16,2);REJECT_SHARED();
+    mb_put_u64(w+8,0);mb_put_u64(w+16,0);REJECT_SHARED();
+    mb_put_u64(w+16,1);pending_memory=m->id;REJECT_SHARED();pending_memory=0;
+    assert(native_shared_command(&session,MB_SHARED_WRITE,w,31,&fd,&result)==MB_PROTOCOL_ERROR);
+    assert(native_shared_command(&session,MB_SHARED_WRITE,w,32,&fd,&result)==MB_OK);
+    REJECT_SHARED(); // duplicate/out-of-order generation
+    assert(!submits && !writes);
+#undef REJECT_SHARED
+    finish();
+}
+static void shared_restart(void) {
+    shared_setup();struct proxy_resource *m=shared_mapping(0,230400);
+    for(unsigned i=0;i<50;++i) {
+        memset(m->mirror,11+i,(size_t)m->map_size);
+        proxy_UnmapMemory(&device,m);
+        assert(!m->shared.map && !memories[0].shared.map && !m->mirror);
+        void *out=NULL;assert(proxy_DroidDeckMapStagingMALI(&device,m,&out)==VK_SUCCESS);
+        assert(out==m->shared.map && !m->shared.sequence && !memories[0].shared.sequence);
+    }
+    assert(shared_registers==51 && memory_unmaps==50);finish();
+}
+static void shared_ranges(void) {
+    shared_setup();struct proxy_resource *m=shared_mapping(0,230400);
+    memset(m->mirror,0x57,(size_t)m->map_size);
+    const uint64_t offsets[]={7,230399}, sizes[]={19,1};
+    for(unsigned i=0;i<2;++i) {
+        assert(interop_copy_mapping(m,offsets[i],sizes[i],1)==VK_SUCCESS);
+        assert(!memcmp(m->mirror+offsets[i],(uint8_t *)memories[0].map+offsets[i],(size_t)sizes[i]));
+    }
+    uint8_t *native_map=memories[0].map;
+    assert(!native_map[0] && !native_map[6] && !native_map[26] && !native_map[230398]);
+    assert(shared_writes==2 && !writes && !submits && memories[0].shared.sequence==2);
+    finish();
+}
+static void shared_oversized(void) {
+    shared_setup();struct proxy_resource *m=shared_mapping(0,MB_SHARED_MAX_BYTES+1u);
+    assert(!m->shared.map && !shared_registers);
+    assert(proxy_DroidDeckStagingMALI(&device,m,command_ptr)==VK_SUCCESS);
+    assert(submit()==VK_SUCCESS && writes==9 && !shared_writes && submits==1);
+    assert(!memcmp(m->mirror,memories[0].map,(size_t)m->map_size));finish();
 }
 static void staging_bulk(void) {
     struct proxy_resource *m = large_staging(4u * 1024u * 1024u);
@@ -829,6 +979,16 @@ int main(int argc, char **argv) {
     (void)proxy_trace_read; (void)proxy_trace_write; (void)proxy_DroidDeckFrameTraceMALI;
     assert(argc == 2);
     if (!strcmp(argv[1], "bulk")) bulk();
+    else if (!strcmp(argv[1], "shared_direct")) shared_direct();
+    else if (!strcmp(argv[1], "shared_fallback")) shared_fallback();
+    else if (!strcmp(argv[1], "shared_map_failure")) shared_map_failure();
+    else if (!strcmp(argv[1], "shared_cap")) shared_cap();
+    else if (!strcmp(argv[1], "shared_failure")) shared_failure();
+    else if (!strcmp(argv[1], "shared_bad_ack")) shared_bad_ack();
+    else if (!strcmp(argv[1], "shared_bounds")) shared_bounds();
+    else if (!strcmp(argv[1], "shared_restart")) shared_restart();
+    else if (!strcmp(argv[1], "shared_ranges")) shared_ranges();
+    else if (!strcmp(argv[1], "shared_oversized")) shared_oversized();
     else if (!strcmp(argv[1], "staging_bulk")) staging_bulk();
     else if (!strcmp(argv[1], "staging_bulk_errors")) staging_bulk_errors();
     else if (!strcmp(argv[1], "staging_bulk_bounds")) staging_bulk_bounds();
