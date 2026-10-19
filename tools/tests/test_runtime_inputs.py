@@ -45,6 +45,46 @@ class RuntimeInputsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'libproot.so'):
             runtime.record(self.root)
 
+    def test_missing_mali_assets_cannot_be_attested(self):
+        for name in runtime.MALI_ASSETS:
+            with self.subTest(asset=name):
+                path = self.root / 'app/src/main/assets/mali-vulkan' / name
+                content = path.read_bytes()
+                path.unlink()
+                try:
+                    with self.assertRaisesRegex(ValueError, name):
+                        runtime.record(self.root)
+                finally:
+                    path.write_bytes(content)
+
+    def test_changed_mali_contract_rejects_old_outputs(self):
+        for name in ['tools/mali-vulkan/protocol.h', 'app/src/main/cpp/malivulkan/interop_commands.h']:
+            with self.subTest(source=name):
+                path = self.root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('original protocol')
+                runtime.record(self.root)
+                path.write_text('changed protocol')
+                with self.assertRaisesRegex(ValueError, 'sources changed'):
+                    runtime.verify(self.root)
+
+    def test_missing_or_stale_mali_payload_in_apk_is_rejected(self):
+        runtime.record(self.root)
+        data = runtime.verify(self.root)
+        apk = self.root / 'mali.apk'
+        for asset in runtime.MALI_ASSETS:
+            target = 'assets/mali-vulkan/' + asset
+            for mode in ['missing', 'stale']:
+                with self.subTest(asset=asset, mode=mode):
+                    with ZipFile(apk, 'w') as package:
+                        for name, output in data['outputs'].items():
+                            if name == target and mode == 'missing':
+                                continue
+                            content = b'stale' if name == target else (self.root / output['path']).read_bytes()
+                            package.writestr(name, content)
+                    with self.assertRaisesRegex(ValueError, target):
+                        runtime.check_apk(apk, self.root)
+
     def test_base_audio_without_compiled_sinks_is_rejected(self):
         self.audio(['pactl'])
         with self.assertRaisesRegex(ValueError, 'module-aaudio-sink'):

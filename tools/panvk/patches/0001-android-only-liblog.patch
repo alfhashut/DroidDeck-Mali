@@ -1,0 +1,15 @@
+--- a/meson.build
++++ b/meson.build
+@@ -18,6 +18,8 @@
+ )
+-add_project_link_arguments(
+-  '-llog',
+-  language : ['c', 'cpp'],
+-)
++if host_machine.system() == 'android'
++  add_project_link_arguments(
++    '-llog',
++    language : ['c', 'cpp'],
++  )
++endif
+ project_version = meson.project_version()

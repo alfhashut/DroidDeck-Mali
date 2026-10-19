@@ -14,14 +14,17 @@ ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = Path('app/build/runtime-inputs.json')
 SOURCE_PATHS = ['app/build.gradle', 'app/src/main/cpp/fakeinput_steam.cpp', 'app/src/main/assets/pulseaudio.tzst',
                 'tools/linuxfs', 'tools/proot', 'tools/aaudio-sink', 'tools/directaudio',
-                'tools/gamescope/release.env', 'tools/droiddeck-esync/release.env',
+                'tools/gamescope', 'tools/droiddeck-esync/release.env',
                 'tools/mangoapp', 'tools/msitools', 'tools/comet', 'tools/build_local.sh',
                 'tools/release/runtime_inputs.py', 'app/src/main/assets/desktop-removal',
                 'tools/quest', 'tools/vr/src', 'tools/vr/driver_droiddeck', 'tools/vr/layer', 'tools/vr/build.sh',
                 'app/src/main/cpp/waylandcomp/src/headpose_shm.h',
                 'app/src/main/cpp/waylandcomp/src/spatialpose_shm.h',
                 'app/src/main/cpp/adrenotools/src/hook/kgsl.h',
+                'app/src/main/cpp/CMakeLists.txt', 'app/src/main/cpp/malivulkan', 'tools/mali-vulkan',
                 'app/src/main/assets/graphics_driver/adrenotools-turnip25.1.0.tzst']
+MALI_ASSETS = ('broker_probe', 'libdroiddeck_mali_proxy.so', 'mali_proxy_icd.json',
+               'vulkan_loader_test', 'capability_inventory')
 
 
 def digest(path):
@@ -45,7 +48,7 @@ def sources(root):
 
 def outputs(root):
     result = {}
-    for tree in ['linuxfs', 'directaudio', 'droiddeck-esync', 'desktop-removal']:
+    for tree in ['linuxfs', 'directaudio', 'droiddeck-esync', 'desktop-removal', 'mali-vulkan']:
         base = root / 'app/src/main/assets' / tree
         for path in base.rglob('*'):
             if path.is_file() and not any(part.startswith('.') for part in path.relative_to(base).parts):
@@ -63,6 +66,7 @@ def outputs(root):
 
 def required():
     paths = ['assets/graphics_driver/adrenotools-turnip25.1.0-quest1.tzst']
+    paths += ['assets/mali-vulkan/' + name for name in MALI_ASSETS]
     paths += [f'assets/graphics_driver/adrenotools-{name}.tzst'
               for name in ['turnip26.3.0-a6xx', 'turnip26.3.0-quest2']]
     paths += ['assets/linuxfs/' + name for name in ['libfakeinput.so', 'libblsession.so',

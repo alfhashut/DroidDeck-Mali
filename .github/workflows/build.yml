@@ -3,7 +3,7 @@ run-name: ${{ github.event_name == 'pull_request' && format('building pr {0} on 
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, mali-0.5-port ]
     paths-ignore:
       - '**/*.md'
       - 'LICENSE'
@@ -34,6 +34,8 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      GAMESCOPE_FROM_SOURCE: 'false'
     outputs:
       variants: ${{ steps.variants.outputs.list }}
     steps:
@@ -184,7 +186,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: app/src/main/assets/linuxfs
-          key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ hashFiles('app/src/main/cpp/fakeinput_steam.cpp', 'app/src/main/cpp/adrenotools/src/hook/kgsl.h', 'tools/quest/*', 'tools/linuxfs/preload/*.c', 'tools/linuxfs/build-x86-preloads.sh', 'tools/linuxfs/fex/*', 'tools/linuxfs/clipboard/*.c', 'tools/linuxfs/ssbs/*.c', 'tools/proot/fastpath/*.c', 'tools/linuxfs/overlay/usr/local/bin/*', 'tools/linuxfs/overlay/usr/bin/**', 'tools/linuxfs/desktop/*', 'tools/gamescope/release.env', 'tools/wlroots/release.env', 'tools/linuxfs/uruntime.env', 'tools/linuxfs/licenses/*', 'tools/mangoapp/*', 'tools/msitools/**', 'tools/comet/**', 'tools/linuxfs/debian-image.env', 'tools/vr/**') }}
+          key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ env.GAMESCOPE_FROM_SOURCE }}-${{ hashFiles('app/src/main/cpp/fakeinput_steam.cpp', 'app/src/main/cpp/adrenotools/src/hook/kgsl.h', 'tools/quest/*', 'tools/linuxfs/preload/*.c', 'tools/linuxfs/build-x86-preloads.sh', 'tools/linuxfs/fex/*', 'tools/linuxfs/clipboard/*.c', 'tools/linuxfs/ssbs/*.c', 'tools/proot/fastpath/*.c', 'tools/linuxfs/overlay/usr/local/bin/*', 'tools/linuxfs/overlay/usr/bin/**', 'tools/linuxfs/desktop/*', 'tools/gamescope/release.env', 'tools/gamescope/patches/*.patch', 'tools/gamescope/build-in-arch.sh', 'tools/gamescope/runtime-sonames.txt', 'tools/wlroots/release.env', 'tools/linuxfs/uruntime.env', 'tools/linuxfs/licenses/*', 'tools/mangoapp/*', 'tools/msitools/**', 'tools/comet/**', 'tools/linuxfs/debian-image.env', 'tools/vr/**') }}
 
       - name: Build libfakeinput.so and libblsession.so (glibc aarch64)
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -223,7 +225,7 @@ jobs:
           for f in tools/linuxfs/overlay/usr/bin/* tools/linuxfs/overlay/usr/bin/steamos-polkit-helpers/*; do
             [ -f "$f" ] && install -Dm644 "$f" "$D/${f#tools/linuxfs/overlay/}"
           done
-          if [ -f tools/gamescope/release.env ]; then
+          if [ "$GAMESCOPE_FROM_SOURCE" != true ] && [ -f tools/gamescope/release.env ]; then
             . tools/gamescope/release.env
             gh release download "${GAMESCOPE_TAG}" -R "${GAMESCOPE_REPO:-${GITHUB_REPOSITORY}}" -p gamescope.tzst -O gamescope.tzst
             echo "${GAMESCOPE_SHA256}  gamescope.tzst" | sha256sum -c -
@@ -283,6 +285,30 @@ jobs:
           install -Dm644 tools/linuxfs/desktop/kwin_wayland_wrapper "$D/usr/local/bin/kwin_wayland_wrapper"
           install -Dm644 tools/linuxfs/desktop/firefox-droiddeck.js "$D/usr/lib/firefox/defaults/pref/droiddeck.js"
           ls -lR "$D"
+
+      - name: Download same-run Gamescope component
+        if: env.GAMESCOPE_FROM_SOURCE == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: gamescope-patched
+          path: gamescope-component
+
+      - name: Overlay same-run Gamescope component
+        if: env.GAMESCOPE_FROM_SOURCE == 'true'
+        run: |
+          set -euo pipefail
+          (cd gamescope-component && sha256sum -c gamescope.tzst.sha256)
+          tar --use-compress-program=unzstd -xf gamescope-component/gamescope.tzst -C app/src/main/assets/linuxfs
+          test -f app/src/main/assets/linuxfs/usr/local/bin/gamescope
+
+      - name: Build isolated Mali Vulkan assets and check contracts
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross libvulkan-dev libvulkan1 python3-yaml >/dev/null
+          tools/mali-vulkan/build-probe.sh
+          tools/mali-vulkan/build-icd.sh
+          python3 -B tools/mali-vulkan/run_phase1_tests.py --with-loader
 
       - name: Fetch the Debian image the preloads build in
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -459,7 +485,7 @@ jobs:
           path: |
             app/.cxx
             app/build/intermediates/cxx
-          key: cxx-${{ env.NDK_VERSION }}-${{ hashFiles('app/src/main/cpp/**', 'tools/vr/src/xr_*.h') }}
+          key: cxx-${{ env.NDK_VERSION }}-${{ hashFiles('app/src/main/cpp/**', 'tools/vr/src/xr_*.h', 'tools/mali-vulkan/**') }}
           restore-keys: |
             cxx-${{ env.NDK_VERSION }}-
 

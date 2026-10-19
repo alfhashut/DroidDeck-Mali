@@ -162,6 +162,32 @@ if restore_step x86-preloads "${x86_key}" "${linuxfs_dir}"; then :; else
     save_step x86-preloads "${x86_key}" "${x86_stage}"
 fi
 
+mali_headers="${VK_INCLUDE:-}"
+if [[ -z "${mali_headers}" ]]; then
+    for ndk_host in "${NDK}"/toolchains/llvm/prebuilt/*; do
+        if [[ -f "${ndk_host}/sysroot/usr/include/vulkan/vk_icd.h" ]]; then
+            mali_headers="${ndk_host}/sysroot/usr/include"
+            break
+        fi
+    done
+fi
+if [[ ! -f "${mali_headers}/vulkan/vk_icd.h" ]]; then
+    echo "Mali proxy build needs Vulkan headers; set VK_INCLUDE to their include directory." >&2
+    exit 1
+fi
+mkdir -p "${staging_dir}/mali-headers"
+cp -R "${mali_headers}/vulkan" "${staging_dir}/mali-headers/"
+if [[ -d "${mali_headers}/vk_video" ]]; then
+    cp -R "${mali_headers}/vk_video" "${staging_dir}/mali-headers/"
+fi
+docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
+    -v "${repo_root}:/src" -v "${staging_dir}/mali-headers:/mali-headers:ro" \
+    -w /src -e VULKAN_HEADERS=/mali-headers "${image_name}" bash -c '
+        set -euo pipefail
+        tools/mali-vulkan/build-probe.sh
+        tools/mali-vulkan/build-icd.sh
+    '
+
 vr_out="${linuxfs_dir}/usr/local/lib/droiddeck-vr"
 vr_key=$(inputs_hash "${image_id} ${ndk_version} ${VK_INCLUDE:-}" tools/vr app/src/main/cpp/waylandcomp/generated/xdg-shell-protocol.c)
 if ! restore_step vr "${vr_key}" "${vr_out}"; then

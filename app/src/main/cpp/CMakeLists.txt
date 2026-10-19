@@ -37,6 +37,16 @@ target_link_libraries(sdnative log)
 add_library(deviceinfo SHARED deviceinfo/vkinfo.c)
 target_link_libraries(deviceinfo dl)
 
+add_library(maliahb SHARED malivulkan/normal_ownership.c
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/mali-vulkan/frame_trace.c")
+target_compile_features(maliahb PRIVATE c_std_11)
+target_link_libraries(maliahb android)
+
+add_library(malivulkan SHARED malivulkan/system_broker.c malivulkan/interop_consumer.c)
+target_compile_features(malivulkan PRIVATE c_std_11)
+target_include_directories(malivulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/mali-vulkan")
+target_link_libraries(malivulkan dl log android maliahb)
+
 add_library(termux SHARED termux/termux.c)
 
 # The optional proprietary SDK is supplied locally; its headers/libraries are not vendored.

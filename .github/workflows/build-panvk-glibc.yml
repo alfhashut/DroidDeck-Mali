@@ -1,0 +1,95 @@
+name: Build isolated PanVK glibc ARM64 probe artifact
+
+# C8B.1 B0 only: no APK integration, production staging, release, or automatic builds.
+'on':
+  workflow_dispatch:
+    inputs:
+      artifact_mode:
+        description: Temporary raw phone-test output or strict portable package
+        type: choice
+        default: raw-test
+        options:
+          - raw-test
+          - audited-package
+
+permissions:
+  contents: read
+
+jobs:
+  panvk:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    # Native ARM64 container, no cross compiler or emulation. Containers run only in CI.
+    container: debian:13-slim
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LC_ALL: C.UTF-8
+      PANVK_ARTIFACT: ${{ inputs.artifact_mode == 'audited-package' && 'panvk-glibc-arm64' || 'droiddeck-panvk-raw-test-arm64' }}
+    steps:
+      - name: Install native build dependencies
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential binutils bison flex cmake meson ninja-build pkg-config \
+            python3 python3-mako python3-packaging python3-yaml \
+            llvm-19-dev clang-19 libclang-cpp19-dev libclang-19-dev \
+            libclc-19 libclc-19-dev libllvmspirvlib-19-dev spirv-tools \
+            libdrm-dev libelf-dev zlib1g-dev libx11-dev libx11-xcb-dev \
+            libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev libxcb-shm0-dev \
+            libxcb-sync-dev libxcb-xfixes0-dev libxshmfence-dev libxrandr-dev
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check artifact and probe contracts without a GPU
+        run: |
+          python3 -B tools/mali-vulkan/run_phase1_tests.py --panvk-only
+      - name: Read audited source pin
+        id: source
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          pin = json.loads(Path('tools/panvk/source.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key in ('repository', 'commit'):
+                  print(f'{key}={pin[key]}', file=output)
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ steps.source.outputs.commit }}
+          path: panvk-source
+          persist-credentials: false
+      - name: Build isolated ICD and stage selected artifact (raw-test by default)
+        run: |
+          bash tools/panvk/build-glibc.sh \
+            "$GITHUB_WORKSPACE/panvk-source" "$RUNNER_TEMP/panvk-build" \
+            "$GITHUB_WORKSPACE/out/$PANVK_ARTIFACT" "${{ inputs.artifact_mode || 'raw-test' }}"
+      - name: Archive without installing into the runner or APK
+        run: |
+          set -euo pipefail
+          panvk_epoch=$(git -C panvk-source show -s --format=%ct HEAD)
+          tar --sort=name --mtime="@$panvk_epoch" --owner=0 --group=0 --numeric-owner \
+            -C out -cf - "$PANVK_ARTIFACT" | gzip -n > "out/$PANVK_ARTIFACT.tar.gz"
+          cd out
+          sha256sum "$PANVK_ARTIFACT.tar.gz" > "$PANVK_ARTIFACT.tar.gz.sha256"
+          cat "$PANVK_ARTIFACT/BUILD_INFO.txt" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PANVK_ARTIFACT }}
+          path: |
+            out/${{ env.PANVK_ARTIFACT }}.tar.gz
+            out/${{ env.PANVK_ARTIFACT }}.tar.gz.sha256
+          if-no-files-found: error
+      - name: Preserve configure failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-glibc-arm64-build-logs
+          path: ${{ runner.temp }}/panvk-build/meson-logs/
+          if-no-files-found: ignore
