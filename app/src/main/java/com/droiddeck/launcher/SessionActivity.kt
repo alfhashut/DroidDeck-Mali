@@ -1241,7 +1241,11 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (SessionState.running) SessionState.mode
         else intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM
 
+    private fun loadingMali(): Boolean = if (SessionState.running) SessionState.maliBackend
+        else loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE
+
     private fun pausedTitle(): String = when (SessionState.mode) {
+        com.droiddeck.launcher.gpu.MaliSessionSelection.MODE -> getString(R.string.session_mali_paused)
         SessionService.MODE_DESKTOP -> getString(R.string.session_desktop_paused)
         SessionService.MODE_RUN -> com.droiddeck.launcher.frontend.Library.nameForProgram(SessionState.program)
             ?.let { getString(R.string.session_named_paused, it) } ?: getString(R.string.session_program_paused)
@@ -1249,6 +1253,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun loadingTitle(): String = when (loadingMode()) {
+        com.droiddeck.launcher.gpu.MaliSessionSelection.MODE -> getString(R.string.session_starting_mali)
         SessionService.MODE_DESKTOP -> getString(R.string.session_starting_desktop)
         SessionService.MODE_RUN -> {
             val program = if (SessionState.running) SessionState.program else intent.getStringExtra(SessionService.EXTRA_PROGRAM)
@@ -1448,7 +1453,11 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val turnip = TurnipDriver(this)
         com.droiddeck.launcher.gpu.DriverSetupLog.write(this, "surface.driver-setup")
         if (!CompositorHost.isStarted) CompositorHost.displayChoice = SessionPrefs.androidDriver(this)
-        val driverId = if (CompositorHost.isStarted) null else turnip.install()
+        val maliSession = loadingMali()
+        if (!CompositorHost.isStarted) {
+            android.system.Os.setenv("DROIDDECK_MALI_NORMAL_SESSION", if (maliSession) "1" else "0", true)
+        }
+        val driverId = if (CompositorHost.isStarted || maliSession) null else turnip.install()
 
         val previous = SessionState.outputSize
         val live = if (SessionState.followScreen && !isInPictureInPictureMode)
@@ -1488,7 +1497,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 probe.maxLuminance, probe.maxAverageLuminance, probe.minLuminance,
                 probe.ratioAvailable, probe.ratio, Build.VERSION.SDK_INT,
             )
-            val wanted = SessionPrefs.hdr(this, mode)
+            val wanted = !maliSession && SessionPrefs.hdr(this, mode)
             val on = wanted && probe.reason == null
             SessionState.hdr = on
             if (on) {
@@ -1633,6 +1642,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun applyFrameGen() {
+        if (loadingMali()) {
+            WaylandCompositor.nativeSetFrameGenArmed(false, 0, 0)
+            return
+        }
         val hz = refreshHz()
         Thread({
             val problem = FrameGen.apply(this, hz)

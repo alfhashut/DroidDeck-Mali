@@ -1972,11 +1972,33 @@ class MainActivity : ComponentActivity() {
         install(release)
     }
 
+    private var selectingSessionGpu = false
+
     private fun startSession(intent: Intent, steamSession: Boolean = false): Boolean {
-        if (busy || LinuxRuntimeInstaller.isBusy()) return false
+        if (busy || LinuxRuntimeInstaller.isBusy() || SessionState.phase == SessionPhase.STOPPING) return false
         if (com.droiddeck.launcher.storage.StorageState.cleaning) {
             android.widget.Toast.makeText(this, R.string.storage_cleanup_busy, android.widget.Toast.LENGTH_SHORT).show()
             return false
+        }
+        if (!steamSession && intent.getStringExtra(SessionService.EXTRA_MODE) == SessionService.MODE_DESKTOP &&
+            !intent.hasExtra(SessionService.EXTRA_STEAM_UI)) {
+            val gpu = com.droiddeck.launcher.gpu.VulkanInfo.cachedOrNull()
+            if (gpu == null) {
+                if (selectingSessionGpu) return false
+                selectingSessionGpu = true
+                Thread({
+                    com.droiddeck.launcher.gpu.VulkanInfo.query()
+                    ui.post {
+                        selectingSessionGpu = false
+                        if (!isFinishing && !isDestroyed) startSession(intent, steamSession)
+                    }
+                }, "session-gpu-selection").start()
+                return true
+            }
+            if (com.droiddeck.launcher.gpu.MaliSessionSelection.supported(gpu)) {
+                if (!SessionState.running && SessionState.phase !in setOf(SessionPhase.IDLE, SessionPhase.FAILED)) return false
+                intent.putExtra(SessionService.EXTRA_MODE, com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
+            }
         }
         refreshPhantomStatus()
         if (steamSession && PhantomProcessLimit.blocksSteam(phantomProcessStatus)) {

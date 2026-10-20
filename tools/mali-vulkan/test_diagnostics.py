@@ -17,7 +17,8 @@ class DiagnosticBoundaryTests(unittest.TestCase):
     def test_component_smoke_rejects_wrong_status_and_missing_help_option(self):
         options = ('vk-enumerate-only', 'vk-capabilities', 'vk-create-device-test', 'vk-submit-test',
                    'vk-buffer-memory-test', 'vk-image-memory-test', 'vk-ahb-test', 'vk-ahb-present-test',
-                   'vk-gamescope-renderer-init-test', 'vk-gamescope-first-frame-test')
+                   'vk-gamescope-renderer-init-test', 'vk-gamescope-first-frame-test',
+                   'mali-session-test', 'mali-wayland-client-test', 'mali-wayland-session')
         checker = ROOT / 'tools/gamescope/check-diagnostics.sh'
         with tempfile.TemporaryDirectory(prefix='mali-diagnostic-smoke-') as directory:
             binary = Path(directory) / 'gamescope'
@@ -59,19 +60,22 @@ sys.exit(int(os.environ.get('DIAGNOSTIC_STATUS', '1')))
         exports = set(re.findall(r'Java_com_droiddeck_launcher_gpu_SystemVulkanBroker_(native\w+)\(', code))
         self.assertEqual(declarations, exports)
 
-    def test_only_diagnostic_activity_calls_the_wrapper(self):
+    def test_only_diagnostic_activity_and_normal_lease_call_the_wrapper(self):
         java = ROOT / 'app/src/main/java'
         callers = {path.relative_to(java).as_posix() for path in java.rglob('*.kt')
                    if 'SystemVulkanBroker.' in path.read_text()}
-        self.assertEqual(callers, {'com/droiddeck/launcher/gpu/SystemVulkanBrokerActivity.kt'})
+        self.assertEqual(callers, {'com/droiddeck/launcher/gpu/SystemVulkanBrokerActivity.kt',
+                                   'com/droiddeck/launcher/gpu/MaliNormalBroker.kt'})
 
     def test_preview_diagnostics_cannot_reach_persistent_or_shared_modes(self):
         wrapper = (GPU / 'SystemVulkanBroker.kt').read_text()
         activity = (GPU / 'SystemVulkanBrokerActivity.kt').read_text()
         for forbidden in ('MALI_VULKAN_NORMAL_SESSION', 'MALI_VULKAN_SESSION_TEST',
                           'MALI_VULKAN_SHARED_STAGING', '--mali-session-test',
-                          '--mali-wayland-client-test', 'startNormal', 'stopNormal', 'Panvk'):
+                          '--mali-wayland-client-test', 'Panvk'):
             self.assertNotIn(forbidden, wrapper + activity)
+        self.assertNotIn("startNormal", activity)
+        self.assertNotIn("stopNormal", activity)
 
     def test_diagnostics_use_current_runtime_logging_api(self):
         wrapper = (GPU / 'SystemVulkanBroker.kt').read_text()

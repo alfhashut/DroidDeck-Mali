@@ -28,7 +28,7 @@ _droiddeck_prepare() {
   cd \"\$srcdir/gamescope\"
   for p in \$(ls \"\$srcdir\"/*.patch | sort); do
     echo \"applying \$(basename \"\$p\")\"
-    patch -p1 --no-backup-if-mismatch < \"\$p\"
+    patch -p1 --batch --fuzz=0 --no-backup-if-mismatch < \"\$p\"
   done
 }
 if declare -f prepare >/dev/null; then

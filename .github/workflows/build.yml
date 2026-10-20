@@ -332,7 +332,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross libvulkan-dev libvulkan1 python3-yaml >/dev/null
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross libvulkan-dev libvulkan1 libwayland-dev python3-yaml >/dev/null
           tools/mali-vulkan/build-probe.sh
           tools/mali-vulkan/build-icd.sh
           python3 -B tools/mali-vulkan/run_phase1_tests.py
@@ -341,6 +341,7 @@ jobs:
           mkdir -p /tmp/gamescope-source
           tar -xzf /tmp/gamescope-source.tar.gz -C /tmp/gamescope-source
           python3 -B tools/mali-vulkan/run_phase2_tests.py --gamescope-source /tmp/gamescope-source/gamescope-3.16.29
+          python3 -B tools/mali-vulkan/run_phase3_tests.py --gamescope-source /tmp/gamescope-source/gamescope-3.16.29
 
       - name: Fetch the Debian image the preloads build in
         if: steps.preloads.outputs.cache-hit != 'true'

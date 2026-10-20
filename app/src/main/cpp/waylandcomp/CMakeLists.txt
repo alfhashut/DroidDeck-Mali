@@ -1,3 +1,10 @@
+if(NOT TARGET maliahb)
+    add_library(maliahb SHARED ../malivulkan/normal_ownership.c
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/mali-vulkan/frame_trace.c")
+    target_compile_features(maliahb PRIVATE c_std_11)
+    target_link_libraries(maliahb android)
+endif()
+
 add_library(droiddeckwayland SHARED
         src/compositor.c
         src/vk_present.c
@@ -91,6 +98,7 @@ set_target_properties(wayland-server PROPERTIES IMPORTED_LOCATION
 target_link_libraries(droiddeckwayland
         wayland-server
         adrenotools
+        maliahb
         dl
         log
         android

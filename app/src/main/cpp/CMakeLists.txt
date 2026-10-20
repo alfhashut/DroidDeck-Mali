@@ -29,6 +29,11 @@ string(SHA256 WINFG_CHAIN_HASH_FULL "${WINFG_HASH_INPUT}")
 string(SUBSTRING "${WINFG_CHAIN_HASH_FULL}" 0 12 WINFG_CHAIN_HASH)
 message(STATUS "win-fg chain: ${WINFG_UPSTREAM} (src ${WINFG_CHAIN_HASH})")
 
+add_library(maliahb SHARED malivulkan/normal_ownership.c
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/mali-vulkan/frame_trace.c")
+target_compile_features(maliahb PRIVATE c_std_11)
+target_link_libraries(maliahb android)
+
 add_subdirectory(waylandcomp)
 add_subdirectory(questxr)
 add_library(sdnative SHARED sdnative/sdnative.c)
@@ -36,11 +41,6 @@ target_link_libraries(sdnative log)
 
 add_library(deviceinfo SHARED deviceinfo/vkinfo.c)
 target_link_libraries(deviceinfo dl)
-
-add_library(maliahb SHARED malivulkan/normal_ownership.c
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/mali-vulkan/frame_trace.c")
-target_compile_features(maliahb PRIVATE c_std_11)
-target_link_libraries(maliahb android)
 
 add_library(malivulkan SHARED malivulkan/system_broker.c malivulkan/interop_consumer.c)
 target_compile_features(malivulkan PRIVATE c_std_11)

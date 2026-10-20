@@ -1,0 +1,236 @@
+# DroidDeck-Mali 0.5 port: Phase 3 normal presentation
+
+Base: Phase 2 commit `cc58bcd5` on `mali-0.5-port`.
+Reference: `mali-gpu-experiment` (`3e1d9255`), with the normal Gamescope core
+from its pre-performance/pre-Steam checkpoint `7fd567ad`.
+
+The added route is Gamescope/glibc → proxy ICD → service-owned Android/Bionic
+broker → real system Vulkan → Mali-G52 → AHardwareBuffer/SYNC_FD → the current
+DroidDeck Android compositor. It remains a single-client nested Wayland session
+with the reference interactive SHM client. It does not provide general game or
+Steam client compatibility.
+
+**Launch scope**
+
+The automatic entry is the existing non-Steam Desktop action, only for ARM vendor
+`0x13b5`, device `0x74021000`, Vulkan >= 1.1. That action selects `mali-wayland`
+on the validated device. Other GPUs retain their requested desktop route. Steam,
+Steam-desktop requests, SteamVR, game URLs and program launch requests retain 0.5
+routing. The wider redirection and Steam backend at the reference tip are deliberately
+omitted: they depend on later Xwayland/client work outside this phase.
+
+`MaliSessionSelection` uses numeric IDs, not the GPU name, and rejects query errors,
+missing fields, malformed API versions and other Mali device IDs. The broker repeats
+the hardware check against a real inventory reply before staging the proxy and
+starting the guest. Shared staging is forced to `0`; the normal shell entry rejects
+an enabled value. PanVK remains separate. No proprietary Mali library is copied.
+
+**Ownership and 0.5 adaptations**
+
+- `SystemVulkanBroker` grants an exclusive normal lease. Every diagnostic command,
+  diagnostic start and diagnostic stop rejects that lease. A failed native stop
+  retains the wrapper lease; a quarantined session prevents another normal start.
+- `MaliNormalBroker` waits for an actual connectable Android Wayland socket, then
+  performs the reference v1 inventory handshake with bounded reads. It stages the
+  existing glibc proxy/manifest atomically, uses the Phase 2 manifest validator and
+  checks the ELF architecture. Its normal transport remains wire v7 with unchanged
+  IDs, layouts, same-UID checks and disconnect cleanup from Phase 1.
+- `SessionService` uses current `LinuxRuntime.command`, persistent
+  `LinuxRuntime.prootTempDir`, `SessionFiles.stage`, `liveDir/shm`, session log folders
+  and `SessionEvents`. No runtime API, including `debugLogDir()`, is restored.
+  The ordinary session body, maintenance gate, storage handling, driver selection,
+  terminal setup, Steam/download/store/agent behavior and cleanup remain in place.
+- Startup preparation and normal teardown share `maliStartupLock`; cancellation
+  cannot finish and admit a restart while the old startup is still staging files
+  or acquiring its broker. Guest PID registration uses `stopLock` and generation
+  checks. STOPPING is published under that lock, closing the launch race.
+- Stop sends SIGTERM to the identified Gamescope descendant and allows seven
+  seconds for its real five-second Android release drain. PID start times protect
+  against reuse. Generic process cleanup follows; only then does the service stop
+  its broker. Idle/failed completion, suspend resumption, foreground/lock cleanup,
+  store teardown and newer 0.5 finalization remain through the current APIs.
+  A release timeout reports failure and retains/quarantines resources, rather than
+  declaring a buffer reusable. Backend/start-time state is cleared for restart.
+- The current compositor links the same `maliahb` shared library as the broker,
+  preventing two independent registries. `banner_ahb_v1` v3 creates an opaque-key
+  AHB-only `wl_buffer`, with zero DMA-BUF planes and all plane FDs unset. Versions
+  1/2 retain their existing behavior. Single-pixel buffers and 0.5 Quest/VR/Cardboard,
+  scene composition, presentation timing and ordinary DMA-BUF paths are retained.
+- The normal display uses system Vulkan 1.1 on the exact validated device. It
+  requests real supported extensions, advertises no DMA-BUF formats, and disables
+  unsupported HDR/frame-generation use on this route. Other devices keep the
+  current 1.3/custom-driver behavior. Existing SurfaceControl release callbacks
+  already provide the needed release fences; `sc_layer.c` needs no behavioral port.
+- The compositor rejects unpublished/retired AHB presentation before an Android
+  transaction. This adds a fail-closed check to the reference handoff. Real readable
+  release fences acknowledge ownership; error events do not. Watcher allocation
+  failure retains the buffer. Cancellation before display and actual release remain
+  distinct, and destroying a Wayland object never acknowledges Android completion.
+
+**Why each existing file changes**
+
+| File | Required change |
+| --- | --- |
+| `.github/workflows/build.yml` | Install Wayland development headers for the small release harness and run Phase 3 contracts; preserve current build/cache/overlay/runtimeAssets/validation logic. |
+| `app/src/main/cpp/CMakeLists.txt` | Define the existing shared registry before entering the compositor subdirectory. |
+| `app/src/main/cpp/waylandcomp/CMakeLists.txt` | Link `maliahb`; retain a standalone target fallback without duplicating the registry inside either consumer library. |
+| `app/src/main/cpp/waylandcomp/protocols/banner-ahb-v1.xml` | Extend the existing protocol to v3 with the opaque broker-buffer request. |
+| `app/src/main/cpp/waylandcomp/generated/banner-ahb-v1-protocol.c` | Update the generated request table, signature, type table and version for v3. |
+| `app/src/main/cpp/waylandcomp/generated/banner-ahb-v1-server-protocol.h` | Expose the matching generated server callback and since-version constant. |
+| `app/src/main/cpp/waylandcomp/src/ahb_swapchain.c` | Import the exact registry AHB, validate publication, distinguish cancellation/submission, acknowledge real release fences and retain on errors. |
+| `app/src/main/cpp/waylandcomp/src/compositor.c` | Create plane-free AHB buffers and recognize their content/fullscreen handoff while preserving current scene/Quest/single-pixel behavior. |
+| `app/src/main/cpp/waylandcomp/src/droiddeck_ext.h` | Declare the compositor's AHB-only buffer factory. |
+| `app/src/main/cpp/waylandcomp/src/vk_present.c` | Gate system-Vulkan 1.1/AHB-only behavior and real feature selection to the normal Mali display. |
+| `app/src/main/cpp/waylandcomp/src/wl_dmabuf.c` | Advertise no DMA-BUF formats for the AHB-only route. |
+| `app/src/main/java/com/droiddeck/launcher/MainActivity.kt` | Resolve the exact hardware gate for the non-Steam Desktop entry and reject launches while stopping; retain maintenance/storage/waiting logic. |
+| `app/src/main/java/com/droiddeck/launcher/SessionActivity.kt` | Use system Vulkan for Mali, preserve live backend selection on reattachment, provide Mali loading titles, and avoid unsupported HDR/framegen features. |
+| `app/src/main/java/com/droiddeck/launcher/gpu/SystemVulkanBroker.kt` | Add exclusive service leases and reject competing diagnostic commands, asset staging and teardown. |
+| `app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt` | Reuse fullscreen/Steam display preferences for the isolated normal mode. |
+| `app/src/main/java/com/droiddeck/launcher/session/SessionService.kt` | Own normal startup, guest registration, stop/drain, broker lifetime and restart state using current 0.5 APIs. |
+| `app/src/main/java/com/droiddeck/launcher/session/SessionState.kt` | Track the live Mali backend across Activity reattachment and teardown. |
+| `app/src/main/res/values/strings.xml` | Add normal Mali starting/paused labels. |
+| `tools/gamescope/PATCHES.md` | Document namespace, provenance, manual reconciliation, order and scope. |
+| `tools/gamescope/build-in-arch.sh` | Require batch/zero-fuzz application without replacing packaging, cursor tests or SONAME checks. |
+| `tools/gamescope/check-diagnostics.sh` | Verify new persistent/normal command markers and fail-closed entry smoke checks; same-run artifact validation picks these up. |
+| `tools/linuxfs/overlay/usr/local/bin/droiddeck-session` | Dispatch only explicit normal mode before ordinary setup; require broker/manifest/display and reject shared staging. All later 0.5 script behavior is unchanged. |
+| `tools/mali-vulkan/test_diagnostics.py` | Permit the now-authorized normal lease owner while keeping shell diagnostic access isolated; cover the extended component smoke checker. |
+| `tools/mali-vulkan/test_normal_launch.py` | Adapt the manifest-validator location; add actual native broker restart/socket tests and shared-staging refusal. |
+| `tools/mali-vulkan/tests/normal_android_release.c` | Execute the unpublished-presentation rejection against the actual compositor code in addition to existing real Wayland event-loop/fence tests. |
+
+The existing Phase 1 `malivulkan` ownership implementation, proxy and protocol files
+already contain the required normal implementation and remain byte-identical.
+No manifest changes, removed APIs, new broker JNI symbols, GPU detection changes,
+wlroots tree, PanVK client wiring or Steam script changes are necessary.
+
+**Gamescope reconciliation and final order**
+
+0210 ports persistent renderer/output ownership and its diagnostic clients. Its
+old `interop_test_api.h` insertion is omitted because 0204 already supplies the
+same canonical ABI. 0211 ports the pre-performance normal core, manually merging
+the touch-down guard into the current Wayland backend. Both patches are regenerated
+against the exact 0.5 stack on pristine 3.16.29. Canonical normal headers match
+Phase 1 exactly. The nested client receives no private proxy/broker environment.
+Later staging, detailed performance, upload-ring, Xwayland/Steam and frame-journal
+patches are omitted. Only ownership/error/final-cleanup accounting remains.
+
+All previous patches retain their exact contents. Application order:
+
+```text
+0002-steamcompmgr-fallback-appid-focus.patch
+0009-fix-arm64-steam-night-mode.patch
+0019-steamcompmgr-arm64-virtual-white.patch
+0020-color-p3-red-is-wide-gamut.patch
+0100-realtime-queue-and-gamepad-cursor.patch
+0101-nested-wayland-cursor-routing.patch
+0110-wayland-backend-touch.patch
+0111-wayland-pointer-warps-in-passthrough.patch
+0112-restore-iconified-game-on-resume.patch
+0114-take-override-redirect-from-mapnotify.patch
+0115-limiter-paces-per-window.patch
+0200-vulkan-enumerate-only.patch
+0201-vulkan-capabilities.patch
+0202-vulkan-create-device-test.patch
+0203-vulkan-submit-test.patch
+0204-vulkan-memory-ahb-tests.patch
+0205-vulkan-gamescope-renderer-tests.patch
+0206-vulkan-blit-input-proof.patch
+0210-mali-persistent-session.patch
+0211-mali-normal-wayland-session.patch
+```
+
+**Lightweight results**
+
+- Phase 3: 26 passed. Real host-compiled native ownership/release code, a real
+  Wayland event loop with eventfd release fences, real proxy/loader plus mock
+  Android Vulkan, normal v7 protocol rejection and parent ownership, actual native
+  broker restart/socket/blocked-shutdown checks, normal launch script execution,
+  service ownership/source contracts, full patch application and output-pool execution.
+- Phase 2 regressions: 63 broker/proxy/diagnostic tests and 25 diagnostic translation-unit
+  tests passed against the full new stack. Only small diagnostic units were compiled.
+- Phase 1 regressions: 101 Mali and 124 PanVK isolated contracts passed.
+- Existing 0.5 session regressions: 23 passed, covering guest environment, temporary
+  storage cleanup, cursor routing, run status, log handling and session assets.
+- Existing Steam cold/desktop launch regressions: 16 passed.
+- Python syntax, shell syntax, Android XML, workflow YAML and 36 embedded workflow
+  shell steps passed validation. Existing diagnostic patches and all Phase 1 native
+  broker/proxy protocol files remain unchanged. All-file `git diff --check` passes.
+
+The Unix socket tests needed execution outside the filesystem sandbox after its
+socket policy rejected the first attempts. The successful runs above use local
+host mocks only; they do not prove Android Vulkan execution or real GPU presentation.
+The four new Kotlin selection tests are added to the existing CI unit-test task;
+no local Gradle, APK, full Gamescope or driver build was run.
+
+Reproduce the Phase 3 suite with public Vulkan headers and pristine source:
+
+```sh
+python3 -B tools/mali-vulkan/run_phase3_tests.py \
+  --gamescope-source /tmp/droiddeck-mali-phase2-source/gamescope-3.16.29 \
+  --vulkan-headers /tmp/droiddeck-mali-phase2-headers/Vulkan-Headers-1.3.296/include
+```
+
+**CI and device validation still required**
+
+GitHub Actions has not been triggered here. It must compile/link the complete ARM64
+Gamescope Wayland/headless/renderer stack and APK; run the existing cursor-routing,
+component smoke, SONAME and runtimeAssets checks; validate fingerprints/same-run
+artifacts; verify that both native consumers load one packaged `libmaliahb.so`;
+and run `testReleaseUnitTest`, including the new hardware-gate and existing manifest
+validator tests. Full renderer/normal-session host fixtures in `test_session.py`
+and `test_normal_session.py` also require a CI environment with Gamescope's pinned
+wlroots and renderer dependencies; the lightweight runner deliberately does not
+compile them locally or claim their results.
+
+On the validated Mali-G52 phone, use Desktop to enter the normal interactive
+session. Verify the broker handshake and real GPU inventory, the actual Gamescope
+BLIT output through the proxy, touch/mouse/keyboard, exact AHB handoff and producer
+SYNC_FD completion. Exercise normal Stop with a displayed last buffer, restart,
+activity recreation/background/surface detach, startup cancellation, child/broker
+loss and deliberately delayed/missing Android release. Confirm real release fences,
+balanced normal teardown, no stale broker or nested-display sockets, and quarantine
+rather than reuse on timeout. Surface/output-size transitions and optional display
+settings require device evidence for this fixed-output nested core. Ordinary Adreno
+Steam/desktop/game and Quest/VR/Cardboard regression checks still require their
+hardware; their existing implementations have been retained.
+
+Shared CPU staging, persistent staging performance work, PanVK client integration,
+Steam/Xwayland/CEF/ANGLE acceleration, broad Mali device support and detailed
+performance/frame-journal instrumentation remain deferred. No commit was created.
+
+**Every added or modified file**
+
+```text
+M	.github/workflows/build.yml
+M	app/src/main/cpp/CMakeLists.txt
+M	app/src/main/cpp/waylandcomp/CMakeLists.txt
+M	app/src/main/cpp/waylandcomp/generated/banner-ahb-v1-protocol.c
+M	app/src/main/cpp/waylandcomp/generated/banner-ahb-v1-server-protocol.h
+M	app/src/main/cpp/waylandcomp/protocols/banner-ahb-v1.xml
+M	app/src/main/cpp/waylandcomp/src/ahb_swapchain.c
+M	app/src/main/cpp/waylandcomp/src/compositor.c
+M	app/src/main/cpp/waylandcomp/src/droiddeck_ext.h
+M	app/src/main/cpp/waylandcomp/src/vk_present.c
+M	app/src/main/cpp/waylandcomp/src/wl_dmabuf.c
+M	app/src/main/java/com/droiddeck/launcher/MainActivity.kt
+M	app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+A	app/src/main/java/com/droiddeck/launcher/gpu/MaliNormalBroker.kt
+A	app/src/main/java/com/droiddeck/launcher/gpu/MaliSessionSelection.kt
+M	app/src/main/java/com/droiddeck/launcher/gpu/SystemVulkanBroker.kt
+M	app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
+M	app/src/main/java/com/droiddeck/launcher/session/SessionService.kt
+M	app/src/main/java/com/droiddeck/launcher/session/SessionState.kt
+M	app/src/main/res/values/strings.xml
+A	app/src/test/java/com/droiddeck/launcher/gpu/MaliSessionSelectionTest.kt
+A	docs/development/mali-phase3.md
+M	tools/gamescope/PATCHES.md
+M	tools/gamescope/build-in-arch.sh
+M	tools/gamescope/check-diagnostics.sh
+A	tools/gamescope/patches/0210-mali-persistent-session.patch
+A	tools/gamescope/patches/0211-mali-normal-wayland-session.patch
+M	tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+A	tools/mali-vulkan/run_phase3_tests.py
+M	tools/mali-vulkan/test_diagnostics.py
+M	tools/mali-vulkan/test_normal_launch.py
+A	tools/mali-vulkan/test_phase3.py
+M	tools/mali-vulkan/tests/normal_android_release.c
+```

@@ -9,6 +9,7 @@ int AHardwareBuffer_recvHandleFromUnixSocket(int, AHardwareBuffer **);
 struct AHardwareBuffer { unsigned refs; AHardwareBuffer_Desc desc; };
 struct dmabuf_buffer { void *state; };
 static unsigned acknowledgements;
+static unsigned transactions;
 void AHardwareBuffer_acquire(AHardwareBuffer *a) { assert(a->refs); ++a->refs; }
 void AHardwareBuffer_release(AHardwareBuffer *a) { assert(a->refs); --a->refs; }
 void AHardwareBuffer_describe(const AHardwareBuffer *a, AHardwareBuffer_Desc *d) { *d=a->desc; }
@@ -17,6 +18,12 @@ void droiddeck_dmabuf_unref(struct dmabuf_buffer *b) { (void)b; }
 int droiddeck_dmabuf_fd(const struct dmabuf_buffer *b) { (void)b; return -1; }
 void droiddeck_log(const char *tag,const char *fmt,...) { (void)tag;(void)fmt; }
 void droiddeck_release_buffer(struct surface *s,struct wl_resource *r,int p,int64_t t) { (void)s;(void)r;(void)p;(void)t; ++acknowledgements; }
+const struct droiddeck_color *droiddeck_surface_color(const struct surface *s) { (void)s; return NULL; }
+void droiddeck_surface_describe(const struct surface *s,char *out,size_t size) { (void)s; snprintf(out,size,"test"); }
+int sc_layer_present_ahb(AHardwareBuffer *a,int w,int h,int fd,void *token,int sw,int sh,const struct droiddeck_color *color,uint32_t format) {
+    (void)a;(void)w;(void)h;(void)fd;(void)token;(void)sw;(void)sh;(void)color;(void)format;
+    ++transactions; return 0;
+}
 int main(void) {
     struct AHardwareBuffer a={.refs=1,.desc={.width=640,.height=360}};
     uint32_t key=mb_normal_register(&a); assert(key && mb_normal_import(key,640,360));
@@ -24,6 +31,9 @@ int main(void) {
     struct ahb_buf ab={.id=1,.broker_key=key,.b=&b,.ahb=&a,.on_layer=1,.resource=(void *)1,.release_pending=1,.fence_fd=-1};
     b.state=&ab;wl_list_init(&g_bufs);wl_list_insert(&g_bufs,&ab.link);
     g_loop=wl_event_loop_create();assert(g_loop);
+    ab.resource=NULL;
+    assert(ahb_swapchain_present(&b,NULL,640,360)==-1 && transactions==0);
+    ab.resource=(void *)1;
     assert(mb_normal_publish(key,1,2,3) && mb_normal_submit(key));
     int fd=eventfd(0,EFD_CLOEXEC|EFD_NONBLOCK);assert(fd>=0);int signal=dup(fd);assert(signal>=0);
     handle_released(1,fd);
@@ -44,5 +54,5 @@ int main(void) {
     assert(mb_normal_snapshot(key,&state) && state.released==2 && acknowledgements==2);
     mb_normal_forget(key);mb_normal_detach(key);AHardwareBuffer_release(&a);assert(a.refs==1);
     wl_list_remove(&ab.link);wl_event_loop_destroy(g_loop);
-    puts("actual Wayland AHB release: delayed fence, error not ACK, retained timeout, unpublished cancellation, no-fence real callback passed");
+    puts("actual Wayland AHB release: reject unpublished presentation, delayed fence, error not ACK, retained timeout, unpublished cancellation, no-fence real callback passed");
 }

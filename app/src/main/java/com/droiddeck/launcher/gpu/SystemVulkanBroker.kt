@@ -10,10 +10,11 @@ import java.io.File
 import java.io.IOException
 import org.json.JSONObject
 
-/** Opt-in Vulkan query experiments. Call off the main thread; normal sessions never start this. */
+/** System Vulkan broker with exclusive diagnostic or normal-session ownership. */
 object SystemVulkanBroker {
     private const val TAG = "MaliVulkanBroker"
     private var socket: File? = null
+    private var normalOwned = false
     @JvmStatic private external fun nativeQuarantinedSessions(): Int
 
     @JvmStatic private external fun nativeStart(socketPath: String)
@@ -28,6 +29,7 @@ object SystemVulkanBroker {
 
     @Synchronized
     fun start(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         socket?.let { return it.path }
         val directory = File(context.filesDir, "mali-vulkan")
         if (!directory.isDirectory && !directory.mkdirs()) throw IOException("Cannot create $directory")
@@ -40,9 +42,27 @@ object SystemVulkanBroker {
         return path.path
     }
 
+    @Synchronized fun startNormal(context: Context): String {
+        if (socket != null) throw IOException("Mali broker is already in use")
+        System.loadLibrary("malivulkan")
+        if (nativeQuarantinedSessions() != 0) throw IOException("A previous Android release timed out; retained resources require app process restart")
+        val path = start(context)
+        normalOwned = true
+        return path
+    }
+
+    @Synchronized fun stopNormal(): Boolean {
+        if (!normalOwned) return true
+        nativeStop()
+        socket = null
+        normalOwned = false
+        return nativeQuarantinedSessions() == 0
+    }
+
     /** Runs the glibc probe through the existing one-off Linux/proot command path. */
     @Synchronized
     fun runProbe(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) {
             return "Linux runtime is not installed or is being removed.\n" +
@@ -66,6 +86,7 @@ object SystemVulkanBroker {
     /** Uses the guest's normal libvulkan.so.1, with the proxy selected for this command only. */
     @Synchronized
     fun runIcdTest(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) {
             return "Linux runtime is not installed or is being removed.\n" +
@@ -99,6 +120,7 @@ object SystemVulkanBroker {
     /** Runs the actual staged DroidDeck Gamescope binary, without starting a session. */
     @Synchronized
     fun runGamescopeEnumeration(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) {
             return "Linux runtime is not installed or is being removed.\n" +
@@ -141,6 +163,7 @@ object SystemVulkanBroker {
     /** Runs the actual staged DroidDeck Gamescope binary, without starting a session. */
     @Synchronized
     fun runGamescopeDeviceTest(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) {
             return "Linux runtime is not installed or is being removed.\n" +
@@ -182,6 +205,7 @@ object SystemVulkanBroker {
 
     @Synchronized
     fun runGamescopeSubmitTest(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) {
             return "Linux runtime is not installed or is being removed.\n" +
@@ -229,6 +253,7 @@ object SystemVulkanBroker {
             "--vk-gamescope-renderer-init-test", "--vk-gamescope-first-frame-test",
         )
         require(option in options)
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) return "Install the Linux runtime in DroidDeck, then retry."
         val directory = path.parentFile
@@ -259,6 +284,7 @@ object SystemVulkanBroker {
 
     @Synchronized
     fun runCapabilities(context: Context): String {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         val path = socket ?: throw IOException("Broker is not running")
         if (!LinuxRuntime.isInstalled(context)) {
             return "Linux runtime is not installed or is being removed.\n" +
@@ -315,6 +341,7 @@ object SystemVulkanBroker {
 
     @Synchronized
     fun stop() {
+        if (normalOwned) throw IOException("Mali broker belongs to the running normal session")
         if (socket == null) return
         nativeStop()
         socket = null

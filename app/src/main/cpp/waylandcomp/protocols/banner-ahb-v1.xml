@@ -23,7 +23,7 @@
     DEALINGS IN THE SOFTWARE.
   </copyright>
 
-  <interface name="banner_ahb_v1" version="2">
+  <interface name="banner_ahb_v1" version="3">
     <description summary="Android gralloc buffers behind dma-buf wl_buffers">
       Zero-copy window layers on Android. A Vulkan swapchain image that the
       client allocated as an Android AHardwareBuffer (gralloc) is still shared
@@ -101,5 +101,20 @@
       </description>
       <arg name="enabled" type="uint" summary="1 = gralloc swapchain images wanted, 0 = not"/>
     </event>
+    <request name="create_broker_buffer" since="3">
+      <description summary="create an AHB-only buffer from the local Mali broker">
+        Experimental same-app broker handoff. key is an opaque registry ID,
+        never a native pointer or Vulkan handle. The compositor acquires the
+        broker's exact AHardwareBuffer. No Linux DMA-BUF export is involved.
+        The producer must finish its real SYNC_FD wait and publish ownership
+        through the broker before committing. wl_buffer.release is sent only
+        after the real Android release fence has signalled. Destroying a
+        wl_buffer does not release an allocation still held by Android.
+      </description>
+      <arg name="buffer" type="new_id" interface="wl_buffer"/>
+      <arg name="key" type="uint"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+    </request>
   </interface>
 </protocol>

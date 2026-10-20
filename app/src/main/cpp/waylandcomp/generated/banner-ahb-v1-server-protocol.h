@@ -63,6 +63,12 @@ struct banner_ahb_v1_interface {
 		       uint32_t modifier_hi,
 		       uint32_t modifier_lo,
 		       uint32_t image_count);
+	void (*create_broker_buffer)(struct wl_client *client,
+				     struct wl_resource *resource,
+				     uint32_t buffer,
+				     uint32_t key,
+				     uint32_t width,
+				     uint32_t height);
 };
 
 #define BANNER_AHB_V1_MODE 0
@@ -71,6 +77,7 @@ struct banner_ahb_v1_interface {
 
 #define BANNER_AHB_V1_DESTROY_SINCE_VERSION 1
 #define BANNER_AHB_V1_ATTACH_SINCE_VERSION 1
+#define BANNER_AHB_V1_CREATE_BROKER_BUFFER_SINCE_VERSION 3
 
 static inline void
 banner_ahb_v1_send_mode(struct wl_resource *resource_, uint32_t enabled)

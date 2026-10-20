@@ -14,6 +14,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NormalBrokerTests(test_renderer.RendererFixture):
+    def test_native_broker_restart_socket_ownership_and_blocked_shutdown(self):
+        path = self.directory / "restart.sock"
+        result = subprocess.run([str(self.directory / "broker_mock"), "--self-test", str(path),
+                                 str(self.directory / "broker_probe")], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repeated start/stop, blocked read/accept, socket ownership checks passed", result.stdout)
+        self.assertFalse(path.exists())
+
     def open_normal(self, path):
         connection = self.connect(path)
         self.fields(connection, 2, 1 << 22)
@@ -101,7 +109,8 @@ class NormalLaunchTests(unittest.TestCase):
         self.assertNotIn("ARGV=", result.stdout)
 
     def test_normal_script_requires_opt_in_and_outer_wayland_0(self):
-        for change in ({"MALI_VULKAN_NORMAL_SESSION": "0"}, {"WAYLAND_DISPLAY": "wayland-1"}):
+        for change in ({"MALI_VULKAN_NORMAL_SESSION": "0"}, {"WAYLAND_DISPLAY": "wayland-1"},
+                       {"MALI_VULKAN_SHARED_STAGING": "1"}):
             with self.subTest(change=change):
                 result = self.run_script(change)
                 self.assertEqual(result.returncode, 65)
@@ -133,8 +142,10 @@ class NormalLaunchTests(unittest.TestCase):
         self.assertIn('cp -- "$repo_root/tools/mali-vulkan/mali_proxy_icd.json" "$output/mali_proxy_icd.json"', build)
         broker = (ROOT / "app/src/main/java/com/droiddeck/launcher/gpu/MaliNormalBroker.kt").read_text()
         self.assertIn("val library = validateProxyManifest(manifest)", broker)
-        self.assertIn("resolved == library.canonicalFile", broker)
-        self.assertIn("resolved.parentFile == directory", broker)
+        validator = (ROOT / "app/src/main/java/com/droiddeck/launcher/gpu/SystemVulkanBroker.kt").read_text()
+        self.assertIn("SystemVulkanBroker.validateProxyManifest(manifest)", broker)
+        self.assertIn("resolved == library.canonicalFile", validator)
+        self.assertIn("resolved.parentFile == directory", validator)
         self.assertNotIn('icd.getString("library_path") == "libdroiddeck_mali_proxy.so"', broker)
 
     def test_service_readiness_order_and_stop_start_race_guards(self):

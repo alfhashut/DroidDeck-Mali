@@ -422,9 +422,12 @@ static int dev_init(void) {
                    "generation %s)", g_colorspace_ext ? "enables" : "has no",
                    g_colorspace_ext ? "is possible where the screen surface offers one" : "is not possible: tone-mapped instead");
     }
+
+    const char *mali_mode = getenv("DROIDDECK_MALI_NORMAL_SESSION");
+    const int mali_normal = mali_mode && !strcmp(mali_mode, "1");
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                              .pApplicationName = "droiddeck-wayland-present",
-                             .apiVersion = VK_API_VERSION_1_3};
+                             .apiVersion = mali_normal ? VK_API_VERSION_1_1 : VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                 .pApplicationInfo = &app,
                                 .enabledExtensionCount = n_inst_exts,
@@ -452,6 +455,9 @@ static int dev_init(void) {
     {
         VkPhysicalDeviceProperties props;
         g_vk.GetPhysicalDeviceProperties(g_pd, &props);
+        if (mali_normal && (props.vendorID != 0x13b5 || props.deviceID != 0x74021000 || props.apiVersion < VK_API_VERSION_1_1)) {
+            LOGE("present: normal Mali display selection does not match validated hardware"); g_dev_state = -1; return -1;
+        }
         snprintf(g_gpu_name, sizeof(g_gpu_name), "%s", props.deviceName);
         droiddeck_log("gpu", "compositor renders on %s with %s", props.deviceName,
                    g_library_name ? g_library_name : "the system Vulkan driver");
@@ -467,9 +473,17 @@ static int dev_init(void) {
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
     VkExtensionProperties *exts = calloc(ne ? ne : 1, sizeof(*exts));
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, exts);
-    for (unsigned i = 0; i < 5; i++)
-        if (!has_ext(exts, ne, dev_exts[i]))
-            LOGE("present: driver MISSING %s (dmabuf import will fail)", dev_exts[i]);
+    if (mali_normal) {
+        /* AHB-only Wayland frames go straight to sc_layer. The Android renderer
+         * needs only its real surface swapchain, never a fabricated DMA-BUF import. */
+        n_dev_exts = 1;
+        if (!has_ext(exts, ne, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) { free(exts); g_dev_state = -1; return -1; }
+        droiddeck_log("gpu", "Mali experimental display: vendor Vulkan 1.1 + AHB-only Wayland; DMA-BUF import disabled");
+    } else {
+        for (unsigned i = 0; i < 5; i++)
+            if (!has_ext(exts, ne, dev_exts[i])) LOGE("present: driver MISSING %s (dmabuf import will fail)", dev_exts[i]);
+    }
+
     int want_hdr_md = 0;
     if (droiddeck_color_requested()) {
         want_hdr_md = has_ext(exts, ne, VK_EXT_HDR_METADATA_EXTENSION_NAME);
@@ -482,7 +496,8 @@ static int dev_init(void) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                    .queueFamilyIndex = g_qfam, .queueCount = 1, .pQueuePriorities = &prio};
-    const void *fg_features = vkp_framegen_device_features(g_inst, vk_loader_gipa(), g_pd);
+
+    const void *fg_features = mali_normal ? NULL : vkp_framegen_device_features(g_inst, vk_loader_gipa(), g_pd);
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = fg_features,
                               .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                               .enabledExtensionCount = n_dev_exts, .ppEnabledExtensionNames = dev_exts};
@@ -535,7 +550,7 @@ static int dev_init(void) {
     g_dev_state = 1;
     reset_sync();
     init_black_image();
-    vkp_framegen_device_ready(g_dev, g_queue, g_qfam, fg_features != NULL);
+    if (!mali_normal) vkp_framegen_device_ready(g_dev, g_queue, g_qfam, fg_features != NULL);
     return 0;
 }
 
@@ -869,6 +884,8 @@ static int modifier_importable(VkFormat fmt, uint64_t modifier, VkImageUsageFlag
 }
 
 int vkp_dmabuf_modifiers(uint32_t drm_format, uint64_t *out, int max) {
+    const char *normal = getenv("DROIDDECK_MALI_NORMAL_SESSION");
+    if (normal && !strcmp(normal, "1")) return 0;
     if (max <= 0 || dev_init() != 0 || !g_vk.GetPhysicalDeviceFormatProperties2) return 0;
     VkFormat fmt = drm_to_vk(drm_format);
     VkDrmFormatModifierPropertiesListEXT list = {
@@ -910,6 +927,8 @@ int vkp_image_is_dmabuf(const struct vkp_image *img) { return img && img->dmabuf
 
 struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t modifier, int w, int h,
                                           uint32_t stride, uint32_t offset, int as_blit_dst) {
+    const char *normal = getenv("DROIDDECK_MALI_NORMAL_SESSION");
+    if (normal && !strcmp(normal, "1")) return NULL;
     if (modifier == MOD_INVALID || w <= 0 || h <= 0) return NULL;
     if (dev_init() != 0) return NULL;
 

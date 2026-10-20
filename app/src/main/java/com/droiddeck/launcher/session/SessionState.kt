@@ -43,6 +43,8 @@ object SessionState {
     var running = false
     @Volatile
     var runtimeDriver: String? = null
+    @Volatile
+    var maliBackend = false
     var suspended by mutableStateOf(false)
     @Volatile var pipActive = false
     @Volatile

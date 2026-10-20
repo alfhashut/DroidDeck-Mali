@@ -73,11 +73,31 @@ The Mali diagnostic patches follow all 0.5 patches in filename order. Their orig
 | `0205-vulkan-gamescope-renderer-tests.patch` | 0118 | Explicit renderer initialization and first-frame diagnostics |
 | `0206-vulkan-blit-input-proof.patch` | 0119 | Same-image pixel/readback proof |
 
-`0204` carries the canonical private ABI header from `tools/mali-vulkan/`;
-its unused session declarations do not enable a session path. Renderer diagnostics
-use an explicit flag whose default remains off. No persistent-session, shared-staging,
-compositor handoff or Steam patch is included.
+| `0210-mali-persistent-session.patch` | 0120 | Persistent renderer/output ownership and nested SHM client diagnostics |
+| `0211-mali-normal-wayland-session.patch` | 0121 | Normal single-client nested Wayland session with broker AHB-only output |
 
-`check-diagnostics.sh` checks all ten command markers and, on the ARM64 builder,
-requires each independent command to fail with an explicitly missing ICD. The
-existing cursor-routing test and runtime SONAME audit remain in the build.
+All 11 upstream 0.5 patches and diagnostic patches 0200–0206 retain their exact bytes.
+The two new patches are regenerated against their complete result on Gamescope 3.16.29.
+The old 0120 header insertion is omitted because 0204 already supplies the canonical
+`interop_test_api.h`. The normal-session starting point is reference commit `7fd567ad`,
+before later shared-staging, upload/performance, Steam, and frame-journal additions.
+Its touch-down guard is merged into 0.5's existing touch tracking; ordinary cursor,
+touch, and pointer-warp code remains in place. Current canonical normal ABI headers
+are copied verbatim; their unused performance declarations do not enable instrumentation.
+
+Filename order is the application order: 0002, 0009, 0019, 0020, 0100, 0101, 0110,
+0111, 0112, 0114, 0115, 0200–0206, 0210, 0211. `test_phase3.py` applies the entire
+stack with zero fuzz, checks that every Mali hunk has zero offset, verifies protocol/header
+parity, and executes the actual output-pool state machine. The normal child receives
+its nested Wayland socket without the compositor's private proxy/broker environment.
+Producer SYNC_FD completion precedes publication; MB_NORMAL_END must acknowledge
+Android releases before output resources are destroyed. Release failure retains
+allocations and fails the session.
+
+`check-diagnostics.sh` checks thirteen command markers and, on the ARM64 builder,
+requires independent diagnostics/persistent probes to fail with a missing ICD and
+requires normal-session entry to fail without its isolated launch environment. This
+smoke test does not prove real presentation. The existing cursor-routing test,
+source fingerprint, same-run artifact overlay, and runtime SONAME audit remain.
+No Steam/Xwayland client bridge, PanVK integration, shared CPU staging, or later
+performance/frame-journal patch is included.

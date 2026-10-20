@@ -876,7 +876,7 @@ object SessionPrefs {
             .onFailure { android.util.Log.e("GameEnvironment", "Could not update game environment", it) }
     }
 
-    fun prefMode(mode: String): String = if (mode == SessionService.MODE_RUN) SessionService.MODE_STEAM else mode
+    fun prefMode(mode: String): String = if (mode == SessionService.MODE_RUN || mode == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE) SessionService.MODE_STEAM else mode
 
     fun pipAutoEnter(context: Context): Boolean = prefs(context).getBoolean("pipAutoEnter", false)
 
