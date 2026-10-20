@@ -361,12 +361,22 @@ jobs:
             rm -f /tmp/debian-image.tar.zst
           else
             echo "::warning::the hosted Debian image could not be fetched; pulling from the registry instead"
-            for attempt in 1 2 3 4 5; do
-              docker pull "$image" && break
-              [ "$attempt" -lt 5 ] || { echo "::error::could not pull $image after $attempt attempts"; exit 1; }
-              echo "pull attempt $attempt failed (registry busy?); retrying in $((attempt * 30)) s"
-              sleep $((attempt * 30))
+            pulled=false
+            for candidate in debian:bullseye "$image"; do
+              for attempt in 1 2 3 4 5; do
+                if docker pull "$candidate"; then
+                  if [ "$candidate" != "$image" ]; then docker tag "$candidate" "$image"; fi
+                  pulled=true
+                  break
+                fi
+                [ "$attempt" -lt 5 ] || break
+                echo "pull attempt $attempt failed for $candidate (registry busy?); retrying in $((attempt * 30)) s"
+                sleep $((attempt * 30))
+              done
+              [ "$pulled" = false ] || break
+              echo "::warning::could not pull $candidate after $attempt attempts"
             done
+            [ "$pulled" = true ] || { echo '::error::could not pull Debian bullseye from any fallback registry'; exit 1; }
           fi
           docker image ls "$image"
 
