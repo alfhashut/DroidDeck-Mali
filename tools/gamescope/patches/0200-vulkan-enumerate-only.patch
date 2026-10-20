@@ -1,0 +1,162 @@
+From: DroidDeck
+Subject: [PATCH] main: opt-in Vulkan enumeration without renderer/backend initialization
+
+Gamescope 3.16.29. Use only core instance queries at API 1.0 through the normal
+Vulkan loader. No logical device or WSI/backend is initialized in this mode.
+
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -25,6 +25,7 @@
+ #include "main.hpp"
+ #include "steamcompmgr.hpp"
+ #include "rendervulkan.hpp"
++#include "vulkan_enumerate_only.hpp"
+ #include "wlserver.hpp"
+ #include "convar.h"
+ #include "gpuvis_trace_utils.h"
+@@ -60,6 +61,7 @@
+ const struct option *gamescope_options = (struct option[]){
+ 	{ "help", no_argument, nullptr, 0 },
+ 	{ "version", no_argument, nullptr, 0 },
++	{ "vk-enumerate-only", no_argument, nullptr, 0 },
+ 	{ "nested-width", required_argument, nullptr, 'w' },
+ 	{ "nested-height", required_argument, nullptr, 'h' },
+ 	{ "nested-refresh", required_argument, nullptr, 'r' },
+@@ -169,6 +171,7 @@
+ 	"\n"
+ 	"Options:\n"
+ 	"  --help                         show help message\n"
++	"  --vk-enumerate-only            print Vulkan devices and exit without initializing a renderer/backend\n"
+ 	"  -W, --output-width             output width\n"
+ 	"  -H, --output-height            output height\n"
+ 	"  -w, --nested-width             game width\n"
+@@ -714,6 +717,10 @@
+ 
+ int main(int argc, char **argv)
+ {
++	// The standalone diagnostic exits before any normal startup, including scripts/X11.
++	if ( argc == 2 && strcmp( argv[1], "--vk-enumerate-only" ) == 0 )
++		return vulkan_enumerate_only();
++
+ 	g_argc = argc;
+ 	g_argv = argv;
+ 
+@@ -789,6 +796,8 @@
+ 					gamescope::PrintVersion();
+ 					fprintf(stderr, "%s", usage);
+ 					return 0;
++				} else if (strcmp(opt_name, "vk-enumerate-only") == 0) {
++					return vulkan_enumerate_only();
+ 				} else if (strcmp(opt_name, "version") == 0) {
+ 					gamescope::PrintVersion();
+ 					return 0;
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -110,6 +110,7 @@
+   'commit.cpp',
+   'color_helpers.cpp',
+   'main.cpp',
++  'vulkan_enumerate_only.cpp',
+   'edid.cpp',
+   'wlserver.cpp',
+   'vblankmanager.cpp',
+diff --git a/src/vulkan_enumerate_only.hpp b/src/vulkan_enumerate_only.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/vulkan_enumerate_only.hpp
+@@ -0,0 +1,4 @@
++#pragma once
++
++// Debug-only core Vulkan 1.0 instance queries. No renderer/backend/device setup.
++int vulkan_enumerate_only();
+diff --git a/src/vulkan_enumerate_only.cpp b/src/vulkan_enumerate_only.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/vulkan_enumerate_only.cpp
+@@ -0,0 +1,84 @@
++// Opt-in instance queries through the normal glibc Vulkan loader, independent of rendervulkan.
++#include "vulkan_enumerate_only.hpp"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <vulkan/vulkan.h>
++
++int vulkan_enumerate_only()
++{
++    // The query path works with a 1.0 ICD. Report the physical device's own version below.
++    const VkApplicationInfo app = {
++        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++        .pApplicationName = "Gamescope Vulkan enumeration diagnostic",
++        .apiVersion = VK_API_VERSION_1_0,
++    };
++    const VkInstanceCreateInfo info = {
++        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++        .pApplicationInfo = &app,
++    };
++    VkInstance instance = VK_NULL_HANDLE;
++    printf("gamescope: Vulkan enumeration-only (instance API 1.0, no extensions)\n");
++    VkResult result = vkCreateInstance(&info, nullptr, &instance);
++    if (result != VK_SUCCESS)
++    {
++        fprintf(stderr, "gamescope: enumeration-only vkCreateInstance failed: %d\n", int(result));
++        return 1;
++    }
++    printf("gamescope: enumeration-only vkCreateInstance = VK_SUCCESS\n");
++
++    int code = 1;
++    VkPhysicalDevice *devices = nullptr;
++    uint32_t count = 0;
++    // Count/list can race hotplug. Retry VK_INCOMPLETE without publishing partial output.
++    for (unsigned attempt = 0; attempt < 4; ++attempt)
++    {
++        count = 0;
++        result = vkEnumeratePhysicalDevices(instance, &count, nullptr);
++        if (result != VK_SUCCESS)
++            break;
++        if (!count)
++        {
++            code = 0;
++            break;
++        }
++        devices = static_cast<VkPhysicalDevice *>(calloc(count, sizeof(*devices)));
++        if (!devices)
++        {
++            result = VK_ERROR_OUT_OF_HOST_MEMORY;
++            break;
++        }
++        result = vkEnumeratePhysicalDevices(instance, &count, devices);
++        if (result == VK_SUCCESS)
++        {
++            code = 0;
++            break;
++        }
++        free(devices);
++        devices = nullptr;
++        if (result != VK_INCOMPLETE)
++            break;
++    }
++
++    if (code == 0)
++    {
++        printf("gamescope: physical-device count = %u\n", count);
++        for (uint32_t i = 0; i < count; ++i)
++        {
++            VkPhysicalDeviceProperties p = {};
++            vkGetPhysicalDeviceProperties(devices[i], &p);
++            printf("Device %u\ndeviceName: %s\nvendorID: 0x%08x\ndeviceID: 0x%08x\n"
++                        "apiVersion: %u.%u.%u\ndriverVersion: %u\ndeviceType: %u\n",
++                        i, p.deviceName, p.vendorID, p.deviceID,
++                        VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
++                        VK_VERSION_PATCH(p.apiVersion), p.driverVersion, unsigned(p.deviceType));
++        }
++    }
++    else
++        fprintf(stderr, "gamescope: enumeration-only physical-device query failed: %d\n", int(result));
++
++    free(devices);
++    vkDestroyInstance(instance, nullptr);
++    printf("gamescope: destroyed enumeration-only Vulkan instance\n");
++    return code;
++}

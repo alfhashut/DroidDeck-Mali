@@ -1,0 +1,101 @@
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1899,6 +1899,15 @@
+         }
+         if (!targetDescriptors[1].imageView) { targetDescriptors[1].imageView = m_device->MaliDummyStorage(); targetDescriptors[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL; }
+     }
++    if (m_device->IsMaliDiagnostic() && m_target->externalImage()) {
++        if (!m_boundTextures[0] || imageDescriptors[0].imageView != (m_useSrgb[0] ? m_boundTextures[0]->srgbView() : m_boundTextures[0]->linearView()) ||
++            imageDescriptors[0].imageView == m_device->MaliDummy2D() || targetDescriptors[0].imageView != m_target->srgbView() ||
++            targetDescriptors[0].imageView == m_device->MaliDummyStorage() || imageDescriptors[0].imageLayout != VK_IMAGE_LAYOUT_GENERAL ||
++            targetDescriptors[0].imageLayout != VK_IMAGE_LAYOUT_GENERAL)
++            m_device->FailMaliDiagnostic("BLIT real source/output descriptor identity", VK_ERROR_INITIALIZATION_FAILED);
++        std::puts("BLIT descriptor identity verified: layer 0 source/sampler binding=3 array index=0; exact AHB storage binding=1 array index=0; source/output GENERAL; dummy fill preserved both");
++        std::printf("Gamescope BLIT dispatch X/Y/Z=%u/%u/%u\n", x, y, z);
++    }
+ 	m_device->vk.UpdateDescriptorSets(m_device->device(), writeDescriptorSets.size(), writeDescriptorSets.data(), 0, nullptr);
+ 
+ 	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
+@@ -3932,6 +3941,10 @@
+ 		u_nitsToLinear = 1.0f / g_flInternalDisplayBrightnessNits;
+ 		u_itmSdrNits = g_flHDRItmSdrNits;
+ 		u_itmTargetNits = g_flHDRItmTargetNits;
++        if (g_device.IsMaliDiagnostic()) {
++            std::printf("BlitPushData: UBO bytes=%zu scale0=(%.2f,%.2f) offset0=(%.2f,%.2f) opacity0=%.2f borderMask=%u filter=%u alphaMode=%u rotation=%u CTM0=identity colorspaceMask=%u\n",
++                sizeof(*this), scale[0].x, scale[0].y, offset[0].x, offset[0].y, opacity[0], borderMask, u_shaderFilter, u_alphaMode, u_rotation, frameInfo->colorspaceMask());
++        }
+ 	}
+ 
+ 	explicit BlitPushData_t(float blit_scale) {
+diff --git a/src/vulkan_renderer_test.inc b/src/vulkan_renderer_test.inc
+--- a/src/vulkan_renderer_test.inc
++++ b/src/vulkan_renderer_test.inc
+@@ -203,14 +203,65 @@
+         if (y < 128) p[x < 128 ? 0 : 1] = 255;
+         else if (x < 128) p[2] = 255; else p[0] = p[1] = p[2] = 255;
+     }
+-    auto source = vulkan_create_texture_from_bits(256, 256, 256, 256, DRM_FORMAT_ABGR8888, {}, bits.data());
++    CVulkanTexture::createFlags sourceFlags; sourceFlags.bTransferSrc = true;
++    auto source = vulkan_create_texture_from_bits(256, 256, 256, 256, DRM_FORMAT_ABGR8888, sourceFlags, bits.data());
+     require(source != nullptr, "Gamescope input texture upload");
++    // Read back the actual uploaded image, before any BLIT descriptor/pipeline work.
++    // Reuse the final-image readback buffer after unmapping it; no presentation copy.
++    auto copyImage = (PFN_vkCmdCopyImageToBuffer)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkCmdCopyImageToBuffer");
++    require(copyImage != nullptr, "source readback command lookup");
++    auto sourceCommand = g_device.commandBuffer();
++    VkImageMemoryBarrier sourceBarrier{ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++        .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = source->vkImage(), .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1} };
++    g_device.vk.CmdPipelineBarrier(sourceCommand->rawBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        0, 0, nullptr, 0, nullptr, 1, &sourceBarrier);
++    VkBufferImageCopy sourceRegion{ .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {256, 256, 1} };
++    copyImage(sourceCommand->rawBuffer(), source->vkImage(), VK_IMAGE_LAYOUT_GENERAL, readback, 1, &sourceRegion);
++    VkBufferMemoryBarrier hostBarrier{ .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .buffer = readback, .size = VK_WHOLE_SIZE };
++    g_device.vk.CmdPipelineBarrier(sourceCommand->rawBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++        0, 0, nullptr, 1, &hostBarrier, 0, nullptr);
++    sourceBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; sourceBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++    g_device.vk.CmdPipelineBarrier(sourceCommand->rawBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++        0, 0, nullptr, 0, nullptr, 1, &sourceBarrier);
++    const auto sourceSequence = g_device.submit(std::move(sourceCommand)); g_device.wait(sourceSequence, true);
++    void *sourceMapped = nullptr;
++    require(MaliResult(g_device.vk.MapMemory(g_device.device(), readbackMemory, 0, VK_WHOLE_SIZE, 0, &sourceMapped), "vkMapMemory actual input image readback"), "source readback map");
++    if (!coherent) {
++        auto invalidate = (PFN_vkInvalidateMappedMemoryRanges)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkInvalidateMappedMemoryRanges");
++        require(invalidate != nullptr, "source invalidate lookup");
++        VkMappedMemoryRange range{ .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = readbackMemory, .size = VK_WHOLE_SIZE };
++        require(MaliResult(invalidate(g_device.device(), 1, &range), "vkInvalidateMappedMemoryRanges actual input bytes"), "source readback invalidate");
++    }
++    uint32_t sourceBad = 0;
++    for (unsigned i = 0; i < 256u * 256u; ++i) sourceBad += std::memcmp((const uint8_t *)sourceMapped + i * 4, bits.data() + i * 4, 4) != 0;
++    const unsigned sourcePoints[][2] = {{64,64}, {192,64}, {64,192}, {192,192}};
++    for (const auto &point : sourcePoints) {
++        const uint8_t *pixel = (const uint8_t *)sourceMapped + (point[1] * 256 + point[0]) * 4;
++        std::printf("Gamescope input GPU readback pixel(%u,%u) RGBA=(%u,%u,%u,%u)\n", point[0], point[1], pixel[0], pixel[1], pixel[2], pixel[3]);
++    }
++    g_device.vk.UnmapMemory(g_device.device(), readbackMemory);
++    std::printf("Gamescope input texture mismatches=%u (65536 actual Vulkan pixels)\n", sourceBad);
++    require(!sourceBad, "Gamescope input texture verification");
++    std::puts("Gamescope input texture verification: PASS");
+     gamescope::OwningRc<CVulkanTexture> target = new CVulkanTexture();
+     require(target->BInitMaliAHB(ahb.image, 256, 256), "Gamescope AHB texture wrapper");
+     currentOutputWidth = currentOutputHeight = 256;
+     FrameInfo_t frame{}; frame.applyOutputColorMgmt = false; frame.outputEncodingEOTF = EOTF_Gamma22;
+     auto layer = frame.layers.push(); layer->tex = source.get(); layer->scale = {2.0f, 2.0f}; layer->offset = {-64.0f, -64.0f}; layer->opacity = 1.0f;
+-    layer->filter = GamescopeUpscaleFilter::NEAREST; layer->blackBorder = true; layer->applyColorMgmt = false; layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
++    layer->filter = GamescopeUpscaleFilter::NEAREST; layer->blackBorder = true; layer->applyColorMgmt = false;
++    // applyColorMgmt is DRM-only. Valid dummy LUTs have one mip and would enable
++    // shader color management for SRGB. Use the existing explicit no-LUT path.
++    layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
++    std::printf("FrameInfo layer count=%d output=256x256 output EOTF=%u applyOutputColorMgmt=%u\n", frame.layers.count(), unsigned(frame.outputEncodingEOTF), unsigned(frame.applyOutputColorMgmt));
++    std::printf("layer 0: source=%ux%u opacity=%.2f offset=(%.2f,%.2f) scale=(%.2f,%.2f) destination=128x128 z/order=%d colorspace=%u PASSTHRU applyColorMgmt=%u blackBorder=%u filter=NEAREST\n",
++        source->width(), source->height(), layer->opacity, layer->offset.x, layer->offset.y, layer->scale.x, layer->scale.y, layer->zpos, unsigned(layer->colorspace), unsigned(layer->applyColorMgmt), unsigned(layer->blackBorder));
++    std::puts("BLIT color management: existing PASSTHRU skips textureQueryLevels dummy-LUT activation; dummy descriptors remain valid");
+     std::puts("Expected first Gamescope frame: 64-pixel BLACK border, centered 128x128 RED GREEN / BLUE WHITE; source covers full 256x256");
+     g_device.m_maliProducerFence = producer.fence; g_device.m_maliReadbackBuffer = readback;
+     std::puts("real renderer path: vulkan_composite -> BLIT -> CVulkanCmdBuffer::dispatch -> native Mali compute dispatch");

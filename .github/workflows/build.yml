@@ -29,13 +29,39 @@ env:
   PRELOAD_CACHE_VERSION: v6
 
 jobs:
+  gamescope:
+    name: Build diagnostic Gamescope
+    if: ${{ (github.ref_name == 'mali-0.5-port' || github.head_ref == 'mali-0.5-port') && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Build in Arch Linux ARM
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/work" -w /work menci/archlinuxarm:base-devel bash tools/gamescope/build-in-arch.sh
+          sudo chown -R "$(id -u):$(id -g)" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gamescope-patched
+          path: |
+            gamescope.tzst
+            gamescope.tzst.sha256
+            gamescope-inputs.sha256
+          if-no-files-found: error
+
   build:
     name: Build APK
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    needs: gamescope
+    if: ${{ !cancelled() && (needs.gamescope.result == 'success' || needs.gamescope.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      GAMESCOPE_FROM_SOURCE: 'false'
+      GAMESCOPE_FROM_SOURCE: ${{ needs.gamescope.result == 'success' }}
     outputs:
       variants: ${{ steps.variants.outputs.list }}
     steps:
@@ -186,7 +212,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: app/src/main/assets/linuxfs
-          key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ env.GAMESCOPE_FROM_SOURCE }}-${{ hashFiles('app/src/main/cpp/fakeinput_steam.cpp', 'app/src/main/cpp/adrenotools/src/hook/kgsl.h', 'tools/quest/*', 'tools/linuxfs/preload/*.c', 'tools/linuxfs/build-x86-preloads.sh', 'tools/linuxfs/fex/*', 'tools/linuxfs/clipboard/*.c', 'tools/linuxfs/ssbs/*.c', 'tools/proot/fastpath/*.c', 'tools/linuxfs/overlay/usr/local/bin/*', 'tools/linuxfs/overlay/usr/bin/**', 'tools/linuxfs/desktop/*', 'tools/gamescope/release.env', 'tools/gamescope/patches/*.patch', 'tools/gamescope/build-in-arch.sh', 'tools/gamescope/runtime-sonames.txt', 'tools/wlroots/release.env', 'tools/linuxfs/uruntime.env', 'tools/linuxfs/licenses/*', 'tools/mangoapp/*', 'tools/msitools/**', 'tools/comet/**', 'tools/linuxfs/debian-image.env', 'tools/vr/**') }}
+          key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ env.GAMESCOPE_FROM_SOURCE }}-${{ hashFiles('app/src/main/cpp/fakeinput_steam.cpp', 'app/src/main/cpp/adrenotools/src/hook/kgsl.h', 'tools/quest/*', 'tools/linuxfs/preload/*.c', 'tools/linuxfs/build-x86-preloads.sh', 'tools/linuxfs/fex/*', 'tools/linuxfs/clipboard/*.c', 'tools/linuxfs/ssbs/*.c', 'tools/proot/fastpath/*.c', 'tools/linuxfs/overlay/usr/local/bin/*', 'tools/linuxfs/overlay/usr/bin/**', 'tools/linuxfs/desktop/*', 'tools/gamescope/release.env', 'tools/gamescope/patches/*.patch', 'tools/gamescope/build-in-arch.sh', 'tools/gamescope/check-diagnostics.sh', 'tools/gamescope/runtime-sonames.txt', 'tools/wlroots/release.env', 'tools/linuxfs/uruntime.env', 'tools/linuxfs/licenses/*', 'tools/mangoapp/*', 'tools/msitools/**', 'tools/comet/**', 'tools/linuxfs/debian-image.env', 'tools/vr/**') }}
 
       - name: Build libfakeinput.so and libblsession.so (glibc aarch64)
         if: steps.preloads.outputs.cache-hit != 'true'
@@ -298,8 +324,9 @@ jobs:
         run: |
           set -euo pipefail
           (cd gamescope-component && sha256sum -c gamescope.tzst.sha256)
+          sha256sum -c gamescope-component/gamescope-inputs.sha256
           tar --use-compress-program=unzstd -xf gamescope-component/gamescope.tzst -C app/src/main/assets/linuxfs
-          test -f app/src/main/assets/linuxfs/usr/local/bin/gamescope
+          bash tools/gamescope/check-diagnostics.sh app/src/main/assets/linuxfs/usr/local/bin/gamescope --markers-only
 
       - name: Build isolated Mali Vulkan assets and check contracts
         run: |
@@ -308,7 +335,12 @@ jobs:
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross libvulkan-dev libvulkan1 python3-yaml >/dev/null
           tools/mali-vulkan/build-probe.sh
           tools/mali-vulkan/build-icd.sh
-          python3 -B tools/mali-vulkan/run_phase1_tests.py --with-loader
+          python3 -B tools/mali-vulkan/run_phase1_tests.py
+          curl -fL --retry 3 https://codeload.github.com/ValveSoftware/gamescope/tar.gz/refs/tags/3.16.29 -o /tmp/gamescope-source.tar.gz
+          echo '9fe99fb4c7a80323cb7617825887dd8ff43e80a1e8c60a42740320eaa91ea01e  /tmp/gamescope-source.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/gamescope-source
+          tar -xzf /tmp/gamescope-source.tar.gz -C /tmp/gamescope-source
+          python3 -B tools/mali-vulkan/run_phase2_tests.py --gamescope-source /tmp/gamescope-source/gamescope-3.16.29
 
       - name: Fetch the Debian image the preloads build in
         if: steps.preloads.outputs.cache-hit != 'true'

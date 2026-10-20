@@ -49,6 +49,7 @@ tar --use-compress-program=unzstd -xf "$PKG" -C out --strip-components=2 usr/bin
 mv out/gamescope out/usr/local/bin/gamescope
 chmod 755 out/usr/local/bin/gamescope
 strip --strip-unneeded out/usr/local/bin/gamescope || true
+bash tools/gamescope/check-diagnostics.sh "$WORK/out/usr/local/bin/gamescope"
 NEEDED=$(readelf -d out/usr/local/bin/gamescope | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
 echo "NEEDED: $NEEDED"
 MISSING=""
@@ -56,4 +57,6 @@ for lib in $NEEDED; do grep -qx "$lib" tools/gamescope/runtime-sonames.txt || MI
 if [ -n "$MISSING" ]; then echo "ERROR: not in the runtime:$MISSING"; exit 3; fi
 (cd out && tar --use-compress-program='zstd -19' -cf ../gamescope.tzst usr)
 sha256sum gamescope.tzst | tee gamescope.tzst.sha256
+sha256sum tools/gamescope/build-in-arch.sh tools/gamescope/check-diagnostics.sh \
+    tools/gamescope/runtime-sonames.txt tools/gamescope/patches/*.patch > gamescope-inputs.sha256
 ls -l gamescope.tzst out/usr/local/bin/gamescope

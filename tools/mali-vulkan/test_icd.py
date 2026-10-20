@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
 MAGIC = 0x564D4444
@@ -457,6 +458,18 @@ class IcdTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("native broker:", result.stdout)
+
+    def test_foreign_or_unavailable_peer_credentials_never_open_vulkan(self):
+        for policy in ("foreign", "error"):
+            with self.subTest(policy=policy), mock.patch.dict(os.environ, {"DD_TEST_PEER_CREDENTIALS": policy}):
+                with self.broker() as path:
+                    connection = self.connect(path)
+                    try:
+                        self.assertEqual(connection.recv(1), b"")
+                    except ConnectionResetError:
+                        pass
+                self.assertIn("credentials must match app uid", self.broker_errors)
+                self.assertIn("CLEANUP creates=0 destroys=0 closes=0", self.cleanup_output)
 
     def test_live_instance_and_old_probe_can_coexist(self):
         with self.broker() as path:

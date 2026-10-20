@@ -7,20 +7,32 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 #include <vulkan/vulkan.h>
 static void *mock_dlopen(const char *, int);
 static void *mock_dlsym(void *, const char *);
 static int mock_dlclose(void *);
 static const char *mock_dlerror(void);
+static int mock_getsockopt(int, int, int, void *, socklen_t *);
 #define dlopen mock_dlopen
 #define dlsym mock_dlsym
 #define dlclose mock_dlclose
 #define dlerror mock_dlerror
+#define getsockopt mock_getsockopt
 #include "../../../app/src/main/cpp/malivulkan/system_broker.c"
 #undef dlopen
 #undef dlsym
 #undef dlclose
 #undef dlerror
+#undef getsockopt
+static int mock_getsockopt(int fd, int level, int option, void *value, socklen_t *length) {
+    const char *policy = getenv("DD_TEST_PEER_CREDENTIALS");
+    if (policy && !strcmp(policy, "error")) { errno = EIO; return -1; }
+    int result = getsockopt(fd, level, option, value, length);
+    if (!result && level == SOL_SOCKET && option == SO_PEERCRED && policy && !strcmp(policy, "foreign"))
+        ((struct ucred *)value)->uid ^= 1;
+    return result;
+}
 static atomic_int mode, creates, destroys, closes;
 static atomic_int device_creates, device_destroys, queue_gets;
 static int thrown;

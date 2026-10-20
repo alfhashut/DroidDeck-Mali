@@ -32,6 +32,8 @@ jobs:
           path: |
             gamescope.tzst
             gamescope.tzst.sha256
+            gamescope-inputs.sha256
+          if-no-files-found: error
       - name: Publish
         if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
         env:

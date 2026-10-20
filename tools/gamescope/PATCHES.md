@@ -59,3 +59,25 @@ library list, before anything is published.
 
 Sixteen more of Armada's patches are DRM/lease/HDR-on-KMS work for a native display, which this
 app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the runtime has.
+
+The Mali diagnostic patches follow all 0.5 patches in filename order. Their original
+`mali-gpu-experiment` numbers are retained here for checkpoint documentation:
+
+| Port file | Reference | Diagnostic |
+| --- | --- | --- |
+| `0200-vulkan-enumerate-only.patch` | 0113 | Instance/device inventory without renderer startup |
+| `0201-vulkan-capabilities.patch` | 0114 | Real driver capability queries |
+| `0202-vulkan-create-device-test.patch` | 0115 | Logical device and queue lifecycle |
+| `0203-vulkan-submit-test.patch` | 0116 | Event command submission and fence completion |
+| `0204-vulkan-memory-ahb-tests.patch` | 0117 | Independent buffer/image/AHB diagnostics |
+| `0205-vulkan-gamescope-renderer-tests.patch` | 0118 | Explicit renderer initialization and first-frame diagnostics |
+| `0206-vulkan-blit-input-proof.patch` | 0119 | Same-image pixel/readback proof |
+
+`0204` carries the canonical private ABI header from `tools/mali-vulkan/`;
+its unused session declarations do not enable a session path. Renderer diagnostics
+use an explicit flag whose default remains off. No persistent-session, shared-staging,
+compositor handoff or Steam patch is included.
+
+`check-diagnostics.sh` checks all ten command markers and, on the ARM64 builder,
+requires each independent command to fail with an explicitly missing ICD. The
+existing cursor-routing test and runtime SONAME audit remain in the build.
