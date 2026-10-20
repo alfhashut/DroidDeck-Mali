@@ -65,14 +65,14 @@ class SessionBoundaryTests(unittest.TestCase):
         self.assertIn('MaliSessionControls.environment(extraEnv())', normal)
         self.assertNotIn('debugLogDir', normal)
 
-    def test_shared_staging_and_panvk_are_not_normal_session_options(self):
+    def test_shared_staging_is_explicit_and_panvk_is_not_a_broker_option(self):
         broker = (JAVA / 'gpu/MaliNormalBroker.kt').read_text()
-        self.assertIn('"MALI_VULKAN_SHARED_STAGING=0"', broker)
-        self.assertNotIn('shared-staging.enabled', broker)
+        self.assertIn('sharedStagingEnvironment', broker)
+        self.assertIn('directory?.let { File(it, "shared-staging.enabled").isFile } == true', broker)
         self.assertNotIn('Panvk', broker)
         shell = (ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-session').read_text()
         self.assertIn('if [ "$mode" = mali-wayland ] ||', shell)
-        self.assertIn('[ "${MALI_VULKAN_SHARED_STAGING:-0}" = 0 ]', shell)
+        self.assertIn('case ${MALI_VULKAN_SHARED_STAGING:-0} in', shell)
         outer = shell.split('case $mode in', 1)[0]
         self.assertNotIn('-cef-use-vulkan', outer)
         self.assertNotIn('droiddeck-steam-client-panvk', outer)

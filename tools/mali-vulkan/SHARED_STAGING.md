@@ -94,9 +94,13 @@ unchanged submit adds 72 bytes: 4 MiB + 200 versus 148 bytes for these operation
 One-time probe/registration and unrelated RPCs are excluded. Multiple dirty
 ranges/slots produce multiple small notifications.
 
-Default is disabled. At Mali normal-session launch the APK checks
-`/sdcard/Download/DroidDeck/shared-staging.enabled`, setting
-`MALI_VULKAN_SHARED_STAGING=1` for the proxy session. Steam-child environment
+Default is disabled. At Mali normal-session launch the APK uses
+`Context.getExternalFilesDir("mali-vulkan")` and checks
+`/sdcard/Android/data/com.droiddeck.launcher/files/mali-vulkan/shared-staging.enabled`, setting
+`MALI_VULKAN_SHARED_STAGING=1` for the proxy session. An absent marker, a directory
+with that name, or unavailable external storage selects `0`. The marker is a regular
+file; its contents are ignored. Package-suffixed builds use their own external-files
+directory. Steam-child environment
 explicitly strips it. Change the marker while normally stopped; mappings are
 never switched under callers.
 
@@ -132,86 +136,77 @@ The legacy 92-opcode aggregate snapshot ABI is unchanged and excludes opcodes
 Memory-write role accounting records copied bytes; shared notifications do not
 increase the legacy socket pixel upload byte count.
 
-## CI and fish-compatible A/B procedure
+## CI and device A/B procedure
 
-After commit/push to `mali-gpu-experiment`:
+Build on GitHub Actions after the change has been reviewed and pushed to
+`mali-0.5-port`. Use the APK and Gamescope component from the same source SHA/run.
+The matched broker/proxy must both contain the final optional opcodes. No additional
+Gamescope patch is needed: the existing private persistent-staging mapper returns
+the shared pointer, and 0215 already strips transport controls from child processes.
 
-```fish
-gh workflow run build.yml --ref mali-gpu-experiment
+Use the release package `com.droiddeck.launcher` below (adjust for a package suffix).
+Stop the session before changing the marker or arming the journal. This affects
+new sessions and newly mapped slots; there is no live transport switch.
+
+For baseline A, remove the marker:
+
+```sh
+adb -s SERIAL shell rm -f /sdcard/Android/data/com.droiddeck.launcher/files/mali-vulkan/shared-staging.enabled
+python3 -B tools/mali-vulkan/frame_journal_control.py arm --serial SERIAL
 ```
 
-Use `gamescope` and dependent `build` from one SHA/run: artifacts
-`gamescope-patched` and `droiddeck-apk`. The APK embeds Gamescope and builds the
-matched glibc proxy/Android broker. Gamescope changes are journal definitions
-and client environment isolation only. No PanVK build is needed.
+Launch the normal Mali session. Keep the same workload, window size and Steam
+client choice for both captures. In the running session's Terminal:
 
-Normal **Stop**, install the matching test-key APK without clearing data, and
-arm before Launch:
-
-```fish
-adb -s E68DS8U4IVYTKJXK install -r /tmp/droiddeck-frame-apk/app-release-unsigned.apk
-set -l ab_dir (mktemp -d /tmp/steam-shared-staging-ab-XXXXXX)
-mkdir "$ab_dir/A" "$ab_dir/B"
-adb -s E68DS8U4IVYTKJXK shell rm -f /sdcard/Download/DroidDeck/shared-staging.enabled
-python3 -B tools/panvk/frame_journal.py arm --serial E68DS8U4IVYTKJXK
+```sh
+droiddeck-mali-diagnostics journal --seconds 10
 ```
 
-Use **Mali Steam Launch**, retaining the client PanVK option and stride 56.
-Require exactly one fresh Gamescope and one fresh Android worker:
+After capture completion, on the host:
 
-```fish
-python3 -B tools/panvk/frame_journal.py status --serial E68DS8U4IVYTKJXK
+```sh
+python3 -B tools/mali-vulkan/frame_journal_control.py pull --serial SERIAL --output shared-A.zip
+python3 -B tools/mali-vulkan/frame_journal_control.py disarm --serial SERIAL
 ```
 
-Move/scroll the same Steam page at the same window size throughout 10 seconds.
-The existing capture temporarily applies 0xff and restores original individual
-affinities. Capture A (fallback), then disarm even if capture fails:
+Stop normally. Enable B explicitly, then arm before launching again:
 
-```fish
-python3 -B tools/panvk/stage_phone_test.py --serial E68DS8U4IVYTKJXK \
-  --frame-diagnostics --perf-seconds 10 --perf-output "$ab_dir/A" --run
-python3 -B tools/panvk/frame_journal.py disarm --serial E68DS8U4IVYTKJXK
+```sh
+adb -s SERIAL shell mkdir -p /sdcard/Android/data/com.droiddeck.launcher/files/mali-vulkan
+adb -s SERIAL shell touch /sdcard/Android/data/com.droiddeck.launcher/files/mali-vulkan/shared-staging.enabled
+python3 -B tools/mali-vulkan/frame_journal_control.py arm --serial SERIAL
 ```
 
-Normal **Stop**. Enable the gate and arm BEFORE **Mali Steam Launch**:
+Require the startup log to select `MALI_VULKAN_SHARED_STAGING=1`, proxy
+`capable=yes`, and qualifying mappings with `transport=shared mmap`. Capability
+or registration fallback is safe but does not prove successful shared operation.
+Capture the same workload using `journal --seconds 10`, pull as `shared-B.zip`,
+then disarm. This procedure does not change CPU affinity or PanVK configuration.
 
-```fish
-adb -s E68DS8U4IVYTKJXK shell touch /sdcard/Download/DroidDeck/shared-staging.enabled
-python3 -B tools/panvk/frame_journal.py arm --serial E68DS8U4IVYTKJXK
+Each export retains previous captures. Extract the Gamescope and Android JSONL
+pair for exactly one capture into its own directory. Do not combine runs:
+
+```sh
+python3 -B tools/panvk/analyze_frame_journal.py /path/to/one/capture > shared-summary.json
 ```
 
-After Launch, require fresh workers. Logs must show `capable=yes` and qualifying
-mappings with `transport=shared mmap`; fallback is not a successful shared test.
-Keep Steam moving again:
+Require both footers to report `dropped=0`, `complete=true`, readiness before
+start, positive joined frames and positive complete selected/broker samples.
+For complete sampled queues, inspect
+`upload_queue_decomposition.per_queue[*].client_stage_span_counts.proxy_shared_rpc`
+and `broker_stage_span_counts.broker_shared_copy`: B must have positive counts,
+with persistent-slot `proxy_bulk_rpc` and `broker_mapped_copy` absent or approaching
+zero. A must retain pixel bulk writes. Unrelated mappings can still bulk-upload.
+Dropped records invalidate exact decomposition; a zero count from an unsampled or
+incomplete queue is not evidence that work disappeared.
 
-```fish
-python3 -B tools/panvk/frame_journal.py status --serial E68DS8U4IVYTKJXK
-python3 -B tools/panvk/stage_phone_test.py --serial E68DS8U4IVYTKJXK \
-  --frame-diagnostics --perf-seconds 10 --perf-output "$ab_dir/B" --run
-python3 -B tools/panvk/frame_journal.py disarm --serial E68DS8U4IVYTKJXK
-for arm in A B
-  python3 -B tools/panvk/analyze_frame_journal.py "$ab_dir/$arm/frame-journal" > "$ab_dir/$arm/upload-summary.json"
-  python3 -B tools/panvk/analyze_steam_frames.py "$ab_dir/$arm" \
-    --trace-processor /tmp/droiddeck-trace-processor > "$ab_dir/$arm/external-summary.json"
-  python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); d=s["upload_queue_decomposition"]; print(sys.argv[1],s["capture_quality"]); assert s["lossless_complete_window"] and s["joined_frames"]>0 and not s["unmatched_publish_ids"]; assert d["complete_selected_samples"]>0 and d["broker_complete_samples"]>0; print(d["complete_selected_samples"],d["paired_total_queue_mean_ms"]); print([{"attempt":r["attempt"],"bulk":r["client_stage_span_counts"].get("proxy_bulk_rpc",0),"shared":r["client_stage_span_counts"].get("proxy_shared_rpc",0),"payload_copies":r["broker_stage_span_counts"].get("broker_mapped_copy",0),"shared_copies":r["broker_stage_span_counts"].get("broker_shared_copy",0),"submits":r["broker_stage_span_counts"].get("vk_submit",0)} for r in d["per_queue"] if r["unattributed_ns"] is not None and r["broker_attribution_complete"]])' "$ab_dir/$arm/upload-summary.json"
-end
-```
+Verify pixels, text, colors, resizing, scrolling, repeated pool reuse, Stop/Launch
+and disconnect cleanup. Keep PanVK optional client selection unchanged; if it was
+enabled, repeat the Phase 5 CEF proof independently. Queue-submit wall time is not
+GPU execution time, rpc_receive includes blocking/scheduling, offCPU includes all
+descheduling, Android latch is not physical scanout, and release-fence time is the
+first observed readability.
 
-Both footers must show `"dropped":0,"complete":true`, readiness before start,
-joined frames and positive complete selected/broker samples. External validation
-must still prove ANGLE_VULKAN/PanVK/Mali-G52, no active llvmpipe and
-`affinity-restored.ok=true` without errors. B needs positive shared counts and
-zero persistent-slot bulk/payload-copy counts. Compare mirror, control/socket
-RPC, shared copy, upload_queue, SHM import and CEF/X11/Android rates in the same
-captures. Check visual correctness including text, colors, resizing and scroll.
-
-Repeat B in a fresh directory, and normal Stop/Launch, to check reuse/restart.
-Finally normal **Stop**, remove the gate, arm before Launch and repeat A in a
-fresh directory to verify fallback. Leave the feature disabled and disarm:
-
-```fish
-adb -s E68DS8U4IVYTKJXK shell rm -f /sdcard/Download/DroidDeck/shared-staging.enabled
-python3 -B tools/panvk/frame_journal.py disarm --serial E68DS8U4IVYTKJXK
-```
-
-Only new phone evidence can establish compatibility, exact output and speedup.
+Finally Stop, remove the marker, Launch and repeat A to prove restoration of the
+2 MiB fallback. Leave shared staging disabled and the journal disarmed after tests.
+Only device evidence can establish Android memfd/SELinux compatibility and speedup.

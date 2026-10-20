@@ -33,7 +33,10 @@ class SharedTransportTests(unittest.TestCase):
         repo=ROOT.parents[1]
         gate=(repo/'app/src/main/java/com/droiddeck/launcher/gpu/MaliNormalBroker.kt').read_text()
         self.assertIn('"shared-staging.enabled").isFile',gate)
-        self.assertIn('MALI_VULKAN_SHARED_STAGING=${if (sharedStaging) "1" else "0"}',gate)
-        self.assertIn('"MALI_VULKAN_SHARED_STAGING"',(repo/'tools/gamescope/patches/0124-mali-steam-xwayland-client.patch').read_text())
+        self.assertIn('getExternalFilesDir("mali-vulkan")',gate)
+        self.assertIn('MALI_VULKAN_SHARED_STAGING=${if (enabled) "1" else "0"}',gate)
+        self.assertNotIn('debugLogDir',gate)
+        self.assertNotIn('/Download/',gate)
+        self.assertIn('"MALI_VULKAN_SHARED_STAGING"',(repo/'tools/gamescope/patches/0215-mali-steam-xwayland-client.patch').read_text())
         self.assertIn('mb_shared_probe(path)',(ROOT/'icd_proxy.c').read_text())
 if __name__=='__main__':unittest.main()

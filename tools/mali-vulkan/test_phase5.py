@@ -101,11 +101,10 @@ FROZEN = {'patches': {'files': ['tools/gamescope/patches/0002-steamcompmgr-fallb
                       'tools/mali-vulkan/upload_ring_api.h',
                       'app/src/main/cpp/waylandcomp/src/ahb_swapchain.c',
                       'app/src/main/cpp/waylandcomp/src/sc_layer.c',
-                      'app/src/main/java/com/droiddeck/launcher/gpu/MaliNormalBroker.kt',
                       'app/src/main/java/com/droiddeck/launcher/gpu/SystemVulkanBroker.kt',
                       'app/src/main/java/com/droiddeck/launcher/gpu/MaliSessionSelection.kt',
                       'app/src/main/java/com/droiddeck/launcher/session/SessionService.kt'],
-            'sha256': 'dbceca6f5b5fec7d6e48d2113026bef694b1ec5aa05e27805ce701f71a5098a2'}}
+            'sha256': '580479121e80518ebc1a385139ac32adbdd19d4053644de38570379f54e5a8b7'}}
 
 
 class Phase5Tests(unittest.TestCase):
@@ -163,7 +162,7 @@ class Phase5Tests(unittest.TestCase):
         self.assertIn('_bl_panvk_client=(python3', script)
         self.assertNotIn('steam_client=(python3', script)
         broker = (JAVA / 'gpu/MaliNormalBroker.kt').read_text()
-        self.assertIn('MALI_VULKAN_SHARED_STAGING=0', broker)
+        self.assertIn('sharedStagingEnvironment', broker)
         self.assertNotIn('PANVK_ATOM_STRIDE', broker)
         control = (JAVA / 'gpu/MaliSessionControls.kt').read_text()
         self.assertNotIn('PANVK_ATOM_STRIDE', control)

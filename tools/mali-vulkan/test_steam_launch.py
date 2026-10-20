@@ -39,13 +39,14 @@ class SteamLaunchTests(unittest.TestCase):
             BL_MALI_STEAM_UI='1', XDG_RUNTIME_DIR=str(self.root), WAYLAND_DISPLAY='wayland-0',
             MALI_VULKAN_NORMAL_SESSION='1', MALI_VULKAN_BROKER_SOCKET=str(self.root / 'broker'),
             VK_ICD_FILENAMES=str(self.root / 'mali.json'), VK_DRIVER_FILES=str(self.root / 'mali.json'))
+        self.env.pop('MALI_VULKAN_SHARED_STAGING', None)
         (self.root / 'mali.json').write_text('{}')
         (self.root / 'swrast.so').touch()
         for name in ('broker', 'wayland-0'):
             sock = socket.socket(socket.AF_UNIX)
             sock.bind(str(self.root / name))
             self.addCleanup(sock.close)
-        self.stub('gamescope', "import json,os,sys\nprint('ARGV='+json.dumps(sys.argv[1:]))\nprint('ICD='+os.environ['VK_DRIVER_FILES'])\nprint('INSIDE='+os.environ.get('BL_INSIDE',''))")
+        self.stub('gamescope', "import json,os,sys\nprint('ARGV='+json.dumps(sys.argv[1:]))\nprint('ICD='+os.environ['VK_DRIVER_FILES'])\nprint('INSIDE='+os.environ.get('BL_INSIDE',''))\nprint('SHARED='+os.environ.get('MALI_VULKAN_SHARED_STAGING','0'))")
         self.stub('Xwayland', 'pass')
 
     def stub(self, name, body):
@@ -74,8 +75,18 @@ class SteamLaunchTests(unittest.TestCase):
         self.assertEqual(args, ['--backend', 'wayland', '--mali-wayland-session', '--mali-xwayland',
             '--expose-wayland', '-f', '-W', '1280', '-H', '720', '--', str(self.script), 'steam'])
         self.assertIn('INSIDE=1', result.stdout)
+        self.assertIn('SHARED=0', result.stdout)
         self.assertIn('ICD=' + self.env['VK_DRIVER_FILES'], result.stdout)
         self.assertNotIn('--mali-interactive-client', result.stdout)
+
+    def test_shared_transport_reaches_only_outer_proxy_with_same_steam_command(self):
+        baseline = self.run_session()
+        enabled = self.run_session(env={'MALI_VULKAN_SHARED_STAGING': '1'})
+        self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+        self.assertIn('SHARED=1', enabled.stdout)
+        self.assertIn('ICD=' + self.env['VK_DRIVER_FILES'], enabled.stdout)
+        argv = lambda result: next(line for line in result.stdout.splitlines() if line.startswith('ARGV='))
+        self.assertEqual(argv(baseline), argv(enabled))
 
     def test_outer_gamescope_ignores_client_config_and_retains_its_proxy_icd(self):
         config = Path(self.env['HOME']) / '.config/droiddeck/steam-client-panvk.json'
@@ -152,7 +163,7 @@ calls=json.loads(p.read_text()) if p.exists() else []
 calls.append(sys.argv[1:]);p.write_text(json.dumps(calls))
 e=root/'client-envs.json'
 envs=json.loads(e.read_text()) if e.exists() else []
-envs.append({k:os.environ.get(k) for k in ('PANVK_ATOM_STRIDE','VK_DRIVER_FILES','LIBGL_ALWAYS_SOFTWARE','ANGLE_DEFAULT_PLATFORM')})
+envs.append({k:os.environ.get(k) for k in ('PANVK_ATOM_STRIDE','VK_DRIVER_FILES','LIBGL_ALWAYS_SOFTWARE','ANGLE_DEFAULT_PLATFORM','MALI_VULKAN_SHARED_STAGING')})
 e.write_text(json.dumps(envs))
 if '-shutdown' in sys.argv:
     (root/'shutdown-ack').touch();sys.exit(0)
@@ -228,7 +239,7 @@ if mode=='launch':
         self.assertIn('configuration/launch FAIL', result.stdout)
 
     def test_software_fallback_without_configuration_clears_client_acceleration_overrides(self):
-        self.env.update(PANVK_ATOM_STRIDE='64', ANGLE_DEFAULT_PLATFORM='vulkan')
+        self.env.update(PANVK_ATOM_STRIDE='64', ANGLE_DEFAULT_PLATFORM='vulkan', MALI_VULKAN_SHARED_STAGING='1')
         result, calls = self.inner()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('-cef-use-angle=gl', calls[0])
@@ -238,8 +249,10 @@ if mode=='launch':
         self.assertIsNone(environments[0]['VK_DRIVER_FILES'])
         self.assertIsNone(environments[0]['PANVK_ATOM_STRIDE'])
         self.assertIsNone(environments[0]['ANGLE_DEFAULT_PLATFORM'])
+        self.assertIsNone(environments[0]['MALI_VULKAN_SHARED_STAGING'])
 
     def test_optional_panvk_uses_supported_cef_option_across_update_restart(self):
+        self.env['MALI_VULKAN_SHARED_STAGING'] = '1'
         result, calls = self.inner(exits=(42, 0), experimental=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(calls), 2)
@@ -248,7 +261,8 @@ if mode=='launch':
             self.assertFalse(any(arg.startswith(('-cef-use-gl', '-cef-use-angle')) for arg in args))
         environments = json.loads((self.root / 'client-envs.json').read_text())
         self.assertTrue(all(row['PANVK_ATOM_STRIDE'] == '56' and row['ANGLE_DEFAULT_PLATFORM'] == 'vulkan'
-                            and row['LIBGL_ALWAYS_SOFTWARE'] is None for row in environments))
+                            and row['LIBGL_ALWAYS_SOFTWARE'] is None
+                            and row['MALI_VULKAN_SHARED_STAGING'] is None for row in environments))
 
     def test_accelerated_client_stop_uses_native_shutdown_and_software_recovery(self):
         result, calls = self.inner(graceful=True, experimental=True)

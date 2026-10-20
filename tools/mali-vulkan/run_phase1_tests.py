@@ -29,8 +29,6 @@ PANVK_TESTS = (
 DEFERRED_MALI = {
     'test_bulk.BulkMemoryTests.test_protocol_patch_applies_zero_fuzz_and_matches_canonical_headers':
         'Gamescope patches are deferred',
-    'test_shared_staging.SharedTransportTests.test_gate_is_default_off_and_client_environment_strips_it':
-        'Android session wiring and Gamescope patches are deferred',
     'test_staging.StagingTests.test_normal_integration_and_unchanged_output_sync':
         'Gamescope patches are deferred',
     'test_wait.WaitAttributionTests.test_real_source_sites_and_normal_only_gate':

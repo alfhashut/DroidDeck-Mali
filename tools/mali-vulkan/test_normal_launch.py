@@ -73,7 +73,7 @@ class NormalLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="normal-launch-") as directory:
             root = Path(directory)
             executable = root / "gamescope"
-            executable.write_text("#!/usr/bin/env python3\nimport json,os,sys\nprint('ARGV='+json.dumps(sys.argv[1:]))\nprint('ICD='+os.environ['VK_ICD_FILENAMES'])\n")
+            executable.write_text("#!/usr/bin/env python3\nimport json,os,sys\nprint('ARGV='+json.dumps(sys.argv[1:]))\nprint('ICD='+os.environ['VK_ICD_FILENAMES'])\nprint('SHARED='+os.environ.get('MALI_VULKAN_SHARED_STAGING','0'))\n")
             executable.chmod(0o755)
             manifest = root / "mali.json"
             manifest.write_text('{"ICD":{"library_path":"proxy.so","api_version":"1.0.0"}}')
@@ -82,6 +82,7 @@ class NormalLaunchTests(unittest.TestCase):
                        XDG_RUNTIME_DIR=directory, WAYLAND_DISPLAY="wayland-0",
                        MALI_VULKAN_NORMAL_SESSION="1", MALI_VULKAN_BROKER_SOCKET=str(root / "broker"),
                        VK_ICD_FILENAMES=str(manifest), VK_DRIVER_FILES=str(manifest))
+            env.pop("MALI_VULKAN_SHARED_STAGING", None)
             with socket.socket(socket.AF_UNIX) as display, socket.socket(socket.AF_UNIX) as broker:
                 display.bind(str(root / "wayland-0")); broker.bind(str(root / "broker"))
                 if change:
@@ -92,9 +93,21 @@ class NormalLaunchTests(unittest.TestCase):
     def test_normal_script_selects_actual_wayland_backend_and_ordinary_child(self):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SHARED=0", result.stdout)
         args = json.loads(next(line[5:] for line in result.stdout.splitlines() if line.startswith("ARGV=")))
         self.assertEqual(args, ["--backend", "wayland", "--mali-wayland-session", "--expose-wayland", "-f",
                                 "-W", "1280", "-H", "720", "--", "/usr/local/bin/gamescope", "--mali-interactive-client"])
+
+    def test_explicit_shared_transport_retains_proxy_and_gamescope_arguments(self):
+        baseline = self.run_script()
+        enabled = self.run_script({"MALI_VULKAN_SHARED_STAGING": "1"})
+        self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+        self.assertIn("SHARED=1", enabled.stdout)
+        for result in (baseline, enabled):
+            self.assertIn("ICD=", result.stdout)
+            self.assertIn("mali.json", result.stdout)
+        argv = lambda result: next(line for line in result.stdout.splitlines() if line.startswith("ARGV="))
+        self.assertEqual(argv(baseline), argv(enabled))
 
     def test_normal_script_missing_broker_fails_without_starting_gamescope(self):
         result = self.run_script({"MALI_VULKAN_BROKER_SOCKET": "/nonexistent/droiddeck-broker"})
@@ -110,7 +123,7 @@ class NormalLaunchTests(unittest.TestCase):
 
     def test_normal_script_requires_opt_in_and_outer_wayland_0(self):
         for change in ({"MALI_VULKAN_NORMAL_SESSION": "0"}, {"WAYLAND_DISPLAY": "wayland-1"},
-                       {"MALI_VULKAN_SHARED_STAGING": "1"}):
+                       {"MALI_VULKAN_SHARED_STAGING": "2"}, {"MALI_VULKAN_SHARED_STAGING": "true"}):
             with self.subTest(change=change):
                 result = self.run_script(change)
                 self.assertEqual(result.returncode, 65)

@@ -24,7 +24,10 @@ if [ "$mode" = mali-wayland ] || { [ "$mode" = steam ] && [ "${BL_MALI_STEAM_UI:
   [ -S "${XDG_RUNTIME_DIR:?}/wayland-0" ] || { echo 'Android Wayland compositor socket is not ready'; exit 65; }
   [ -S "${MALI_VULKAN_BROKER_SOCKET:?}" ] || { echo 'Mali broker socket disappeared after readiness handshake'; exit 65; }
   [ -s "${VK_ICD_FILENAMES:?}" ] && [ "${VK_DRIVER_FILES:-}" = "$VK_ICD_FILENAMES" ] || { echo 'Mali proxy manifest missing'; exit 65; }
-  [ "${MALI_VULKAN_SHARED_STAGING:-0}" = 0 ] || { echo 'Mali shared staging is disabled'; exit 65; }
+  case ${MALI_VULKAN_SHARED_STAGING:-0} in
+    0|1) ;;
+    *) echo 'Mali shared staging must be 0 or 1'; exit 65 ;;
+  esac
   if [ "$mode" = steam ] && [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
     [ "${BL_STEAM_CLIENT_ARCH:-arm64}" = arm64 ] || { echo 'Mali software compatibility requires the ARM64 Steam client'; exit 66; }
     command -v Xwayland >/dev/null 2>&1 || { echo 'Mali Steam compatibility unavailable: Xwayland missing'; exit 66; }

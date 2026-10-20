@@ -79,10 +79,11 @@ class FinalPathTests(unittest.TestCase):
         self.assertIn('MALI_RELEASE_TIMEOUT', stop)
         self.assertIn('SessionActivity.EXTRA_STEAMVR', (JAVA / 'MainActivity.kt').read_text())
 
-    def test_controls_use_app_specific_paths_and_never_activate_shared_or_panvk(self):
+    def test_controls_use_app_specific_paths_and_cannot_override_shared_or_panvk(self):
         broker = (JAVA / 'gpu/MaliNormalBroker.kt').read_text()
         self.assertIn('File(LinuxRuntime.logDir(context), "mali-frame-trace")', broker)
-        self.assertIn('MALI_VULKAN_SHARED_STAGING=0', broker)
+        self.assertIn('getExternalFilesDir("mali-vulkan")', broker)
+        self.assertIn('sharedStagingEnvironment', broker)
         self.assertNotIn('debugLogDir', broker)
         controls = (JAVA / 'gpu/MaliSessionControls.kt').read_text()
         for forbidden in ('VK_DRIVER_FILES', 'MALI_VULKAN_SHARED_STAGING', 'PANVK_ATOM_STRIDE', 'FRAME_TRACE_DIR'):

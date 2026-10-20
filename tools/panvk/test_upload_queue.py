@@ -149,6 +149,9 @@ class UploadQueueTests(unittest.TestCase):
         self.assertNotIn('broker_mapped_copy',row['broker_stage_span_counts'])
         self.assertIn('android/broker_shared_copy',out['stage_spans'])
         self.assertAlmostEqual(d['unattributed_inside_queue_mean_ms'],0.8)
+        lossy=self.analyze(dropped=1);d=lossy['upload_queue_decomposition']
+        self.assertFalse(lossy['lossless_complete_window'])
+        self.assertEqual((d['complete_selected_samples'],d['broker_complete_samples'],d['remainder_samples']),(0,0,0))
 
     def test_different_native_namespace_not_joined(self):
         self.transport_fixture()

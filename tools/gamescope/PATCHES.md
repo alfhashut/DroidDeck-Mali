@@ -112,7 +112,12 @@ Android latch is not scanout, and any dropped records invalidate exact decomposi
 
 0215 retains Phase 3's unconditional removal of private proxy/broker variables from
 every nested client. Only Gamescope uses the Mali proxy; Xwayland and ARM64 Steam use
-Mesa software GL/SHM. PanVK, CEF Vulkan acceleration and shared CPU staging remain off.
+Mesa software GL/SHM by default. Phase 5 adds an optional client-only PanVK/CEF
+route outside the Gamescope bridge. Phase 6 adds a default-off app-specific shared
+CPU staging marker; the existing private mapper and child-environment stripping
+already support it, so the 27-patch stack remains byte-identical through 0218.
+Shared staging changes only proxy/broker CPU transport and retains 2 MiB bulk
+fallback. See `tools/mali-vulkan/SHARED_STAGING.md` for the opt-in and validation.
 
 `check-diagnostics.sh` checks thirteen command markers plus the Xwayland and optimized
 private-API markers, including in same-run artifact overlays. On the ARM64 builder it

@@ -6,6 +6,7 @@ import android.net.LocalSocketAddress
 import android.os.SystemClock
 import android.system.Os
 import android.system.OsConstants
+import android.util.Log
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import com.droiddeck.launcher.wayland.CompositorHost
 import java.io.File
@@ -87,8 +88,10 @@ object MaliNormalBroker {
             val elf = library.inputStream().use { input -> ByteArray(20).also { check(input.read(it) == it.size) } }
             check(elf[0] == 0x7f.toByte() && elf[1] == 'E'.code.toByte() && elf[2] == 'L'.code.toByte() && elf[3] == 'F'.code.toByte() &&
                 elf[4] == 2.toByte() && elf[5] == 1.toByte() && elf[18] == 0xb7.toByte() && elf[19] == 0.toByte()) { "Mali proxy asset is not an AArch64 ELF library" }
+            val sharedStaging = sharedStagingEnvironment(runCatching { context.getExternalFilesDir("mali-vulkan") }.getOrNull())
+            Log.i("MaliNormalBroker", "CPU shared staging: $sharedStaging; 2 MiB bulk fallback retained")
             return MaliSessionSelection.environment(manifest.path, socket) +
-                listOf("MALI_VULKAN_SHARED_STAGING=0", "DROIDDECK_FRAME_TRACE_DIR=${traceDirectory.path}")
+                listOf(sharedStaging, "DROIDDECK_FRAME_TRACE_DIR=${traceDirectory.path}")
         } catch (error: Throwable) {
             runCatching { SystemVulkanBroker.stopNormal() }.exceptionOrNull()?.let { error.addSuppressed(it) }
             throw error
@@ -96,6 +99,11 @@ object MaliNormalBroker {
     }
 
     internal fun validateProxyManifest(manifest: File): File = SystemVulkanBroker.validateProxyManifest(manifest)
+
+    internal fun sharedStagingEnvironment(directory: File?): String {
+        val enabled = directory?.let { File(it, "shared-staging.enabled").isFile } == true
+        return "MALI_VULKAN_SHARED_STAGING=${if (enabled) "1" else "0"}"
+    }
 
     @Synchronized fun stop(): Boolean = SystemVulkanBroker.stopNormal()
 }
