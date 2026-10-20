@@ -20,7 +20,17 @@ if [ -n "${BL_DEBUG_DIR:-}" ]; then
   exec >>"$BL_DEBUG_DIR/desktop.log" 2>&1
   echo "== droiddeck-desktop $(date -u '+%Y-%m-%d %H:%M:%S UTC') ${BL_WIDTH:-1280}x${BL_HEIGHT:-720}"
 fi
+mali_desktop_parent() {
+  [ "${BL_MALI_DESKTOP:-0}" = 1 ] || return 0
+  local parent=$XDG_RUNTIME_DIR/wayland-0
+  [ "${WAYLAND_DISPLAY:-}" = wayland-0 ] && [ -L "$parent" ] && [ -S "$parent" ] || {
+    echo "== Mali desktop parent unavailable ($1): $parent"
+    return 65
+  }
+  echo "== Mali desktop parent ($1): $parent -> $(readlink -- "$parent") (socket present)"
+}
 find "$XDG_RUNTIME_DIR" -mindepth 1 -maxdepth 1 ! -name 'wayland-0*' ! -name 'keymap.xkb' -exec rm -rf {} + 2>/dev/null
+mali_desktop_parent after-cleanup || exit $?
 chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null
 mkdir -p /tmp/.X11-unix /tmp/.ICE-unix && chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix 2>/dev/null
 export BL_DESKTOP=1
@@ -74,6 +84,10 @@ if [ -f "$HOME/.droiddeck-remote-run" ]; then
   ) &
 fi
 echo "== droiddeck-desktop: Plasma on $WAYLAND_DISPLAY"
+mali_desktop_parent before-Plasma || exit $?
+if [ "${BL_MALI_DESKTOP:-0}" = 1 ] && [ -n "${BL_DEBUG_DIR:-}" ]; then
+  wayland-info >"$BL_DEBUG_DIR/mali-desktop-wayland.txt" 2>&1 || echo '== Mali desktop parent globals query failed'
+fi
 dbus-run-session -- startplasma-wayland
 rc=$?
 echo "== droiddeck-desktop: Plasma ended ($rc)"

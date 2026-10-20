@@ -17,7 +17,8 @@ def main():
     if args.gamescope_source:
         os.environ['GAMESCOPE_SOURCE'] = str(args.gamescope_source.resolve())
     return 0 if run_suite(HERE, ('test_normal', 'test_normal_launch',
-                                'test_session.SessionBrokerTests', 'test_phase3'), {}) else 1
+                                'test_session.SessionBrokerTests', 'test_phase3',
+                                'test_desktop_startup'), {}) else 1
 
 
 if __name__ == '__main__':

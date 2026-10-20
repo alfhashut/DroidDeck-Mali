@@ -81,6 +81,7 @@ The Mali diagnostic patches follow all 0.5 patches in filename order. Their orig
 | `0216-mali-steam-x11-presentation-diagnostics.patch` | 0125 | Opt-in X11 surface/presentation evidence |
 | `0217-mali-frame-trace.patch` | 0126 | Bounded opt-in frame journal, explicit identities and dropped-record accounting |
 | `0218-mali-staging-bulk-writes.patch` | 0127 | Coordinated 2 MiB persistent-staging write bound; shader bound unchanged |
+| `0219-mali-desktop-first-frame-grace.patch` | local desktop follow-up | Explicit KDE child: bounded 90-second first-frame allowance, then original 15-second no-progress watchdog |
 
 All 20 patches through 0211 retain their exact bytes. Phase 4 adds only 0212–0218,
 regenerated against their complete preceding stack on Gamescope 3.16.29.
@@ -95,7 +96,7 @@ the complete stack matches the existing Phase 1 broker/proxy headers byte for by
 These seven overlays must ship together.
 
 Filename order is the application order: 0002, 0009, 0019, 0020, 0100, 0101, 0110,
-0111, 0112, 0114, 0115, 0200–0206, 0210–0218. `test_phase3.py` applies the entire
+0111, 0112, 0114, 0115, 0200–0206, 0210–0219. `test_phase3.py` applies the entire
 stack with zero fuzz, checks that every Mali hunk has zero offset, verifies protocol/header
 parity, and executes the actual output-pool state machine. The normal child receives
 its nested Wayland socket without the compositor's private proxy/broker environment.
@@ -128,3 +129,20 @@ source fingerprint, same-run artifact overlay, and runtime SONAME audit remain.
 The Phase 4 host runner exercises the actual small staging/registry/transport/journal
 implementations and software launch script. Full Gamescope compilation and real
 Mali/Android presentation remain CI/device checks. See `docs/development/mali-phase4.md`.
+
+## KDE startup follow-up
+
+0219 follows 0218 and preserves every previous patch byte. It changes only the
+normal-session watchdog state and its logging. A first-frame allowance of 90
+seconds requires `BL_MALI_DESKTOP=1`, a `droiddeck-session lxqt` child, and no
+`--mali-xwayland`. After the first successful Present, the original 15-second
+no-progress limit applies. Connections, surface creation and commits do not reset
+that timer. Interactive diagnostics retain 15 seconds from child startup; Steam's
+existing Xwayland watchdog exemption is unchanged. Fatal child/display errors and
+normal Stop remain immediate independent of this timer.
+
+This does not add desktop Wayland protocols. The existing normal server does not
+create an xdg-shell global; the desktop's recorded KWin 6.7.5 requires one (and
+other globals) in its nested backend. Startup grace is therefore not proof that
+KDE can render on this server. See `docs/development/mali-phase3.md` for the
+source-backed compatibility gap, actual device status and required next evidence.

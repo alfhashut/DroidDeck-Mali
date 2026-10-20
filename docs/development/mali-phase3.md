@@ -38,30 +38,129 @@ by Gamescope, accepting relative and absolute `WAYLAND_DISPLAY` values. This
 preserves KDE's existing parent-at-wayland-0 / own-socket-at-wayland-1 convention.
 Desktop socket cleanup stays within that private directory and cannot unlink the
 Android display, Gamescope's nested display or broker socket. A missing parent
-socket fails startup. The ordinary non-Mali Desktop launcher and KDE scripts are
-unchanged. The native `gamescope --mali-interactive-client` diagnostic remains
+socket fails startup. The ordinary non-Mali Desktop route is unchanged; new KDE-script checks
+are gated to the explicit Mali desktop child. The native `gamescope --mali-interactive-client` diagnostic remains
 available separately; it is no longer the normal Desktop child.
 
 User-reported real Mali-G52 validation proves the interactive Mali client at
-approximately 60 FPS through the proxy/Bionic/system-Vulkan/AHB path, clean Stop
-without stale Gamescope/proot/session processes, and successful relaunch at
-approximately 60 FPS. Both shared staging and PanVK were OFF in that validation.
-**KDE through this route has not yet been device-validated.** CI must package the
-updated managed script; device follow-up must prove actual Plasma startup, nested
-KWin connecting through Gamescope, input/resize, clean Stop and relaunch, with
-shared staging and PanVK still OFF. No Gamescope patch, native/protocol code,
-AHB/release-fence behavior, shared-staging gate or PanVK implementation changes.
+approximately 60 FPS, clean Stop without stale Gamescope/proot/session processes,
+and successful relaunch. Shared staging and PanVK were OFF. The subsequent KDE
+device run establishes: **renderer initialization PASS; KDE routing PASS; KDE
+launcher reached PASS; first KDE frame FAIL/PENDING; cause under investigation.**
+KDE reaches startplasma-wayland, KWin, kcminit and desktop portals, but Gamescope
+reports commits=0, frames=0 and presented=0 before a clean watchdog teardown. No
+Android crash was reported. This is not successful KDE device validation.
 
-Focused host tests execute the outer desktop command and existing `lxqt` branch
-with mock Gamescope/KDE processes. They check private socket routing and cleanup
-(including a second launch and absolute parent names), diagnostic CLI retention,
-and the unchanged Steam Mali command/client isolation. They do not run real KDE
-or establish additional device results.
+**Socket alias and cold-start watchdog investigation**
 
-Follow-up lightweight checks passed: 29 Mali desktop/Steam launcher tests,
-12 session/bridge/client isolation contracts, and 38 existing Desktop/Steam/x86/
-asset/runtime-input tests. Session shell syntax, Python parsing and
-`git diff --check` passed. No local Android, Gamescope or NDK build was run.
+For the reported generated `wayland-1` socket, the intended paths are:
+
+```text
+/run/droiddeck/wayland-0                 Android compositor (untouched)
+/run/droiddeck/wayland-1                 Gamescope nested server
+/run/droiddeck/mali-desktop/wayland-0 -> /run/droiddeck/wayland-1
+/run/droiddeck/mali-desktop/wayland-1    KWin's own socket
+```
+
+The desktop child exports `XDG_RUNTIME_DIR=/run/droiddeck/mali-desktop` and
+`WAYLAND_DISPLAY=wayland-0`. KDE reporting wayland-0 is therefore expected: it
+names the private alias, not Android's socket. The parent is taken from Gamescope's
+actual generated socket name, not assumed to be 0 or 1. The reported lockfile
+warning for outer wayland-0 is followed by successful allocation of wayland-1;
+it is not evidence that the private alias points to Android. Only the private directory
+is cleaned, with `wayland-0*` excluded. New Mali-only checks/logs verify the alias
+at handoff, after desktop cleanup, before Plasma and immediately before executing
+KWin. A missing/non-socket alias fails cleanly instead of falling back to Android.
+The logs prove path existence at those stages; they do not prove KWin submitted a
+frame. Actual device alias survival through KWin still requires those new logs.
+
+A host socket test now runs the actual session, desktop and KWin wrapper scripts
+with filesystem paths redirected and mocked KDE binaries. It completes a socket
+handshake from the wrapper's parent alias to the mock Gamescope server after
+cleanup and Plasma entry. It repeats with generated names wayland-7 and absolute
+wayland-11, preserves Android/broker socket inodes, creates KWin's separate socket,
+and proves alias loss fails before Plasma. These are host proofs, not real KWin
+protocol or phone rendering tests.
+
+The old watchdog starts after StartServer forks the child, before the child's
+locale/font/desktop/Plasma preparation, and resets only on successful Present.
+The reported child start at 00:57:39 and watchdog failure at 00:57:54 match that
+15-second limit, leaving about 13 seconds after the desktop step at 00:57:41.
+The 15-second pre-frame cutoff is established; whether cold-start delay alone explains the
+zero-frame result is not established.
+
+New patch `0219-mali-desktop-first-frame-grace.patch` gives only the explicit
+`BL_MALI_DESKTOP=1` plus `droiddeck-session lxqt` non-Xwayland child up to 90 seconds
+for its first successful Present. Then it uses the original 15-second no-progress
+limit from the latest successful Present. Client connection, surface creation,
+commits and setup messages cannot prolong startup. Failure remains bounded at 90
+seconds if no frame arrives. Interactive diagnostics retain their original
+15-second startup/progress behavior, even if the desktop flag is inherited with a
+different child command. Steam's existing Xwayland behavior is unchanged. Child
+exit, outer-display failure and Stop are still handled independently of the timer.
+All 27 earlier patches are unchanged; order is now 0210–0219 after 0200–0206.
+
+**Separate Wayland compatibility gap**
+
+Source inspection also shows that `StartServer` creates the basic compositor,
+seat and renderer globals but no xdg-shell. The desktop build pins KWin 6.7.5 in `tools/desktop-kde/build-kwin.sh`; its
+local nested-scale patch leaves backend initialization requirements unchanged. Upstream [KWin 6.7.5 WaylandDisplay::initialize](https://github.com/KDE/kwin/blob/v6.7.5/src/backends/wayland/wayland_display.cpp)
+rejects a parent missing xdg-shell. It also checks subcompositor, single-pixel-buffer,
+viewporter, seat, pointer constraints and presentation-time availability. This is
+a concrete source compatibility gap, independently of the socket alias and timer.
+The installed phone's exact KWin package and backend errors still need verification;
+the abbreviated desktop log does not prove which requirement stopped that run.
+Extending startup alone cannot supply missing Wayland protocols.
+
+For the next device run, the Mali desktop captures the parent globals in
+`$BL_DEBUG_DIR/mali-desktop-wayland.txt` immediately before Plasma. Inspect that
+file, all alias checkpoints and the full KWin backend stderr in desktop.log;
+record the installed `pacman -Q kwin` version. Confirm whether xdg_wm_base and the
+other required globals are absent and whether KWin explicitly rejects them.
+A scoped implementation of the missing desktop protocols, with real configure,
+ACK, surface-role and presentation semantics and focused client tests, remains
+necessary if this backend is used. This change does not fabricate protocol support
+or expand the experimental single-client compositor into a complete desktop shell.
+The proot/systemd/priority/FUSE/portal warnings are not assigned as root cause.
+
+No broker/proxy opcode, Vulkan synchronization, AHB/release ownership, PanVK,
+shared-staging gate or Steam client behavior changes. Shared staging and PanVK
+remain OFF for the device follow-up. There is no local Android/Gamescope/NDK build
+or claim of an additional device result. CI must compile the new Gamescope patch
+and package all three managed scripts from one matching source revision.
+
+**Startup-investigation changed files and checks**
+
+| File | Change |
+| --- | --- |
+| `tools/gamescope/patches/0219-mali-desktop-first-frame-grace.patch` | Add the scoped first-frame watchdog and pure deadline helper; preserve all 27 existing patch bytes and rendering/cleanup code. |
+| `tools/linuxfs/overlay/usr/local/bin/droiddeck-session` | Verify and log the existing private socket alias after handoff; keep routing and transport options unchanged. |
+| `tools/linuxfs/desktop/droiddeck-desktop` | Add Mali-only alias checks after cleanup and before Plasma, plus parent-global capture; ordinary Desktop behavior is unchanged. |
+| `tools/linuxfs/desktop/kwin_wayland_wrapper` | Verify/log the same alias immediately before KWin; retain all existing wrapper arguments and non-Mali behavior. |
+| `tools/mali-vulkan/test_desktop_startup.py` | Compile only the standalone deadline helper, test virtual-time bounds and explicit route selection, and exercise real launcher scripts with mocked KDE and socket handshakes. |
+| `tools/mali-vulkan/run_phase3_tests.py` | Include the focused startup tests in the existing CI host suite. |
+| `tools/mali-vulkan/test_phase3.py` | Extend explicit patch order through 0219 and retain zero-fuzz/zero-offset/header/ownership checks. |
+| `tools/gamescope/PATCHES.md` | Document 0219, exact scope and the unresolved KWin protocol gap. |
+| `docs/development/mali-phase3.md` | Record this diagnosis, actual device status, socket paths, test results and remaining validation. |
+
+Lightweight results: **55 focused startup/launcher/patch/isolation tests and 38
+existing Desktop/Steam/x86/asset/runtime-input tests passed**. The complete
+28-patch stack applies to pristine pinned Gamescope 3.16.29; all Mali hunks apply
+with zero fuzz and zero offset. Canonical Vulkan/proxy/AHB headers remain equal.
+Three changed shell scripts pass `bash -n`; three changed/new Python files parse.
+All-file `git diff --check` includes the new patch and test through a temporary
+index; no files are staged or committed. The small C++ fixture exercises real
+watchdog code with a synthetic monotonic clock, without waiting 90 seconds or
+compiling Gamescope. No NDK, APK, Mesa or PanVK build ran locally.
+
+On the next matching CI/device run require the 90-second KDE-startup log, the
+handoff/after-cleanup/before-Plasma/KWin alias checkpoints, parent-global capture
+and full backend error log. A successful frame must log the transition back to
+15 seconds, followed by real nonzero commits/frames/presented/releases. Test Stop
+during startup, bounded no-frame failure at 90 seconds, post-first-frame hang
+failure at 15 seconds, and clean restart. Repeat the unchanged interactive client
+and Steam routes. Resolve and validate the missing protocol support before
+claiming KDE presentation success; neither grace nor mock socket tests establish it.
 
 The remaining sections record the original Phase 3 scope and checks. Later phases
 add the documented optional Steam/PanVK/shared-staging paths; their defaults and

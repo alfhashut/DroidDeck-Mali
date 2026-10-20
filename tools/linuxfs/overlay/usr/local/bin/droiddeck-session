@@ -233,6 +233,8 @@ if [ -z "${BL_INSIDE:-}" ]; then
       mkdir -p "$desktop_runtime" && chmod 700 "$desktop_runtime" &&
         ln -sfn -- "$parent_display" "$desktop_runtime/wayland-0" || exit 73
       export XDG_RUNTIME_DIR="$desktop_runtime" WAYLAND_DISPLAY=wayland-0
+      [ -S "$desktop_runtime/wayland-0" ] || { echo 'Mali desktop parent alias is not a socket'; exit 65; }
+      echo "== Mali desktop handoff: runtime=$XDG_RUNTIME_DIR display=$WAYLAND_DISPLAY parent=$parent_display"
     fi
     step "starting the desktop"
     start_agent --no-focus

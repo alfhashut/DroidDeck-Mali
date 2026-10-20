@@ -1,0 +1,75 @@
+diff --git a/src/mali_normal.cpp b/src/mali_normal.cpp
+--- a/src/mali_normal.cpp
++++ b/src/mali_normal.cpp
+@@ -2,6 +2,7 @@
+  * input uses its existing seat listeners, SHM imports use Gamescope's renderer.
+  * The application is an argv child, with no diagnostic frame limit/injection. */
+ #include "mali_normal.hpp"
++#include "mali_normal_watchdog.hpp"
+ #include "frame_trace.inc"
+ dd_ft_id g_maliFrameTrace{};
+ #include "normal_detail_perf.hpp"
+@@ -317,7 +318,10 @@
+     const char *baselineEnv = getenv("MALI_VULKAN_PERF_BASELINE");
+     bool perfBaseline = baselineEnv && !strcmp(baselineEnv, "1");
+     std::printf("MaliPerf mode: %s; aggregate interval=2s target=%uHz default=60Hz\n", perfBaseline ? "baseline (old pacing, upload before pool check)" : "paced from frame start, pre-upload pool check", normalPacingHz);
+-    auto next = std::chrono::steady_clock::now(); auto progress = next;
++    const bool desktopStartup = !server.x11 && mali_normal_desktop_child(getenv("BL_MALI_DESKTOP"), command[0], command[1]);
++    auto next = std::chrono::steady_clock::now();
++    MaliNormalWatchdog watchdog(next, desktopStartup);
++    if (desktopStartup) std::puts("normal Mali watchdog: KDE desktop first-frame allowance=90 seconds; after first frame=15 seconds");
+     int childStatus = 0;
+     while (ok && !stopped && !failed) {
+         gamescope::IBackend::Get()->PollState();
+@@ -374,7 +378,9 @@
+                     dd_ft_event(DD_FT_DISCARD, erased, 0, g_maliFrameTrace.client, 2, 0);
+                 }
+                 tracePending = 0;
+-                server.pending = false; ++server.frames; wl_display_flush_clients(server.display); progress = now;
++                server.pending = false; ++server.frames; wl_display_flush_clients(server.display);
++                if (watchdog.awaiting_desktop_frame()) std::puts("normal Mali watchdog: first KDE frame presented; resuming 15-second no-progress timeout");
++                watchdog.presented(now);
+             } else if (result != EAGAIN) { ok = false; break; }
+             // Pace from frame start: a slow render must not pay another target period.
+             // No catch-up burst: the next iteration starts a fresh deadline.
+@@ -383,7 +389,10 @@
+         }
+         // Steam's bootstrap can download for minutes; an idle UI also needs no redraw.
+         // Child exit, Xwayland and outer socket failures remain fatal.
+-        if (!server.x11 && now - progress > std::chrono::seconds(15)) { mali_normal_failure("normal session made no frame progress for 15 seconds"); break; }
++        if (!server.x11 && watchdog.expired(now)) {
++            mali_normal_failure(watchdog.awaiting_desktop_frame() ? "KDE desktop produced no first frame for 90 seconds" : "normal session made no frame progress for 15 seconds");
++            break;
++        }
+         std::this_thread::sleep_for(std::chrono::milliseconds(2));
+     }
+     ok &= !failed;
+diff --git a/src/mali_normal_watchdog.hpp b/src/mali_normal_watchdog.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/mali_normal_watchdog.hpp
+@@ -0,0 +1,24 @@
++#pragma once
++#include <chrono>
++#include <cstring>
++
++inline bool mali_normal_desktop_child(const char *enabled, const char *program, const char *mode) {
++    if (!enabled || std::strcmp(enabled, "1") || !program || !mode) return false;
++    const char *base = std::strrchr(program, '/');
++    return !std::strcmp(base ? base + 1 : program, "droiddeck-session") && !std::strcmp(mode, "lxqt");
++}
++
++class MaliNormalWatchdog {
++    using Clock = std::chrono::steady_clock;
++    Clock::time_point progress;
++    bool desktop;
++    bool firstFrame = false;
++public:
++    MaliNormalWatchdog(Clock::time_point start, bool desktopChild) : progress(start), desktop(desktopChild) {}
++    bool awaiting_desktop_frame() const { return desktop && !firstFrame; }
++    unsigned timeout_seconds() const { return awaiting_desktop_frame() ? 90 : 15; }
++    void presented(Clock::time_point now) { progress = now; firstFrame = true; }
++    bool expired(Clock::time_point now) const {
++        return now - progress > std::chrono::seconds(timeout_seconds());
++    }
++};
