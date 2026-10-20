@@ -37,7 +37,7 @@ FROZEN = {'final_reference': {'files': ['app/src/main/cpp/malivulkan/shared_stag
                                 'tools/mali-vulkan/probe_steam_angle.py',
                                 'tools/mali-vulkan/steam_cef_evidence.py',
                                 '.github/workflows/build-panvk-glibc.yml'],
-                      'sha256': 'b1ea6df9cfe404134149f681a04091c329750cdd43e1ee35e0d0c0985f9f13af'}}
+                      'sha256': 'aa2dd625a1995d6b28079563cc4a616debc77d47b229184736e73d4a85924c06'}}
 
 
 class Phase6Tests(unittest.TestCase):

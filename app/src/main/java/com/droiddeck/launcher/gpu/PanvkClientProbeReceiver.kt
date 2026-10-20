@@ -29,7 +29,8 @@ class PanvkClientProbeReceiver : BroadcastReceiver() {
             return
         }
         try {
-            check(MaliSessionSelection.supported(VulkanInfo.cachedOrNull())) { "PanVK proof requires the validated Mali-G52 route" }
+            val gpu = checkNotNull(VulkanInfo.cachedOrNull()) { "Vulkan GPU information is unavailable" }
+            check(MaliSessionSelection.supported(gpu)) { "PanVK proof requires the validated Mali-G52 route" }
             val script = File(Environment.getExternalStorageDirectory(),
                 "Download/DroidDeckPanVKTest/run_panvk_phone_test.py")
             check(script.isFile) { "Transfer the raw artifact and helpers first" }
