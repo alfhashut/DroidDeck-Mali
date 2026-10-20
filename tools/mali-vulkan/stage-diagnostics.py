@@ -1,4 +1,4 @@
-"""Stage only software-client observers and pure analysis tools into runtime assets."""
+"""Stage client probes/observers and pure analysis tools; no driver libraries."""
 import argparse
 from pathlib import Path
 import shutil
@@ -6,7 +6,8 @@ import shutil
 ROOT = Path(__file__).resolve().parents[2]
 MALI = ('diagnose_steam_perf.py', 'diagnose_steam_cef.py', 'diagnose_steam_x11.py',
         'steam_affinity.py', 'steam_frame_details.py', 'steam_frame_journal.py',
-        'steam_swap_details.py', 'steam_client_environment.py', 'capture_frame_journal.py')
+        'steam_swap_details.py', 'steam_client_environment.py', 'capture_frame_journal.py',
+        'probe_steam_angle.py', 'steam_cef_evidence.py')
 ANALYZERS = ('analyze_frame_journal.py', 'analyze_steam_frames.py', 'summarize_affinity.py')
 
 

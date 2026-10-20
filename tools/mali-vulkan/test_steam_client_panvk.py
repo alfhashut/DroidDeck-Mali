@@ -44,6 +44,7 @@ class SteamClientPanvkTests(unittest.TestCase):
         config.write_text(json.dumps({'version': 1, 'atom_stride': '56', 'target': str(target),
             'steam_root': str(steam), 'angle_dir': str(pair),
             'probe_sha256': client.digest(target / 'probe_steam_angle.py'),
+            'icd_sha256': client.digest(target / 'panvk-local.json'),
             'driver_sha256': client.digest(target / 'libvulkan_panfrost.so')}))
         env = dict(BL_INSIDE='1', BL_MALI_STEAM_UI='1', DISPLAY=':42',
             LIBGL_ALWAYS_SOFTWARE='1', GALLIUM_DRIVER='llvmpipe', MESA_LOADER_DRIVER_OVERRIDE='swrast',
@@ -69,6 +70,7 @@ class SteamClientPanvkTests(unittest.TestCase):
     def test_compositor_wrong_mode_changed_driver_and_wrong_stride_are_rejected(self):
         config, steam, target, env = self.fixture()
         for changes in ({'BL_INSIDE': '0'}, {'BL_MALI_STEAM_UI': '0'},
+                        {'BL_STEAM_CLIENT_ARCH': 'x86_64'},
                         {'MALI_VULKAN_NORMAL_SESSION': '1'}, {'MALI_VULKAN_BROKER_SOCKET': '/broker'}):
             with self.assertRaises(RuntimeError):
                 client.inputs(config, steam, env | changes, target.parent)
@@ -78,6 +80,12 @@ class SteamClientPanvkTests(unittest.TestCase):
             client.inputs(config, steam, env, target.parent)
         config.write_text(json.dumps(data))
         (target / 'libvulkan_panfrost.so').write_bytes(b'changed driver')
+        with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+            client.inputs(config, steam, env, target.parent)
+
+    def test_changed_relocated_icd_is_rejected_before_launch(self):
+        config, steam, target, env = self.fixture()
+        (target / 'panvk-local.json').write_text('{"ICD":{"library_path":"/other/driver.so"}}')
         with self.assertRaisesRegex(RuntimeError, 'identity changed'):
             client.inputs(config, steam, env, target.parent)
 

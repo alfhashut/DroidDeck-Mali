@@ -178,6 +178,7 @@ def prepare(args, environment=None):
     # Set search paths before exec/dlopen. Parent/production environment is untouched.
     # Raw test artifacts bundle no dependencies; missing DSOs must come from the guest.
     env['LD_LIBRARY_PATH'] = ':'.join(dict.fromkeys((str(driver.parent), str(egl.parent),
+        str(root / 'steamrtarm64'),
         str(root / 'steamrtarm64/panorama'), '/usr/lib')))
     return env
 

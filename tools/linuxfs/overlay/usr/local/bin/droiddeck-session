@@ -375,6 +375,7 @@ case $mode in
       [ "$steam_x64" = 0 ] || { echo 'Mali software compatibility requires the ARM64 Steam client'; exit 66; }
       unset VK_DRIVER_FILES VK_ICD_FILENAMES BL_VK_DRIVER MALI_VULKAN_BROKER_SOCKET
       unset MALI_VULKAN_NORMAL_SESSION MALI_VULKAN_RENDERER_TEST MALI_VULKAN_AHB_TEST MALI_VULKAN_SHARED_STAGING
+      unset PANVK_ATOM_STRIDE ANGLE_DEFAULT_PLATFORM PANVK_DXVK_COMPAT PANVK_KBASE_DRI3
       export LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=swrast GALLIUM_DRIVER=llvmpipe
     fi
     if [ "$steam_x64" = 1 ]; then
@@ -806,13 +807,24 @@ BUSCONF
     _bl_ui=(-gamepadui)
     [ "${BL_STEAM_UI:-}" = desktop ] && _bl_ui=()
     _bl_cef=(-cef-force-gpu -cef-use-gl=angle -cef-use-angle=vulkan)
+    _bl_panvk=0
+    _bl_panvk_helper=/usr/local/bin/droiddeck-steam-client-panvk
+    _bl_panvk_config=$HOME/.config/droiddeck/steam-client-panvk.json
     if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
       _bl_cef=(-cef-force-gpu -cef-use-gl=angle -cef-use-angle=gl)
-      echo '== Mali Steam client graphics: ANGLE/OpenGL on Mesa llvmpipe; Gamescope retains Mali Vulkan/AHB'
+      if [ -f "$_bl_panvk_config" ]; then
+        python3 -B "$_bl_panvk_helper" check --config "$_bl_panvk_config" --steam-root "$steam_root" || exit 66
+        _bl_panvk=1
+        _bl_cef=(-cef-force-gpu -cef-use-vulkan)
+        _bl_panvk_client=(python3 -B "$_bl_panvk_helper" launch --config "$_bl_panvk_config" --steam-root "$steam_root" -- "$steam_root/steamrtarm64/steam")
+        echo '== Mali Steam client graphics: optional ANGLE Vulkan/PanVK; UI acceleration UNPROVEN; Gamescope retains Mali Vulkan/AHB'
+      else
+        echo '== Mali Steam client graphics: ANGLE/OpenGL on Mesa llvmpipe; Gamescope retains Mali Vulkan/AHB'
+      fi
     fi
     [ "${steam_cef_gpu:-1}" = 1 ] || _bl_cef=(-cef-disable-gpu)
     if [ "${BL_DESKTOP:-}" = 1 ] && [ "${BL_STEAM_UI:-}" = desktop ]; then
-      _bl_cef=(-cef-disable-gpu)
+      [ "$_bl_panvk" = 1 ] || _bl_cef=(-cef-disable-gpu)
       _bl_ui=(-nobigpicture)
     fi
     if [ "${BL_STEAM_UI:-}" != desktop ]; then
@@ -1162,9 +1174,22 @@ BUSCONF
         desktop_ui_pid=$!
       fi
       steam_started=$SECONDS
-      "${steam_client[@]}" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
-        -no-cef-sandbox -cef-ozone-platform=x11 "${_bl_cef[@]}" "$@"
-      rc=$?
+      if [ "$_bl_panvk" = 1 ]; then
+        _bl_panvk_offsets=$(python3 -B "$_bl_panvk_helper" offsets --steam-root "$steam_root")
+        "${_bl_panvk_client[@]}" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
+          -no-cef-sandbox -cef-ozone-platform=x11 "${_bl_cef[@]}" "$@" &
+        steam_pid=$!
+        python3 -B "$_bl_panvk_helper" observe --steam-root "$steam_root" --steam-pid "$steam_pid" --log-offsets "$_bl_panvk_offsets" &
+        panvk_observer=$!
+        rc=0
+        wait "$steam_pid" || rc=$?
+        kill "$panvk_observer" 2>/dev/null || true
+        wait "$panvk_observer" 2>/dev/null || true
+      else
+        "${steam_client[@]}" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
+          -no-cef-sandbox -cef-ozone-platform=x11 "${_bl_cef[@]}" "$@"
+        rc=$?
+      fi
       steam_ran=$((SECONDS - steam_started))
       if [ -n "$desktop_ui_pid" ]; then
         kill "$desktop_ui_pid" 2>/dev/null || true

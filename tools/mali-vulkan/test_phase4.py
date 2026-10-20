@@ -92,8 +92,9 @@ class FinalPathTests(unittest.TestCase):
         self.assertIn('#define DD_FT_ROOT NULL', native)
         self.assertIn('DROIDDECK_FRAME_TRACE_DIR', native)
         script = (ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-session').read_text()
-        self.assertNotIn('-cef-use-vulkan', script)
-        self.assertNotIn('droiddeck-steam-client-panvk', script)
+        outer = script.split('case $mode in', 1)[0]
+        self.assertNotIn('-cef-use-vulkan', outer)
+        self.assertNotIn('droiddeck-steam-client-panvk', outer)
         self.assertIn('-cef-use-angle=gl', script)
         self.assertIn('"${BL_MALI_STEAM_UI:-0}" = 1 ] || reap_orphans', script)
 

@@ -1,11 +1,14 @@
 """Host-side native log/CPU capture for the opt-in live Steam sampler."""
 import json
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zipfile
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / 'mali-vulkan'))
 from diagnose_steam_perf import cpu_delta, stat_fields
@@ -90,17 +93,29 @@ class PerformanceCapture:
                     if line.startswith('frame-journal-control=')]
         if not controls:
             return
-        from steam_frame_journal import ROOT
+        from frame_journal_control import receive, archive_path
         target = self.directory / 'frame-journal'
         target.mkdir(exist_ok=False)
-        for config in controls:
-            run = config['run']
-            names = [f'capture-{run}.json'] + [f"trace-{run}-{row['pid']}-{row['role']}.jsonl" for row in config['ready']]
-            for name in names:
-                result = subprocess.run(self.adb + ['pull', str(ROOT / name), str(target / name)],
-                                        capture_output=True, text=True, timeout=15)
-                if result.returncode:
-                    (target / (name + '.pull-error.txt')).write_text(result.stderr)
+        try:
+            output = receive(self.adb, 'pull')
+            with tempfile.TemporaryDirectory(prefix='mali-journal-export-') as directory:
+                archive = Path(directory) / 'frames.zip'
+                subprocess.run(self.adb + ['pull', archive_path(output), str(archive)],
+                               check=True, capture_output=True, text=True, timeout=15)
+                with zipfile.ZipFile(archive) as zipped:
+                    for config in controls:
+                        run = config['run']
+                        names = [f'capture-{run}.json'] + [f"trace-{run}-{row['pid']}-{row['role']}.jsonl" for row in config['ready']]
+                        for name in names:
+                            if not re.fullmatch(r'(capture-[0-9]+\.json|trace-[0-9]+-[0-9]+-(android|gamescope)\.jsonl)', name):
+                                raise RuntimeError('invalid journal capture identity')
+                            if zipped.namelist().count(name) != 1:
+                                (target / (name + '.pull-error.txt')).write_text('missing/duplicate exported capture member\n')
+                                continue
+                            with zipped.open(name) as source, (target / name).open('xb') as destination:
+                                shutil.copyfileobj(source, destination)
+        except (OSError, RuntimeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+            (target / 'journal-export-error.txt').write_text(str(error) + '\n')
         print('Internal frame journals=' + str(target), flush=True)
 
     def __exit__(self, *args):

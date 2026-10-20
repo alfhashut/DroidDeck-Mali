@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 import probe_steam_angle as probe
+import panvk_raw_artifact as raw
 
 DRIVER = 'libvulkan_panfrost.so'
 MANIFEST = 'panfrost_icd.aarch64.json'
@@ -55,6 +56,7 @@ def client_environment(proc=Path('/proc')):
 
 
 def stage(artifact, base=GUEST):
+    raw.verify(artifact)
     driver = artifact / DRIVER
     probe.require((artifact / MANIFEST).stat().st_size <= 1024 * 1024, 'oversized raw ICD manifest')
     original = (artifact / MANIFEST).read_bytes()
@@ -70,7 +72,8 @@ def stage(artifact, base=GUEST):
     probe.native_elf(driver)
     script = Path(probe.__file__).resolve()
     # Immutable per-content directories: another invocation never overwrites a loaded DSO.
-    identity = hashlib.sha256((digest(driver) + digest(script)).encode() + original).hexdigest()
+    identity = hashlib.sha256((digest(driver) + digest(script)).encode() + original +
+                              (artifact / 'SHA256SUMS').read_bytes()).hexdigest()
     base.mkdir(parents=True, exist_ok=True)
     target = base / identity
     if not target.exists():
@@ -81,9 +84,8 @@ def stage(artifact, base=GUEST):
             entry['library_path'] = './' + DRIVER
             (pending / 'panvk-local.json').write_text(json.dumps(manifest, indent=2) + '\n')
             shutil.copyfile(script, pending / 'probe_steam_angle.py')
-            for name in ('DEPENDENCIES.txt', 'BUILD_INFO.txt'):
-                if (artifact / name).is_file():
-                    shutil.copyfile(artifact / name, pending / name)
+            for name in raw.FILES[2:]:
+                shutil.copyfile(artifact / name, pending / name)
             # Concurrent identical staging may already have published this directory.
             try:
                 pending.rename(target)
@@ -93,6 +95,7 @@ def stage(artifact, base=GUEST):
     probe.require(digest(target / DRIVER) == digest(driver)
                   and (target / MANIFEST).read_bytes() == original
                   and digest(target / 'probe_steam_angle.py') == digest(script), 'staged raw artifact identity mismatch')
+    raw.verify(target)
     return target
 
 
@@ -141,6 +144,7 @@ def configure_steam_client(artifact, steam, explicit=None):
     config = {'version': 1, 'target': str(target.resolve()), 'steam_root': str(steam.resolve()),
               'angle_dir': str(pair), 'atom_stride': '56',
               'driver_sha256': digest(target / DRIVER), 'probe_sha256': digest(target / 'probe_steam_angle.py')}
+    config['icd_sha256'] = digest(target / 'panvk-local.json')
     shared = Path(__file__).resolve().parent / 'steam-client-panvk.json'
     pointer = Path.home() / '.config/droiddeck/steam-client-panvk.json'
     pointer.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +166,7 @@ def configure_steam_client(artifact, steam, explicit=None):
     print('DROIDDECK_STEAM_CLIENT_PANVK_CONFIGURED enabled; real Steam UI acceleration UNPROVEN', flush=True)
 
 
-def run(artifact, steam, explicit=None, atom_stride='auto'):
+def run(artifact, steam, explicit=None, atom_stride='56'):
     client = client_environment()
     target = stage(artifact)
     pair = angle_pair(steam, explicit)
@@ -212,7 +216,7 @@ def main():
     parser.add_argument('--angle-dir', type=Path)
     parser.add_argument('--steam-client', choices=('enable',),
                         help='Configure the next development Steam client launch with stride 56; does not run the standalone probe')
-    parser.add_argument('--atom-stride', choices=('auto', '56', '64'), default='auto',
+    parser.add_argument('--atom-stride', choices=('auto', '56', '64'), default='56',
                         help='Development GPU probe child only; auto leaves PANVK_ATOM_STRIDE unset')
     args = parser.parse_args()
     try:

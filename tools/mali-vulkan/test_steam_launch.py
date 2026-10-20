@@ -172,8 +172,23 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
             XDG_DATA_HOME=str(home / '.local/share'), XDG_CONFIG_HOME=str(home / '.config'),
             XDG_CACHE_HOME=str(home / '.cache'), BL_CLIENT_CPUS='')
 
+        if experimental:
+            config = home / '.config/droiddeck/steam-client-panvk.json'
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text('{"version":1}')
+            self.stub('droiddeck-steam-client-panvk', '''import json,os,sys
+mode=sys.argv[1]
+if mode=='offsets': print('{}')
+if mode=='launch':
+    command=sys.argv[sys.argv.index('--')+1:]
+    env=dict(os.environ, PANVK_ATOM_STRIDE='56', ANGLE_DEFAULT_PLATFORM='vulkan', VK_DRIVER_FILES='/client/panvk.json')
+    for key in ('LIBGL_ALWAYS_SOFTWARE','MESA_LOADER_DRIVER_OVERRIDE','GALLIUM_DRIVER'): env.pop(key,None)
+    os.execve(command[0],command,env)
+''')
+
         result = self.run_session(env=self.inner_env)
-        return result, json.loads((self.root / 'calls.json').read_text())
+        calls = self.root / 'calls.json'
+        return result, json.loads(calls.read_text()) if calls.exists() else []
 
     def test_shared_steam_bootstrap_channel_and_update_restart_without_game_provisioning(self):
         result, calls = self.inner(exits=(42, 0))
@@ -201,10 +216,19 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ['-cef-force-gpu', '-cef-use-gl=angle', '-cef-use-angle=vulkan'])
 
-    def test_existing_client_config_cannot_enable_panvk_in_the_software_child(self):
+    def test_invalid_optional_configuration_fails_before_client_exec(self):
         config = self.root / 'home/.config/droiddeck/steam-client-panvk.json'
         config.parent.mkdir(parents=True)
-        config.write_text('this old config must never be read')
+        config.write_text('invalid optional PanVK configuration')
+        helper = ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-client-panvk'
+        (self.bin / helper.name).write_bytes(helper.read_bytes())
+        result, calls = self.inner()
+        self.assertEqual(result.returncode, 66, result.stdout + result.stderr)
+        self.assertEqual(calls, [])
+        self.assertIn('configuration/launch FAIL', result.stdout)
+
+    def test_software_fallback_without_configuration_clears_client_acceleration_overrides(self):
+        self.env.update(PANVK_ATOM_STRIDE='64', ANGLE_DEFAULT_PLATFORM='vulkan')
         result, calls = self.inner()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('-cef-use-angle=gl', calls[0])
@@ -213,6 +237,29 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
         self.assertEqual(environments[0]['LIBGL_ALWAYS_SOFTWARE'], '1')
         self.assertIsNone(environments[0]['VK_DRIVER_FILES'])
         self.assertIsNone(environments[0]['PANVK_ATOM_STRIDE'])
+        self.assertIsNone(environments[0]['ANGLE_DEFAULT_PLATFORM'])
+
+    def test_optional_panvk_uses_supported_cef_option_across_update_restart(self):
+        result, calls = self.inner(exits=(42, 0), experimental=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 2)
+        for args in calls:
+            self.assertIn('-cef-use-vulkan', args)
+            self.assertFalse(any(arg.startswith(('-cef-use-gl', '-cef-use-angle')) for arg in args))
+        environments = json.loads((self.root / 'client-envs.json').read_text())
+        self.assertTrue(all(row['PANVK_ATOM_STRIDE'] == '56' and row['ANGLE_DEFAULT_PLATFORM'] == 'vulkan'
+                            and row['LIBGL_ALWAYS_SOFTWARE'] is None for row in environments))
+
+    def test_accelerated_client_stop_uses_native_shutdown_and_software_recovery(self):
+        result, calls = self.inner(graceful=True, experimental=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls[1], ['-shutdown'])
+        (self.root / 'home/.config/droiddeck/steam-client-panvk.json').unlink()
+        result = self.run_session(env=self.inner_env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = json.loads((self.root / 'calls.json').read_text())
+        self.assertIn('-cef-use-angle=gl', calls[-1])
+        self.assertNotIn('-cef-use-vulkan', calls[-1])
 
     def test_mali_does_not_silently_start_the_x86_client(self):
         result = self.run_session(env={'BL_STEAM_CLIENT_ARCH': 'x86_64'})

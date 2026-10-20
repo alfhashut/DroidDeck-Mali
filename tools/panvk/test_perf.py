@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import Mock, patch
 
 import stage_phone_test as phone
@@ -19,6 +20,43 @@ spec.loader.exec_module(perf)
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_private_journal_export_selects_only_the_requested_run(self):
+        from perf_capture import PerformanceCapture
+        import frame_journal_control as control
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = dict(run=42, ready=[dict(pid=10, role='gamescope'), dict(pid=20, role='android')])
+            (root / 'guest-report.txt').write_text('frame-journal-control=' + json.dumps(config) + '\n')
+            names = ['capture-42.json', 'trace-42-10-gamescope.jsonl', 'trace-42-20-android.jsonl']
+            def pull(argv, **kwargs):
+                self.assertEqual(argv[:2], ['adb', 'pull'])
+                self.assertEqual(argv[2], '/external/app/frames.zip')
+                with zipfile.ZipFile(argv[3], 'w') as zipped:
+                    for name in names + ['trace-1-10-gamescope.jsonl', '../../outside']:
+                        zipped.writestr(name, name)
+                return subprocess.CompletedProcess(argv, 0)
+            capture = PerformanceCapture(['adb'], root)
+            with patch.object(control, 'receive', return_value='Broadcast completed: result=1, data="mali-journal-export=/external/app/frames.zip"'), \
+                 patch.object(subprocess, 'run', side_effect=pull), contextlib.redirect_stdout(io.StringIO()):
+                capture.pull_journal()
+            target = root / 'frame-journal'
+            self.assertEqual({path.name for path in target.iterdir()}, set(names))
+            self.assertFalse((root.parent / 'outside').exists())
+
+    def test_missing_private_journal_export_never_creates_a_complete_pair(self):
+        from perf_capture import PerformanceCapture
+        import frame_journal_control as control
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'guest-report.txt').write_text('frame-journal-control=' + json.dumps(
+                dict(run=42, ready=[dict(pid=10, role='gamescope'), dict(pid=20, role='android')])) + '\n')
+            with patch.object(control, 'receive', side_effect=RuntimeError('export refused')), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                PerformanceCapture(['adb'], root).pull_journal()
+            target = root / 'frame-journal'
+            self.assertFalse(list(target.glob('*.jsonl')))
+            self.assertIn('export refused', (target / 'journal-export-error.txt').read_text())
+
     def test_cpu_pid_reuse_and_core_units(self):
         old = dict(start=100, ticks=200)
         self.assertEqual(perf.cpu_delta(old, dict(start=100, ticks=500), 2, 100), 150)

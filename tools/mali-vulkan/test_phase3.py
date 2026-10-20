@@ -73,8 +73,9 @@ class SessionBoundaryTests(unittest.TestCase):
         shell = (ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-session').read_text()
         self.assertIn('if [ "$mode" = mali-wayland ] ||', shell)
         self.assertIn('[ "${MALI_VULKAN_SHARED_STAGING:-0}" = 0 ]', shell)
-        self.assertNotIn('-cef-use-vulkan', shell)
-        self.assertNotIn('droiddeck-steam-client-panvk', shell)
+        outer = shell.split('case $mode in', 1)[0]
+        self.assertNotIn('-cef-use-vulkan', outer)
+        self.assertNotIn('droiddeck-steam-client-panvk', outer)
 
     def test_ahb_only_buffer_has_no_dmabuf_planes_or_export(self):
         source = (CPP / 'waylandcomp/src/compositor.c').read_text()

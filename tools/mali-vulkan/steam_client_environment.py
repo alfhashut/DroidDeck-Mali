@@ -1,4 +1,4 @@
-"""Locate the running software Steam client without staging or selecting a driver."""
+"""Locate the isolated Mali Steam client shell without staging or selecting a driver."""
 import os
 from pathlib import Path
 import re

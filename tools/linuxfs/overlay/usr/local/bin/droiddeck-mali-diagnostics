@@ -5,6 +5,7 @@ shift
 case $action in
   perf) script=diagnose_steam_perf.py ;;
   cef) script=diagnose_steam_cef.py ;;
+  cef-proof) script=steam_cef_evidence.py ;;
   x11) script=diagnose_steam_x11.py ;;
   journal) script=capture_frame_journal.py ;;
   analyze-journal) script=analyze_frame_journal.py ;;

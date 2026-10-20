@@ -2,6 +2,7 @@
 """Development-only laptop helper: transfer raw PanVK + probe, never build or install an APK."""
 import argparse
 from contextlib import ExitStack
+import json
 from pathlib import Path, PurePosixPath
 import os
 import shlex
@@ -17,9 +18,10 @@ import zipfile
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 from adb_device import resolve_serial, DeviceResolutionError
+sys.path.append(str(TOOLS / 'mali-vulkan'))
+import panvk_raw_artifact as raw
 
-FILES = ('libvulkan_panfrost.so', 'panfrost_icd.aarch64.json',
-         'DEPENDENCIES.txt', 'BUILD_INFO.txt', 'SOURCE_DIFF.patch', 'Mesa-license.rst', 'SHA256SUMS')
+FILES = raw.FILES
 
 
 def unpack(artifact, output):
@@ -77,7 +79,7 @@ def guest_helper_uploads(helper, directory, angle_dir, atom_stride=None, steam_c
     return [(helper, implementation), (launcher, helper.name)]
 
 
-def run_phone(adb, external, steam_client=None, x11_diagnostics=False, cef_diagnostics=False, perf_diagnostics=False, perf_output=None):
+def run_phone(adb, external, steam_client=None, x11_diagnostics=False, cef_diagnostics=False, perf_diagnostics=False, perf_output=None, cef_proof=False):
     request = uuid.uuid4().hex
     receiver = 'com.droiddeck.launcher/.gpu.PanvkClientProbeReceiver'
     broadcast = subprocess.run(adb + ['shell', shlex.join([
@@ -86,8 +88,9 @@ def run_phone(adb, external, steam_client=None, x11_diagnostics=False, cef_diagn
     if 'result=1' not in broadcast.stdout:
         raise RuntimeError('PanVK trigger rejected/not installed. Install the CI APK containing this helper and '
                            'start normal Mali Steam Launch first. ' + broadcast.stdout + broadcast.stderr)
-    report = external + '/Download/DroidDeck/panvk-client-probe-' + request + '.log'
-    label = ('Sampling live Steam performance; report=' if perf_diagnostics else
+    report = external + '/Android/data/com.droiddeck.launcher/files/panvk-client-probe/panvk-client-probe-' + request + '.log'
+    label = ('Verifying live Steam CEF PanVK renderer; report=' if cef_proof else
+             'Sampling live Steam performance; report=' if perf_diagnostics else
              'Collecting installed Steam CEF argv diagnostics; report=' if cef_diagnostics else
              'Collecting X11 presentation diagnostics; report=' if x11_diagnostics else
              'Configuring development Steam client; report=' if steam_client else 'Running client-only proof; report=')
@@ -103,13 +106,16 @@ def run_phone(adb, external, steam_client=None, x11_diagnostics=False, cef_diagn
                 if perf_output is not None:
                     (perf_output / 'guest-report.txt').write_text(output)
                 print(output, end='')
-                marker = ('DROIDDECK_PERF_DIAGNOSTICS_DONE' if perf_diagnostics else
+                marker = ('DROIDDECK_CEF_PANVK_PASS' if cef_proof else
+                          'DROIDDECK_PERF_DIAGNOSTICS_DONE' if perf_diagnostics else
                           'DROIDDECK_CEF_DIAGNOSTICS_DONE' if cef_diagnostics else
                           'DROIDDECK_X11_DIAGNOSTICS_DONE' if x11_diagnostics else
                           'DROIDDECK_STEAM_CLIENT_PANVK_CONFIGURED enabled' if steam_client else
                           'C8B.1 PanVK CLIENT-ONLY PROBE PASS')
                 success = ('DROIDDECK_PANVK_PROBE_DONE exit=0' in output.splitlines() and marker in output)
-                if x11_diagnostics or cef_diagnostics or perf_diagnostics:
+                if cef_proof:
+                    print('Steam CEF PanVK hardware renderer ' + ('verified' if success else 'UNPROVEN'))
+                elif x11_diagnostics or cef_diagnostics or perf_diagnostics:
                     print(('Performance sample ' if perf_diagnostics else
                            'CEF argv audit ' if cef_diagnostics else 'X11 snapshot ') +
                           ('collected; no GPU/UI success claim' if success else 'FAILED'))
@@ -137,6 +143,8 @@ def main():
                         help='Snapshot live X11 visual/depth, Composite pixmap and GLX FBConfig compatibility; no artifact or GPU draw')
     parser.add_argument('--cef-diagnostics', action='store_true',
                         help='Read-only audit of installed Steam ARM64 CEF option strings and exact live process argv; no artifact or graphics calls')
+    parser.add_argument('--cef-proof', action='store_true',
+                        help='Verify the live PanVK CEF renderer through CDP, exact argv, GPU ancestry and selected library identities')
     parser.add_argument('--perf-diagnostics', action='store_true',
                         help='Development-only 25-second CPU/XDamage/CEF trace sample of the running Steam UI; no renderer changes or artifact')
     parser.add_argument('--swap-diagnostics', action='store_true',
@@ -155,7 +163,7 @@ def main():
     args = parser.parse_args()
     swap = args.swap_diagnostics or args.frame_diagnostics
     performance = args.perf_diagnostics or swap
-    diagnostics = args.x11_diagnostics or args.cef_diagnostics or performance
+    diagnostics = args.x11_diagnostics or args.cef_diagnostics or args.cef_proof or performance
     if args.frame_scheduler and not args.frame_diagnostics:
         parser.error('--frame-scheduler requires --frame-diagnostics')
     if args.frame_diagnostics:
@@ -164,7 +172,7 @@ def main():
         args.client_affinity = '0xff'
     if args.client_affinity and not (swap and args.run):
         parser.error('--client-affinity requires --swap-diagnostics --run')
-    if sum((args.x11_diagnostics, args.cef_diagnostics, args.perf_diagnostics, args.swap_diagnostics, args.frame_diagnostics)) > 1:
+    if sum((args.x11_diagnostics, args.cef_diagnostics, args.cef_proof, args.perf_diagnostics, args.swap_diagnostics, args.frame_diagnostics)) > 1:
         parser.error('select only one diagnostic mode')
     if args.perf_output and not (performance and args.run):
         parser.error('--perf-output requires --perf-diagnostics or --swap-diagnostics, with --run')
@@ -177,7 +185,7 @@ def main():
     if args.steam_client and args.atom_stride not in (None, '56'):
         parser.error('the Steam client experiment is fixed to atom stride 56')
     if args.steam_client != 'disable' and not diagnostics:
-        print('Requested atom stride=' + ('56' if args.steam_client else (args.atom_stride or 'auto')), flush=True)
+        print('Requested atom stride=' + ('56' if args.steam_client else (args.atom_stride or '56')), flush=True)
     try:
         serial = resolve_serial(args.adb, args.serial, log=True)
         adb = [args.adb, '-s', serial]
@@ -194,13 +202,20 @@ def main():
             if not diagnostics:
                 staging = Path(directory) / 'artifact'
                 unpack(args.artifact, staging)
+                raw.verify(staging)
                 subprocess.run(adb + ['shell', shlex.join(['mkdir', '-p', remote + '/artifact'])], check=True)
                 subprocess.run(adb + ['push', str(staging) + '/.', remote + '/artifact/'], check=True)
-            names = ('run_panvk_phone_test.py', 'probe_steam_angle.py')
-            diagnostic_script = ('diagnose_steam_perf.py' if performance else
+            names = ('run_panvk_phone_test.py', 'probe_steam_angle.py', 'panvk_raw_artifact.py', 'steam_client_environment.py')
+            profile = Path(directory) / 'panvk-source.json'
+            profile.write_text(json.dumps(raw.profile()) + '\n')
+            subprocess.run(adb + ['push', str(profile), remote + '/panvk-source.json'], check=True)
+            diagnostic_script = ('steam_cef_evidence.py' if args.cef_proof else
+                                 'diagnose_steam_perf.py' if performance else
                                  'diagnose_steam_cef.py' if args.cef_diagnostics else 'diagnose_steam_x11.py')
             if diagnostics:
                 names += (diagnostic_script,)
+            if args.cef_proof:
+                names += ('diagnose_steam_perf.py',)
             if performance:
                 names += ('diagnose_steam_x11.py',)
             if swap:
@@ -236,12 +251,12 @@ def main():
                      frame_seconds=(args.perf_seconds or 10) if args.frame_diagnostics else None,
                      frame_scheduler=args.frame_scheduler) as capture:
                     return run_phone(adb, external, perf_diagnostics=True, perf_output=capture.directory)
-            return run_phone(adb, external, args.steam_client, args.x11_diagnostics, args.cef_diagnostics, args.perf_diagnostics)
+            return run_phone(adb, external, args.steam_client, args.x11_diagnostics, args.cef_diagnostics, args.perf_diagnostics, cef_proof=args.cef_proof)
         print('Development files transferred. Start normal Mali Steam Launch, then repeat this command with --run.')
         print('Optional, if the existing second-screen Linux terminal is available:')
         print(shlex.join(['python3', '-B', remote + '/run_panvk_phone_test.py']))
         return 0
-    except (OSError, RuntimeError, DeviceResolutionError, subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as error:
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, DeviceResolutionError, subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as error:
         print(f'PanVK phone transfer FAIL: {error}', file=sys.stderr)
         return 1
 

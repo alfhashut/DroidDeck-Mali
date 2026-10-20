@@ -1,6 +1,6 @@
 name: Build isolated PanVK glibc ARM64 probe artifact
 
-# C8B.1 B0 only: no APK integration, production staging, release, or automatic builds.
+# Client-only artifacts remain manual; the raw driver is never installed into the APK.
 'on':
   workflow_dispatch:
     inputs:
@@ -48,6 +48,7 @@ jobs:
       - name: Check artifact and probe contracts without a GPU
         run: |
           python3 -B tools/mali-vulkan/run_phase1_tests.py --panvk-only
+          python3 -B tools/mali-vulkan/run_phase5_tests.py --artifact-only
       - name: Read audited source pin
         id: source
         run: |

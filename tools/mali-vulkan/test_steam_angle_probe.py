@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import probe_steam_angle as probe
 import run_panvk_phone_test as phone
+from test_panvk_artifact import fixture as raw_fixture, seal
 
 
 class SteamAngleProbeTests(unittest.TestCase):
@@ -28,6 +29,7 @@ class SteamAngleProbeTests(unittest.TestCase):
             (artifact / phone.DRIVER).write_bytes(Path(args.panvk_library).read_bytes())
             (artifact / phone.MANIFEST).write_bytes((Path(__file__).resolve().parents[1] /
                 'panvk/tests/fixtures/panfrost_icd.aarch64.json').read_bytes())
+            raw_fixture(artifact, Path(args.panvk_library).read_bytes())
             shared = root / 'shared'
             shared.mkdir()
             original_stage = phone.stage
@@ -186,6 +188,7 @@ class SteamAngleProbeTests(unittest.TestCase):
             raw_manifest = Path(__file__).resolve().parents[1] / 'panvk/tests/fixtures/panfrost_icd.aarch64.json'
             (artifact / phone.MANIFEST).write_bytes(raw_manifest.read_bytes())
             (artifact / phone.DRIVER).write_bytes(Path(args.panvk_library).read_bytes())
+            raw_fixture(artifact, Path(args.panvk_library).read_bytes())
             target = phone.stage(artifact, root / 'guest')
             self.assertEqual((target / phone.MANIFEST).read_bytes(), raw_manifest.read_bytes())
             expected = json.loads(raw_manifest.read_text())
@@ -194,12 +197,16 @@ class SteamAngleProbeTests(unittest.TestCase):
             self.assertEqual(phone.stage(artifact, root / 'guest'), target)
             old_driver = (target / phone.DRIVER).read_bytes()
             (artifact / phone.DRIVER).write_bytes(old_driver + b'new build')
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                phone.stage(artifact, root / 'guest')
+            seal(artifact)
             replacement = phone.stage(artifact, root / 'guest')
             self.assertNotEqual(target, replacement)
             self.assertEqual((target / phone.DRIVER).read_bytes(), old_driver)
             expected['ICD']['library_path'] = 'libGLES_mali.so'
             (artifact / phone.MANIFEST).write_text(json.dumps(expected))
-            with self.assertRaisesRegex(RuntimeError, 'does not identify'):
+            seal(artifact)
+            with self.assertRaisesRegex(RuntimeError, 'invalid generated'):
                 phone.stage(artifact, root / 'guest')
 
     def test_phone_discovers_real_client_and_rejects_compositor_or_ambiguous_displays(self):
@@ -257,6 +264,7 @@ class SteamAngleProbeTests(unittest.TestCase):
                         self.assertEqual(env['VK_DRIVER_FILES'], str(target_icd))
                         self.assertNotIn('LIBGL_ALWAYS_SOFTWARE', env)
                 self.assertEqual(client, {'DISPLAY': ':42', 'LIBGL_ALWAYS_SOFTWARE': '1'})
+                self.assertEqual(invoke.call_args.args[0][-2:], ['--atom-stride', '56'])
 
     def test_phone_dependency_failure_never_launches_probe_or_reports_pass(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -317,7 +325,7 @@ class SteamAngleProbeTests(unittest.TestCase):
         pair.mkdir(parents=True)
         native = bytearray(20)
         native[:6] = b'\x7fELF\x02\x01'
-        struct.pack_into('<H', native, 18, 183)
+        struct.pack_into('<HH', native, 16, 3, 183)
         for name in ('libEGL.so', 'libGLESv2.so'):
             (pair / name).write_bytes(native)
         driver = root / 'libvulkan_panfrost_kbase.so'

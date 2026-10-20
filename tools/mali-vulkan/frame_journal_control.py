@@ -17,6 +17,21 @@ def command(action, package):
                       '--es', 'action', 'export' if action == 'pull' else action])
 
 
+def receive(adb, action, package='com.droiddeck.launcher'):
+    result = subprocess.run(adb + ['shell', command(action, package)],
+                            capture_output=True, text=True, check=True)
+    if not re.search(r'Broadcast completed: result=1\b', result.stdout):
+        raise RuntimeError(result.stdout + result.stderr)
+    return result.stdout
+
+
+def archive_path(output):
+    match = re.search(r'mali-journal-export=([^"\r\n]+)', output)
+    if not match:
+        raise RuntimeError('journal receiver returned no archive path')
+    return match[1]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('arm', 'disarm', 'status', 'pull'))
@@ -28,17 +43,11 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from adb_device import resolve_serial
     adb = [args.adb, '-s', resolve_serial(args.adb, args.serial, log=True)]
-    result = subprocess.run(adb + ['shell', command(args.action, args.package)],
-                            capture_output=True, text=True, check=True)
-    if not re.search(r'Broadcast completed: result=1\b', result.stdout):
-        raise RuntimeError(result.stdout + result.stderr)
+    output = receive(adb, args.action, args.package)
     if args.action == 'pull':
-        match = re.search(r'mali-journal-export=([^"\r\n]+)', result.stdout)
-        if not match:
-            raise RuntimeError('journal receiver returned no archive path')
-        subprocess.run(adb + ['pull', match[1], str(args.output)], check=True)
+        subprocess.run(adb + ['pull', archive_path(output), str(args.output)], check=True)
     else:
-        print(result.stdout, end='')
+        print(output, end='')
 
 
 if __name__ == '__main__':

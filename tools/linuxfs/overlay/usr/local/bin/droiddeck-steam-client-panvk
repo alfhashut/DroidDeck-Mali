@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Development-only Mali Steam client launcher; never run in Gamescope's environment."""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import sys
+import time
+
+CONFIG = Path.home() / '.config/droiddeck/steam-client-panvk.json'
+ENV_KEYS = ('VK_DRIVER_FILES', 'VK_ICD_FILENAMES', 'PANVK_ATOM_STRIDE',
+            'PANVK_DXVK_COMPAT', 'PANVK_KBASE_DRI3', 'ANGLE_DEFAULT_PLATFORM',
+            'LD_LIBRARY_PATH', 'LIBGL_ALWAYS_SOFTWARE', 'MESA_LOADER_DRIVER_OVERRIDE', 'GALLIUM_DRIVER')
+LOG_NAMES = ('webhelper_gpu.txt', 'cef_log.txt', 'steamwebhelper.log', 'webhelper.txt')
+STOP_OBSERVER = False
+
+
+def say(message):
+    print('== Steam client PanVK: ' + message, flush=True)
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            value.update(block)
+    return value.hexdigest()
+
+
+def inputs(config, steam_root, environment=None, base=None):
+    """Reuse the exact staged phone probe's validation and environment preparation."""
+    environment = os.environ if environment is None else environment
+    require(environment.get('BL_INSIDE') == '1' and environment.get('BL_MALI_STEAM_UI') == '1',
+            'requires the isolated Mali Steam Xwayland client')
+    require(environment.get('BL_STEAM_CLIENT_ARCH', 'arm64') == 'arm64', 'requires the ARM64 Steam client')
+    require(not any(environment.get(key) for key in ('MALI_VULKAN_NORMAL_SESSION', 'MALI_VULKAN_BROKER_SOCKET')),
+            'refusing the compositor/broker environment')
+    require(config.stat().st_size <= 65536, 'oversized development config')
+    data = json.loads(config.read_text())
+    require(isinstance(data, dict) and data.get('version') == 1 and data.get('atom_stride') == '56',
+            'unsupported development config')
+    target = Path(data['target']).resolve(strict=True)
+    base = (Path.home() / 'panvk-test' if base is None else base).resolve()
+    require(target.parent == base and re.fullmatch(r'[0-9a-f]{64}', target.name),
+            'driver must be in the immutable raw-test staging directory')
+    script = target / 'probe_steam_angle.py'
+    driver = target / 'libvulkan_panfrost.so'
+    require(digest(script) == data['probe_sha256'] and digest(driver) == data['driver_sha256']
+            and digest(target / 'panvk-local.json') == data['icd_sha256'],
+            'staged probe/driver identity changed; stage the audited raw artifact again')
+    root = steam_root.resolve(strict=True)
+    require(root == Path(data['steam_root']).resolve(strict=True), 'Steam root differs from configured probe inputs')
+    pair = Path(data['angle_dir']).resolve(strict=True)
+    loader = pair / 'libvulkan.so'
+    require(loader.resolve(strict=True).is_relative_to(root), 'Vulkan loader must come from Steam ARM64')
+    spec = importlib.util.spec_from_file_location('droiddeck_proven_panvk_probe', script)
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    probe.native_elf(loader)
+    args = argparse.Namespace(icd=str(target / 'panvk-local.json'), panvk_library=str(driver),
+                              steam_root=str(root), egl=str(pair / 'libEGL.so'),
+                              gles=str(pair / 'libGLESv2.so'), atom_stride='56')
+    env = probe.prepare(args, environment=environment)
+    # ANGLE's default plus Steam's supported -cef-use-vulkan request; actual CEF
+    # selection still requires real webhelper renderer evidence.
+    env['ANGLE_DEFAULT_PLATFORM'] = 'vulkan'
+    return env, args, loader
+
+
+def log_offsets(root):
+    offsets = {}
+    for name in LOG_NAMES:
+        path = root / 'logs' / name
+        try:
+            stat = path.stat()
+            offsets[name] = [stat.st_ino, stat.st_size]
+        except OSError:
+            offsets[name] = [0, 0]
+    return offsets
+
+
+def process_evidence(pid, steam_pid, proc=Path('/proc')):
+    path = proc / str(pid)
+    if path.stat().st_uid != os.getuid():
+        return None
+    argv = path.joinpath('cmdline').read_bytes().decode(errors='replace').split('\0')
+    if not any(Path(arg).name == 'steamwebhelper' for arg in argv):
+        return None
+    env = dict(item.split('=', 1) for item in path.joinpath('environ').read_bytes().decode(errors='replace').split('\0')
+               if '=' in item)
+    # Steam may sanitize the environment; ancestry still identifies the process
+    # and exposes that the client override was lost, instead of hiding it.
+    if env.get('DROIDDECK_STEAM_CLIENT_PANVK_RUN') != str(steam_pid):
+        parent = pid
+        ancestors = set()
+        while parent != steam_pid and parent > 1 and parent not in ancestors:
+            ancestors.add(parent)
+            status = (proc / str(parent) / 'status').read_text()
+            parent = int(re.search(r'^PPid:\s+(\d+)', status, re.MULTILINE)[1])
+        if parent != steam_pid:
+            return None
+    flags = [arg for arg in argv if arg.startswith(('--use-', '--type=', '--ozone-platform=',
+             '--enable-features=', '--disable-features=', '--disable-gpu', '--ignore-gpu-blocklist'))]
+    maps = path.joinpath('maps').read_text()
+    libraries = sorted({row.split(maxsplit=5)[5] for row in maps.splitlines()
+                        if len(row.split(maxsplit=5)) == 6 and any(name in row.split(maxsplit=5)[5].lower()
+                        for name in ('libegl', 'libgles', 'libvulkan', 'libgl.', 'libglx', 'libgldispatch',
+                                     'libgallium', 'swrast', 'llvmpipe', 'swiftshader'))})
+    return flags, {key: env.get(key, '<unset>') for key in ENV_KEYS}, libraries
+
+
+def observe(steam_pid, root, offsets, proc=Path('/proc'), duration=60):
+    seen = set()
+    logs_seen = set()
+    presentation_seen = set()
+    deadline = time.monotonic() + duration
+    while not STOP_OBSERVER and (proc / str(steam_pid)).exists() and time.monotonic() < deadline:
+        for path in proc.iterdir():
+            if not path.name.isdigit():
+                continue
+            try:
+                evidence = process_evidence(int(path.name), steam_pid, proc)
+            except (OSError, ValueError, TypeError):
+                continue
+            if evidence is None:
+                continue
+            flags, env, libraries = evidence
+            signature = (path.name, tuple(flags), tuple(env.items()), tuple(libraries))
+            if signature not in seen:
+                seen.add(signature)
+                say(f'steamwebhelper actually started: pid={path.name}; ANGLE flags={flags}')
+                say('steamwebhelper environment=' + json.dumps(env, sort_keys=True))
+                say('steamwebhelper mapped graphics libraries=' + json.dumps(libraries))
+        for name in LOG_NAMES:
+            path = root / 'logs' / name
+            try:
+                stat = path.stat()
+                inode, position = offsets.get(name, [0, 0])
+                start = position if inode == stat.st_ino and stat.st_size >= position else 0
+                with path.open('rb') as stream:
+                    stream.seek(max(start, stat.st_size - 131072))
+                    data = stream.read(131072)
+                    end = stream.tell()
+                # Keep the last partial line for the next sample.
+                rows = data.splitlines(keepends=True)
+                if rows and not rows[-1].endswith(b'\n'):
+                    end -= len(rows.pop())
+                offsets[name] = [stat.st_ino, end]
+                lines = [row.decode(errors='replace').rstrip() for row in rows]
+                for line in lines:
+                    if re.search(r'GL_VENDOR|GL_RENDERER|GL_VERSION|GPU0|ANGLE.*(?:Vulkan|OpenGL)|Mali-G52|llvmpipe|\[KFAULT\]|KBASE_IOCTL_MEM_JIT_INIT', line, re.IGNORECASE):
+                        key = (name, line)
+                        if key not in logs_seen:
+                            logs_seen.add(key)
+                            say(f'new renderer/backend log evidence ({name}): {line}')
+                    elif re.search(r'AcquirePixmap|BadMatch|BadDrawable|GLXBadPixmap|failed to create drawable|'
+                                   r'CCompositorGLThread|GLComposer|Loaded GL |Created window|WasHidden', line):
+                        key = (name, line)
+                        if key not in presentation_seen:
+                            presentation_seen.add(key)
+                            say(f'new X11 presentation log evidence ({name}): {line}')
+            except OSError:
+                continue
+        time.sleep(1)
+    if not seen:
+        say('steamwebhelper actually started: not observed within this launch window')
+    if not logs_seen:
+        say('renderer/backend evidence unavailable in new Steam logs; UI acceleration UNPROVEN')
+    say('observation ended; process startup/library mappings alone do not prove UI acceleration')
+
+
+def stop_observer(*_):
+    global STOP_OBSERVER
+    STOP_OBSERVER = True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=('check', 'launch', 'observe', 'offsets'))
+    parser.add_argument('--config', type=Path, default=CONFIG)
+    parser.add_argument('--steam-root', type=Path, required=True)
+    parser.add_argument('--steam-pid', type=int)
+    parser.add_argument('--log-offsets', default='{}')
+    args, command = parser.parse_known_args()
+    if args.mode != 'launch' and command:
+        parser.error('unexpected arguments: ' + ' '.join(command))
+    try:
+        if args.mode == 'offsets':
+            print(json.dumps(log_offsets(args.steam_root)))
+            return 0
+        if args.mode == 'observe':
+            require(args.steam_pid is not None and args.steam_pid > 1, 'missing Steam PID')
+            signal.signal(signal.SIGTERM, stop_observer)
+            signal.signal(signal.SIGINT, stop_observer)
+            observe(args.steam_pid, args.steam_root, json.loads(args.log_offsets))
+            return 0
+        env, selected, loader = inputs(args.config, args.steam_root)
+        if args.mode == 'check':
+            say(f'enabled (DEVELOPMENT ONLY); selected ICD={selected.icd}; PANVK_ATOM_STRIDE=56')
+            say(f'Steam ARM64 ANGLE={selected.egl}, {selected.gles}; Vulkan loader={loader}')
+            say('requested Steam CEF option=-cef-use-vulkan -> --use-angle=vulkan; ANGLE_DEFAULT_PLATFORM=vulkan')
+            say('client environment=' + json.dumps({key: env.get(key, '<unset>') for key in ENV_KEYS}, sort_keys=True))
+            return 0
+        command = command[1:] if command[:1] == ['--'] else command
+        executable = (args.steam_root / 'steamrtarm64/steam').resolve(strict=True)
+        require(command and Path(command[0]).resolve(strict=True) == executable, 'only the native Steam client may be launched')
+        require('-cef-use-vulkan' in command, 'missing supported Steam -cef-use-vulkan request')
+        require(not any(arg.startswith(('-cef-use-angle', '-cef-use-gl', '--use-angle', '--use-gl'))
+                        or arg == '-no-linux-angle' for arg in command),
+                'unsupported/conflicting backend flags; use only Steam -cef-use-vulkan')
+        env['DROIDDECK_STEAM_CLIENT_PANVK_RUN'] = str(os.getpid())
+        say(f'launching native Steam pid={os.getpid()} with client-only PanVK; UI acceleration UNPROVEN')
+        say('exact Steam exec argv=' + json.dumps(command))
+        os.execve(str(executable), command, env)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        say(f'configuration/launch FAIL: {error}; disable the development config to restore C8A')
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

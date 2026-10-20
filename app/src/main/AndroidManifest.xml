@@ -223,5 +223,9 @@
             android:name=".gpu.MaliFrameJournalReceiver"
             android:exported="true"
             android:permission="android.permission.DUMP" />
+        <receiver
+            android:name=".gpu.PanvkClientProbeReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
     </application>
 </manifest>
