@@ -37,9 +37,9 @@ if [ "$mode" = mali-wayland ] || { [ "$mode" = steam ] && [ "${BL_MALI_STEAM_UI:
     exec gamescope --backend wayland --mali-wayland-session --mali-xwayland --expose-wayland -f \
       -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- "$0" steam "$@"
   fi
-  step 'Mali GPU support (experimental): normal nested Wayland session; no Steam'
-  exec gamescope --backend wayland --mali-wayland-session --expose-wayland -f \
-    -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- /usr/local/bin/gamescope --mali-interactive-client
+  step 'Mali GPU support (experimental): KDE desktop in nested Wayland session'
+  BL_MALI_DESKTOP=1 exec gamescope --backend wayland --mali-wayland-session --expose-wayland -f \
+    -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- "$0" lxqt "$@"
 fi
 
 prepare_locale() {
@@ -221,6 +221,19 @@ if [ -z "${BL_INSIDE:-}" ]; then
     sleep 0.1
   done
   if [ "$mode" = lxqt ]; then
+    if [ "${BL_MALI_DESKTOP:-0}" = 1 ]; then
+      # KDE reserves wayland-0 for its parent and cleans its own runtime sockets.
+      parent_display=${WAYLAND_DISPLAY:?}
+      case $parent_display in
+        /*) ;;
+        *) parent_display="${XDG_RUNTIME_DIR:?}/$parent_display" ;;
+      esac
+      [ -S "$parent_display" ] || { echo 'Mali desktop parent Wayland socket missing'; exit 65; }
+      desktop_runtime="${XDG_RUNTIME_DIR:?}/mali-desktop"
+      mkdir -p "$desktop_runtime" && chmod 700 "$desktop_runtime" &&
+        ln -sfn -- "$parent_display" "$desktop_runtime/wayland-0" || exit 73
+      export XDG_RUNTIME_DIR="$desktop_runtime" WAYLAND_DISPLAY=wayland-0
+    fi
     step "starting the desktop"
     start_agent --no-focus
     [ -x /usr/local/bin/droiddeck-desktop ] || { echo "== the desktop package is not installed"; exit 66; }

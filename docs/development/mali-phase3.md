@@ -6,9 +6,66 @@ from its pre-performance/pre-Steam checkpoint `7fd567ad`.
 
 The added route is Gamescope/glibc → proxy ICD → service-owned Android/Bionic
 broker → real system Vulkan → Mali-G52 → AHardwareBuffer/SYNC_FD → the current
-DroidDeck Android compositor. It remains a single-client nested Wayland session
-with the reference interactive SHM client. It does not provide general game or
-Steam client compatibility.
+DroidDeck Android compositor. The initial Phase 3 client was the reference
+interactive SHM diagnostic. The current non-Steam Desktop route reuses the normal
+KDE launcher inside this bridge, as described below.
+
+**Desktop follow-up and current device evidence**
+
+The authoritative script is
+`tools/linuxfs/overlay/usr/local/bin/droiddeck-session`. Gradle's
+`stageSessionScripts` packages it into the managed session assets, and
+`SessionFiles.stage()` reinstalls it during launch preparation. Installed-runtime
+edits are therefore temporary; this follow-up changes the repository source.
+
+The `mali-wayland` entry now starts:
+
+```sh
+BL_MALI_DESKTOP=1 gamescope --backend wayland --mali-wayland-session --expose-wayland -f \
+  -W "$BL_WIDTH" -H "$BL_HEIGHT" -- /usr/local/bin/droiddeck-session lxqt
+```
+
+`lxqt` is the existing 0.5 internal Desktop mode. It runs the existing desktop
+preparation and `/usr/local/bin/droiddeck-desktop`, which starts
+`dbus-run-session -- startplasma-wayland`. No second KDE launcher or renamed mode
+is introduced. The child leaves `BL_INSIDE` unset so that the existing direct
+Desktop branch executes; the Steam Mali/Xwayland route retains its own
+`BL_INSIDE=1` child setup and exact command.
+
+Only this Mali desktop child gets a private `$XDG_RUNTIME_DIR/mali-desktop`
+directory (mode 0700). Its `wayland-0` symlink points to the nested socket supplied
+by Gamescope, accepting relative and absolute `WAYLAND_DISPLAY` values. This
+preserves KDE's existing parent-at-wayland-0 / own-socket-at-wayland-1 convention.
+Desktop socket cleanup stays within that private directory and cannot unlink the
+Android display, Gamescope's nested display or broker socket. A missing parent
+socket fails startup. The ordinary non-Mali Desktop launcher and KDE scripts are
+unchanged. The native `gamescope --mali-interactive-client` diagnostic remains
+available separately; it is no longer the normal Desktop child.
+
+User-reported real Mali-G52 validation proves the interactive Mali client at
+approximately 60 FPS through the proxy/Bionic/system-Vulkan/AHB path, clean Stop
+without stale Gamescope/proot/session processes, and successful relaunch at
+approximately 60 FPS. Both shared staging and PanVK were OFF in that validation.
+**KDE through this route has not yet been device-validated.** CI must package the
+updated managed script; device follow-up must prove actual Plasma startup, nested
+KWin connecting through Gamescope, input/resize, clean Stop and relaunch, with
+shared staging and PanVK still OFF. No Gamescope patch, native/protocol code,
+AHB/release-fence behavior, shared-staging gate or PanVK implementation changes.
+
+Focused host tests execute the outer desktop command and existing `lxqt` branch
+with mock Gamescope/KDE processes. They check private socket routing and cleanup
+(including a second launch and absolute parent names), diagnostic CLI retention,
+and the unchanged Steam Mali command/client isolation. They do not run real KDE
+or establish additional device results.
+
+Follow-up lightweight checks passed: 29 Mali desktop/Steam launcher tests,
+12 session/bridge/client isolation contracts, and 38 existing Desktop/Steam/x86/
+asset/runtime-input tests. Session shell syntax, Python parsing and
+`git diff --check` passed. No local Android, Gamescope or NDK build was run.
+
+The remaining sections record the original Phase 3 scope and checks. Later phases
+add the documented optional Steam/PanVK/shared-staging paths; their defaults and
+implementation are unchanged by this desktop follow-up.
 
 **Launch scope**
 
@@ -181,9 +238,10 @@ and `test_normal_session.py` also require a CI environment with Gamescope's pinn
 wlroots and renderer dependencies; the lightweight runner deliberately does not
 compile them locally or claim their results.
 
-On the validated Mali-G52 phone, use Desktop to enter the normal interactive
-session. Verify the broker handshake and real GPU inventory, the actual Gamescope
-BLIT output through the proxy, touch/mouse/keyboard, exact AHB handoff and producer
+The original Phase 3 checklist below targeted the interactive client. The current
+Desktop entry targets KDE and requires the follow-up validation described above.
+For the retained diagnostic client, verify the broker handshake and real GPU
+inventory, the actual Gamescope BLIT output through the proxy, touch/mouse/keyboard, exact AHB handoff and producer
 SYNC_FD completion. Exercise normal Stop with a displayed last buffer, restart,
 activity recreation/background/surface detach, startup cancellation, child/broker
 loss and deliberately delayed/missing Android release. Confirm real release fences,

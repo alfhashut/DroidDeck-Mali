@@ -96,7 +96,14 @@ class NormalLaunchTests(unittest.TestCase):
         self.assertIn("SHARED=0", result.stdout)
         args = json.loads(next(line[5:] for line in result.stdout.splitlines() if line.startswith("ARGV=")))
         self.assertEqual(args, ["--backend", "wayland", "--mali-wayland-session", "--expose-wayland", "-f",
-                                "-W", "1280", "-H", "720", "--", "/usr/local/bin/gamescope", "--mali-interactive-client"])
+                                "-W", "1280", "-H", "720", "--",
+                                str(ROOT / "tools/linuxfs/overlay/usr/local/bin/droiddeck-session"), "lxqt"])
+        self.assertNotIn("--mali-interactive-client", args)
+
+    def test_interactive_diagnostic_remains_a_separate_gamescope_command(self):
+        patch = (ROOT / "tools/gamescope/patches/0211-mali-normal-wayland-session.patch").read_text()
+        self.assertIn('if (argc == 2 && !strcmp(argv[1], "--mali-interactive-client")) return mali_interactive_main();', patch)
+        self.assertIn('int mali_interactive_main()', patch)
 
     def test_explicit_shared_transport_retains_proxy_and_gamescope_arguments(self):
         baseline = self.run_script()

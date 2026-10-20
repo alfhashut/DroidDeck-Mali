@@ -127,11 +127,61 @@ class SteamLaunchTests(unittest.TestCase):
                 self.assertIn(expected, result.stdout)
                 self.assertNotIn('ARGV=', result.stdout)
 
-    def test_interactive_workload_remains_available(self):
+    def test_desktop_workload_reuses_lxqt_without_steam_xwayland(self):
         result = self.run_session('mali-wayland')
-        self.assertEqual(result.returncode, 0)
-        self.assertIn('--mali-interactive-client', result.stdout)
-        self.assertNotIn('--mali-xwayland', result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = json.loads(next(x[5:] for x in result.stdout.splitlines() if x.startswith('ARGV=')))
+        self.assertEqual(args, ['--backend', 'wayland', '--mali-wayland-session', '--expose-wayland',
+                               '-f', '-W', '1280', '-H', '720', '--', str(self.script), 'lxqt'])
+        self.assertNotIn('--mali-interactive-client', args)
+        self.assertNotIn('--mali-xwayland', args)
+        self.assertIn('INSIDE=\n', result.stdout)
+
+    def test_desktop_child_reuses_kde_launcher_and_preserves_parent_sockets(self):
+        self.script.write_text(self.script.read_text().replace('/usr/local/bin/', str(self.bin) + '/').replace(
+            '/usr/local/share/fonts/android', str(self.root / 'no-device-fonts')))
+        self.env.update(BL_PIN_CORES='0', BL_LAUNCH_DIR='')
+        self.stub('localedef', 'raise SystemExit(1)')
+        self.stub('pgrep', "print('steamwebhelper --type= droiddeck-appimage-run dbus-run-session kwin')")
+        self.stub('wayland-info', 'pass')
+        self.stub('droiddeck-fonts', 'pass')
+        self.stub('droiddeck-desktop-bookmarks', 'pass')
+        desktop = (ROOT / 'tools/linuxfs/desktop/droiddeck-desktop').read_text()
+        cleanup = next(line for line in desktop.splitlines() if line.startswith('find "$XDG_RUNTIME_DIR"'))
+        self.stub('droiddeck-desktop', '''import json,os,socket,stat,subprocess
+from pathlib import Path
+subprocess.run(['bash','-c', ''' + repr(cleanup) + '''],check=True)
+runtime=Path(os.environ['XDG_RUNTIME_DIR'])
+parent=runtime/'wayland-0'
+with socket.socket(socket.AF_UNIX) as kwin:
+    kwin.bind(str(runtime/'wayland-1'))
+    print('DESKTOP='+json.dumps(dict(display=os.environ['WAYLAND_DISPLAY'],runtime=runtime.name,
+        parent=str(parent.readlink()),parent_socket=parent.is_socket(),
+        outer_socket=(runtime.parent/'wayland-0').is_socket(),broker=(runtime.parent/'broker').is_socket(),
+        mode=stat.S_IMODE(runtime.stat().st_mode),icd=os.environ.get('VK_DRIVER_FILES'))))
+''')
+        for absolute in (False, True):
+            with self.subTest(absolute=absolute):
+                self.stub('gamescope', '''import os,socket,subprocess,sys
+from pathlib import Path
+parent=Path(os.environ['XDG_RUNTIME_DIR'])/'wayland-1'
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(str(parent))
+    env=dict(os.environ,WAYLAND_DISPLAY=''' + ('str(parent)' if absolute else "'wayland-1'") + ''')
+    for key in ('VK_DRIVER_FILES','VK_ICD_FILENAMES','MALI_VULKAN_BROKER_SOCKET','MALI_VULKAN_NORMAL_SESSION',
+                'MALI_VULKAN_RENDERER_TEST','MALI_VULKAN_AHB_TEST','MALI_VULKAN_SHARED_STAGING'):
+        env.pop(key,None)
+    child=subprocess.run(sys.argv[sys.argv.index('--')+1:],env=env)
+parent.unlink()
+raise SystemExit(child.returncode)
+''')
+                result = self.run_session('mali-wayland')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                actual = json.loads(next(line[8:] for line in result.stdout.splitlines() if line.startswith('DESKTOP=')))
+                self.assertEqual(actual, dict(display='wayland-0', runtime='mali-desktop',
+                    parent=str(self.root / 'wayland-1'), parent_socket=True,
+                    outer_socket=True, broker=True, mode=0o700, icd=None))
+        self.assertIn('dbus-run-session -- startplasma-wayland', desktop)
 
     def inner(self, mali=True, exits=(0,), graceful=False, experimental=False):
         # Exercise the actual shared Steam branch with cheap subprocess fixtures.
