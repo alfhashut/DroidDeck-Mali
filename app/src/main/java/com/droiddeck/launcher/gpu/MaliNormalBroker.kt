@@ -6,6 +6,7 @@ import android.net.LocalSocketAddress
 import android.os.SystemClock
 import android.system.Os
 import android.system.OsConstants
+import com.droiddeck.launcher.runtime.LinuxRuntime
 import com.droiddeck.launcher.wayland.CompositorHost
 import java.io.File
 import java.io.IOException
@@ -32,6 +33,11 @@ object MaliNormalBroker {
             check(SystemClock.elapsedRealtime() < deadline) { "Android Wayland compositor socket did not become ready" }
             Thread.sleep(20)
         }
+        val traceDirectory = File(LinuxRuntime.logDir(context), "mali-frame-trace").apply {
+            check(isDirectory || mkdirs()) { "Cannot create Mali frame journal directory" }
+            Os.chmod(path, 0x1c0)
+        }
+        Os.setenv("DROIDDECK_FRAME_TRACE_DIR", traceDirectory.path, true)
         val socket = SystemVulkanBroker.startNormal(context)
         try {
             // A socket file is not readiness: execute the existing native inventory request.
@@ -81,7 +87,8 @@ object MaliNormalBroker {
             val elf = library.inputStream().use { input -> ByteArray(20).also { check(input.read(it) == it.size) } }
             check(elf[0] == 0x7f.toByte() && elf[1] == 'E'.code.toByte() && elf[2] == 'L'.code.toByte() && elf[3] == 'F'.code.toByte() &&
                 elf[4] == 2.toByte() && elf[5] == 1.toByte() && elf[18] == 0xb7.toByte() && elf[19] == 0.toByte()) { "Mali proxy asset is not an AArch64 ELF library" }
-            return MaliSessionSelection.environment(manifest.path, socket) + "MALI_VULKAN_SHARED_STAGING=0"
+            return MaliSessionSelection.environment(manifest.path, socket) +
+                listOf("MALI_VULKAN_SHARED_STAGING=0", "DROIDDECK_FRAME_TRACE_DIR=${traceDirectory.path}")
         } catch (error: Throwable) {
             runCatching { SystemVulkanBroker.stopNormal() }.exceptionOrNull()?.let { error.addSuppressed(it) }
             throw error

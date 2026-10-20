@@ -335,6 +335,7 @@ jobs:
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross libvulkan-dev libvulkan1 libwayland-dev python3-yaml >/dev/null
           tools/mali-vulkan/build-probe.sh
           tools/mali-vulkan/build-icd.sh
+          python3 -B tools/mali-vulkan/stage-diagnostics.py
           python3 -B tools/mali-vulkan/run_phase1_tests.py
           curl -fL --retry 3 https://codeload.github.com/ValveSoftware/gamescope/tar.gz/refs/tags/3.16.29 -o /tmp/gamescope-source.tar.gz
           echo '9fe99fb4c7a80323cb7617825887dd8ff43e80a1e8c60a42740320eaa91ea01e  /tmp/gamescope-source.tar.gz' | sha256sum -c -
@@ -342,6 +343,7 @@ jobs:
           tar -xzf /tmp/gamescope-source.tar.gz -C /tmp/gamescope-source
           python3 -B tools/mali-vulkan/run_phase2_tests.py --gamescope-source /tmp/gamescope-source/gamescope-3.16.29
           python3 -B tools/mali-vulkan/run_phase3_tests.py --gamescope-source /tmp/gamescope-source/gamescope-3.16.29
+          python3 -B tools/mali-vulkan/run_phase4_tests.py --gamescope-source /tmp/gamescope-source/gamescope-3.16.29
 
       - name: Fetch the Debian image the preloads build in
         if: steps.preloads.outputs.cache-hit != 'true'

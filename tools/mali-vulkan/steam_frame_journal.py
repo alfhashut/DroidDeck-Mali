@@ -5,19 +5,20 @@ import os
 import re
 import time
 
-ROOT = Path('/storage/emulated/0/Download/DroidDeckFrameTrace')
+ROOT = Path(os.environ['DROIDDECK_FRAME_TRACE_DIR']) if os.environ.get('DROIDDECK_FRAME_TRACE_DIR') else None
 
 
 def schedule(seconds, emit, root=ROOT, *, proc_root=Path('/proc')):
+    if root is None:
+        emit('frame-journal-unavailable', 'DROIDDECK_FRAME_TRACE_DIR is not set for this app session')
+        return None
     armed = root / 'armed'
     if not armed.is_file():
         emit('frame-journal-unavailable', 'not armed before Launch; external tracing continues')
         return None
     arm_mtime_ns = armed.stat().st_mtime_ns
-    # Shared-storage markers cross the Android/PRoot boundary; Android's PID
-    # need not exist in guest /proc. Only Gamescope has guest /proc liveness.
-    # arm clears previous ready/control files before touching armed. Require
-    # markers at least as new as armed (shared storage may round timestamps).
+    # The app's private log directory is bound into PRoot. Android's PID need
+    # not exist in guest /proc; only Gamescope has guest /proc liveness.
     ready, rejected = [], []
     for path in sorted(root.glob('ready-*')):
         try:

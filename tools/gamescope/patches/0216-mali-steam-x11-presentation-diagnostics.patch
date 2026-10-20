@@ -1,0 +1,108 @@
+diff --git a/src/mali_x11.inc b/src/mali_x11.inc
+index 0b8cd20..9932d51 100644
+--- a/src/mali_x11.inc
++++ b/src/mali_x11.inc
+@@ -3,17 +3,27 @@
+  * the existing SHM import; bootstrapping, modal windows and replacement are allowed.
+  * No Gamescope game/scaler capability properties are advertised here. */
+ struct MaliXWindow {
+     wlr_xwayland_surface *window = nullptr;
+-    bool dirty = false, presented = false;
++    bool dirty = false, presented = false, bufferLogged = false;
+     wl_listener associate{}, dissociate{}, destroy{}, configure{}, activate{}, fullscreen{};
+     wl_listener map{}, unmap{}, commit{};
+ };
+ static std::vector<MaliXWindow *> xWindows;
+ static bool x11Stopping = false;
+ static void X11Unlisten(wl_listener &listener) {
+     if (listener.link.next) { wl_list_remove(&listener.link); listener.link = {}; }
+ }
++// Presentation diagnostics only: never map/redirect a hidden browser window.
++static void X11Trace(const char *event, MaliXWindow *w) {
++    auto x = w->window;
++    auto s = x->surface;
++    std::printf("Mali Steam X11 event=%s window=0x%x client-pid=%d geometry=%d,%d %ux%u override=%d associated=%d mapped=%d buffer=%d selected=%d ingestion=Xwayland-SHM-to-existing-client-copy; client renderer separately validated\n",
++        event, x->window_id, int(x->pid), int(x->x), int(x->y), unsigned(x->width), unsigned(x->height),
++        int(x->override_redirect), int(s != nullptr), int(s && s->mapped),
++        int(s && wlr_surface_has_buffer(s)), int(s && s == server.surface));
++    std::fflush(stdout);
++}
+ static bool X11Eligible(MaliXWindow *w) {
+     return w->window->surface && w->window->surface->mapped &&
+         (!w->window->override_redirect ||
+          wlr_xwayland_surface_override_redirect_wants_focus(w->window));
+@@ -47,18 +57,21 @@ static void X11Select(MaliXWindow *chosen = nullptr) {
+ static void X11Commit(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, commit);
+     if (wlr_surface_has_buffer(w->window->surface)) {
+         w->dirty = true;
++        if (!w->bufferLogged) { w->bufferLogged = true; X11Trace("first-buffer-commit", w); }
+         if (server.surface == w->window->surface) { server.pending = true; ++server.commits; }
+     }
+ }
+ static void X11Map(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, map);
++    X11Trace("map", w);
+     w->dirty = true;
+     X11Select(w);
+ }
+ static void X11Unmap(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, unmap);
++    X11Trace("unmap", w);
+     if (server.surface == w->window->surface) X11Select();
+ }
+ static void X11Dissociate(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, dissociate);
+@@ -69,8 +82,9 @@ static void X11Dissociate(wl_listener *listener, void *) {
+     X11Unlisten(w->map); X11Unlisten(w->unmap); X11Unlisten(w->commit);
+ }
+ static void X11Associate(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, associate);
++    X11Trace("associate", w);
+     w->map.notify = X11Map; w->unmap.notify = X11Unmap; w->commit.notify = X11Commit;
+     wl_signal_add(&w->window->surface->events.map, &w->map);
+     wl_signal_add(&w->window->surface->events.unmap, &w->unmap);
+     wl_signal_add(&w->window->surface->events.commit, &w->commit);
+@@ -84,8 +98,11 @@ static void X11Destroy(wl_listener *listener, void *) {
+     X11Select();
+ }
+ static void X11Configure(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, configure);
++    X11Trace("configure-current", w);
++    std::printf("Mali Steam X11 configure target window=0x%x geometry=0,0 %dx%d (existing single-UI policy)\n",
++        w->window->window_id, g_nPreferredOutputWidth, g_nPreferredOutputHeight);
+     // C8A is a single focused UI, not a desktop/game window compositor.
+     wlr_xwayland_surface_configure(w->window, 0, 0, g_nPreferredOutputWidth, g_nPreferredOutputHeight);
+ }
+ static void X11Activate(wl_listener *listener, void *) {
+@@ -99,8 +116,9 @@ static void X11Fullscreen(wl_listener *listener, void *) {
+ }
+ static void X11Created(wl_listener *, void *data) {
+     auto w = new MaliXWindow{}; w->window = static_cast<wlr_xwayland_surface *>(data);
+     xWindows.push_back(w);
++    X11Trace("created", w);
+     w->associate.notify = X11Associate; w->dissociate.notify = X11Dissociate; w->destroy.notify = X11Destroy;
+     w->configure.notify = X11Configure; w->activate.notify = X11Activate; w->fullscreen.notify = X11Fullscreen;
+     wl_signal_add(&w->window->events.associate, &w->associate);
+     wl_signal_add(&w->window->events.dissociate, &w->dissociate);
+@@ -112,9 +130,9 @@ static void X11Created(wl_listener *, void *data) {
+ }
+ static void X11Ready(wl_listener *, void *) {
+     server.x11Ready = true;
+     wlr_xwayland_set_seat(server.xwayland, server.seat);
+-    std::printf("Mali Steam Xwayland ready: DISPLAY=%s; SHM/software client; no proxy ICD for Steam\n", server.xwayland->display_name);
++    std::printf("Mali Steam Xwayland ready: DISPLAY=%s; Xwayland SHM transport; Gamescope ingestion=existing CPU client-copy; client GPU renderer separately validated\n", server.xwayland->display_name);
+ }
+ static bool StartX11(wlr_compositor *compositor) {
+     x11Stopping = false;
+     wlr_log_init(WLR_ERROR, nullptr); // keep Xwayland startup/crash stderr visible
+@@ -149,8 +167,9 @@ static void X11Presented() {
+     for (auto w : xWindows) {
+         auto surface = w->window->surface;
+         if (surface == server.surface && !w->presented) {
+             w->presented = true;
++            X11Trace("presented-through-existing-SHM-import", w);
+             std::printf("Mali Steam X11 client surface presented: window=0x%x client-pid=%d; Steam UI/sign-in needs visual confirmation\n",
+                 w->window->window_id, int(w->window->pid));
+         }
+         if (surface == server.surface) w->dirty = false;

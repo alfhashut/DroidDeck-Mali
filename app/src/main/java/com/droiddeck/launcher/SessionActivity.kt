@@ -503,7 +503,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             val needRuntime = com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.installedVersion(this) == null
             val needDesktop = intent.getStringExtra(SessionService.EXTRA_MODE) == SessionService.MODE_DESKTOP &&
                 !com.droiddeck.launcher.runtime.DesktopCatalog.desktopInstalled(this)
-            val needProton = (intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM) == SessionService.MODE_STEAM &&
+            val needProton = !loadingMali() && (intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM) == SessionService.MODE_STEAM &&
                 com.droiddeck.launcher.runtime.DesktopCatalog.protonSeedNeeded(this)
             if (needRuntime || needDesktop || needProton) installThenStart(needRuntime, needDesktop, needProton)
         }
@@ -1242,7 +1242,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         else intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM
 
     private fun loadingMali(): Boolean = if (SessionState.running) SessionState.maliBackend
-        else loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE
+        else intent.getBooleanExtra(SessionService.EXTRA_MALI_BACKEND, false) ||
+            loadingMode() == com.droiddeck.launcher.gpu.MaliSessionSelection.MODE
 
     private fun pausedTitle(): String = when (SessionState.mode) {
         com.droiddeck.launcher.gpu.MaliSessionSelection.MODE -> getString(R.string.session_mali_paused)
@@ -1531,6 +1532,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 intent.getStringExtra(SessionService.EXTRA_STEAM_UI),
                 intent.getStringExtra(SessionService.EXTRA_STEAM_URL),
                 intent.getStringArrayExtra(SessionService.EXTRA_PROGRAM_ARGS),
+                maliBackend = loadingMali(),
             )
         }
         applyFrameGen()
@@ -3120,7 +3122,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val endListener: (Int) -> Unit = { status -> onSessionEnded(status) }
     private val firstFrameListener = Runnable {
         SessionEvents.firstFrame()
-        if (SessionState.mode == SessionService.MODE_STEAM) SteamRepair.clientShown(this)
+        if (SessionState.mode == SessionService.MODE_STEAM && !SessionState.maliBackend) SteamRepair.clientShown(this)
         runOnUiThread {
             loading.visible = false
             hud.start()

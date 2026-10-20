@@ -1,0 +1,1274 @@
+diff --git a/src/interop_protocol.h b/src/interop_protocol.h
+new file mode 100644
+index 0000000..fe5b1c5
+--- /dev/null
++++ b/src/interop_protocol.h
+@@ -0,0 +1,68 @@
++/* Version 6: bounded diagnostic operations, little endian scalars and byte payloads.
++ * Every request starts with device ID. IDs are connection-local, typed, never reused.
++ * No addresses, descriptors, Vulkan structs or arbitrary pNext chains on the wire.
++ * Nonempty replies have prefix count=1, followed by the explicitly described data.
++ */
++#ifndef DROIDDECK_INTEROP_PROTOCOL_H
++#define DROIDDECK_INTEROP_PROTOCOL_H
++#include <stdint.h>
++#define MB_INTEROP_VERSION 6u
++#define MB_INTEROP_MAX_MEMORY (1024u * 1024u)
++#define MB_INTEROP_CHUNK 4096u /* legacy v6 reads/writes */
++#define MB_INTEROP_BULK_VERSION 7u
++/* Per-message bound, not an allocation/mapped-range limit. Fits the existing
++ * renderer request buffer (512 KiB + 256); larger ranges use multiple writes. */
++#define MB_INTEROP_WRITE_MAX (512u * 1024u)
++/* Existing broker reply bound, minus its 12-byte status/result/count prefix.
++ * This is a message limit; larger mapped ranges use multiple bulk reads. */
++#define MB_INTEROP_READ_MAX (128u * 1024u - 12u)
++#define MB_MEMORY_WRITE_HEADER 20u
++#define MB_INTEROP_MAX_REFS 16u
++#define MB_BUFFER_CREATE 32u /* device,u64 size,u32 usage -> ID */
++#define MB_BUFFER_DESTROY 33u /* device,ID */
++#define MB_BUFFER_REQUIREMENTS 34u /* device,ID -> u64 size,u64 alignment,u32 bits */
++#define MB_MEMORY_ALLOCATE 35u /* device,u64 size,u32 type -> ID */
++#define MB_MEMORY_FREE 36u /* device,ID */
++#define MB_BUFFER_BIND 37u /* device,buffer,memory,u64 offset */
++#define MB_MEMORY_MAP 38u /* device,memory,u64 offset,u64 size */
++#define MB_MEMORY_UNMAP 39u /* device,memory */
++#define MB_MEMORY_READ 40u /* device,memory,u64 absolute offset,u32 length -> bytes; v7 bulk */
++#define MB_MEMORY_WRITE 41u /* same header, then length bytes; v7 bulk writes allowed */
++#define MB_MEMORY_FLUSH 42u /* device,memory,u64 offset,u64 size */
++#define MB_MEMORY_INVALIDATE 43u /* same; native range, atom alignment enforced */
++#define MB_IMAGE_CREATE 44u /* device,width,height,usage -> ID; fixed optimal RGBA8 */
++#define MB_IMAGE_DESTROY 45u /* device,ID */
++#define MB_IMAGE_REQUIREMENTS 46u /* same layout as buffer requirements */
++#define MB_IMAGE_BIND 47u /* same layout as buffer bind */
++#define MB_COMMAND_FILL 48u /* device,command,buffer,u64 offset,u64 size,pattern */
++#define MB_COMMAND_BARRIER 49u /* device,command,srcStage,dstStage,kind,resource,
++                               srcAccess,dstAccess,oldLayout,newLayout,srcFamily,dstFamily */
++#define MB_COMMAND_CLEAR 50u /* device,command,image,layout,4 binary32 color components */
++#define MB_COMMAND_COPY 51u /* device,command,image,buffer,layout,width,height,direction
++                            direction=0 image->buffer,1 buffer->image; tightly packed */
++#define MB_AHB_CREATE 52u /* device,width,height -> image,memory,AHB IDs,description(4 u32),usage(u64) */
++#define MB_AHB_RELEASE 53u /* device,AHB ID; image/memory must already be destroyed */
++#define MB_SYNC_FENCE_CREATE 54u /* device,handleType(SYNC_FD) -> fence ID */
++#define MB_SYNC_EXPORT 55u /* device,fence,handleType(SYNC_FD) -> sync ID */
++#define MB_SYNC_WAIT 56u /* device,sync ID,u32 timeout milliseconds <=5000 */
++#define MB_SYNC_CLOSE 57u /* device,sync ID; pending producer rejected */
++#define MB_AHB_INSPECT 58u /* device,AHB,sync,pattern(0 clear,1 quadrants) -> CPU checked (0/1) */
++#define MB_AHB_PRESENT 59u /* device,AHB,sync -> completed consumer handoff; no pixel copying */
++static inline uint32_t mb_interop_write_limit(uint32_t version) {
++    return version >= MB_INTEROP_BULK_VERSION ? MB_INTEROP_WRITE_MAX : MB_INTEROP_CHUNK;
++}
++static inline uint32_t mb_interop_read_limit(uint32_t version) {
++    return version >= MB_INTEROP_BULK_VERSION ? MB_INTEROP_READ_MAX : MB_INTEROP_CHUNK;
++}
++/* Subtraction-based checks never evaluate offset+length or map_offset+map_size. */
++static inline int mb_interop_mapped_range(uint64_t allocation, uint64_t map_offset,
++        uint64_t map_size, uint64_t offset, uint64_t length) {
++    return length && map_offset <= allocation && map_size <= allocation - map_offset &&
++        offset >= map_offset && offset - map_offset <= map_size &&
++        length <= map_size - (offset - map_offset);
++}
++static inline int mb_interop_write_size(uint32_t version, uint32_t bytes, uint64_t length) {
++    return bytes >= MB_MEMORY_WRITE_HEADER && length && length <= mb_interop_write_limit(version) &&
++        length == bytes - MB_MEMORY_WRITE_HEADER;
++}
++#endif
+diff --git a/src/mali_normal.cpp b/src/mali_normal.cpp
+index 6cfeb65..30d62f5 100644
+--- a/src/mali_normal.cpp
++++ b/src/mali_normal.cpp
+@@ -1,8 +1,9 @@
+ /* Experimental normal single-client session. Output is the actual CWaylandBackend,
+  * input uses its existing seat listeners, SHM imports use Gamescope's renderer.
+  * The application is an argv child, with no diagnostic frame limit/injection. */
+ #include "mali_normal.hpp"
++#include "normal_detail_perf.hpp"
+ #include "backend.h"
+ #include "backends.h"
+ #include "rendervulkan.hpp"
+ #include "wlr_begin.hpp"
+@@ -199,8 +200,10 @@ void mali_normal_detach_output() {
+ void mali_normal_destroy_buffers() {
+     for (auto &b : host.buffers) { if (b.buffer) wl_buffer_destroy(b.buffer); b = {}; }
+     if (host.display) wl_display_flush(host.display);
+ }
++static unsigned normalPacingHz = 60;
++unsigned mali_normal_pacing_hz() { return normalPacingHz; }
+ int mali_normal_main(int argc, char **argv) {
+     std::setvbuf(stdout, nullptr, _IOLBF, 0);
+     const char *enabled = getenv("MALI_VULKAN_NORMAL_SESSION"), *outer = getenv("WAYLAND_DISPLAY");
+     if (!enabled || strcmp(enabled, "1") || !outer || strcmp(outer, "wayland-0")) {
+@@ -218,16 +221,26 @@ int mali_normal_main(int argc, char **argv) {
+         }
+         std::fprintf(stderr, "unsupported normal Mali option: %s\n", argv[i]); return 1;
+     }
+     if (!width || !height || !command || !wayland) { std::fputs("normal Mali session needs --backend wayland -W width -H height -- client\n", stderr); return 1; }
++    normalPacingHz = mali_normal_parse_pacing(getenv("MALI_VULKAN_PERF_HZ"));
++    if (!normalPacingHz) { std::fputs("invalid diagnostic Mali pacing: MALI_VULKAN_PERF_HZ must be 30 or 60\n", stderr); return 1; }
++    const auto framePeriod = std::chrono::nanoseconds(1000000000ull / normalPacingHz);
++    std::printf("MaliPerf pacing: target=%uHz period=%.3fms mode=%s event-loop-yield=2ms\n",
++        normalPacingHz, framePeriod.count() / 1e6, normalPacingHz == 60 ? "normal/default" : "diagnostic override");
+     g_maliNormalSessionActive = true; failed = false; stopped = 0;
+     std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
+     g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
+-    g_nNestedRefresh = g_nOutputRefresh = 30000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
++    g_nNestedRefresh = g_nOutputRefresh = normalPacingHz * 1000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
+     bool renderer = vulkan_mali_normal_init(width, height);
+     bool backend = renderer && gamescope::IBackend::Set<gamescope::CWaylandBackend>();
+     auto connector = backend ? gamescope::IBackend::Get()->CreateVirtualConnector(0) : nullptr;
+     bool ok = connector && gamescope::IBackend::Get()->PostInit() && vulkan_mali_normal_outputs() && StartServer(command);
++    // Allows phone A/B measurement of the original pacing/upload behavior
++    // with identical counters, without changing any ownership/sync checks.
++    const char *baselineEnv = getenv("MALI_VULKAN_PERF_BASELINE");
++    bool perfBaseline = baselineEnv && !strcmp(baselineEnv, "1");
++    std::printf("MaliPerf mode: %s; aggregate interval=2s target=%uHz default=60Hz\n", perfBaseline ? "baseline (old pacing, upload before pool check)" : "paced from frame start, pre-upload pool check", normalPacingHz);
+     auto next = std::chrono::steady_clock::now(); auto progress = next;
+     int childStatus = 0;
+     while (ok && !stopped && !failed) {
+         gamescope::IBackend::Get()->PollState();
+@@ -236,24 +249,34 @@ int mali_normal_main(int argc, char **argv) {
+         if (server.child > 0) {
+             pid_t r = waitpid(server.child, &childStatus, WNOHANG);
+             if (r == server.child) { server.child = -1; ok = WIFEXITED(childStatus) && WEXITSTATUS(childStatus) == 0; break; }
+         }
++        vulkan_mali_normal_tick();
+         auto now = std::chrono::steady_clock::now();
+-        if (server.pending && server.surface && now >= next) {
++        if (server.pending && server.surface && now >= next && (perfBaseline || vulkan_mali_normal_available())) {
++            vulkan_mali_normal_frame_begin();
+             auto texture = wlr_surface_get_texture(server.surface);
+             auto wrapped = reinterpret_cast<VulkanWlrTexture_t *>(texture);
+             auto source = wrapped && wrapped->buf ? vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr) : nullptr;
+-            if (!source) { ok = false; break; }
++            vulkan_mali_normal_upload_done();
++            if (!source) { vulkan_mali_normal_frame_end(false); ok = false; break; }
++            MaliCpuScope sceneScope(DD_CPU_SCENE, DD_CPU_FRAME);
+             FrameInfo_t frame{}; auto &layer = *frame.layers.push();
+             layer.tex = source.get(); layer.opacity = 1.0f; layer.filter = GamescopeUpscaleFilter::NEAREST;
+             layer.scale = {source->width() / float(width), source->height() / float(height)};
+             layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU; layer.blackBorder = true; layer.applyColorMgmt = false; frame.outputEncodingEOTF = EOTF_Gamma22;
++            sceneScope.finish();
+             int result = connector->Present(&frame, false);
++            // Include import texture cleanup in frame/RPC accounting.
++            { MaliCpuScope retire(DD_CPU_RETIRE, DD_CPU_FRAME); source = nullptr; }
++            vulkan_mali_normal_frame_end(result == 0);
+             if (result == 0) {
+                 timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time); wlr_surface_send_frame_done(server.surface, &time);
+                 server.pending = false; ++server.frames; wl_display_flush_clients(server.display); progress = now;
+             } else if (result != EAGAIN) { ok = false; break; }
+-            next = std::chrono::steady_clock::now() + std::chrono::nanoseconds(33333333);
++            // Pace from frame start: a slow render must not pay another target period.
++            // No catch-up burst: the next iteration starts a fresh deadline.
++            next = (perfBaseline ? std::chrono::steady_clock::now() : now) + framePeriod;
+         }
+         if (now - progress > std::chrono::seconds(15)) { mali_normal_failure("normal session made no frame progress for 15 seconds"); break; }
+         std::this_thread::sleep_for(std::chrono::milliseconds(2));
+     }
+diff --git a/src/mali_normal.hpp b/src/mali_normal.hpp
+index ddae2fb..28d87f4 100644
+--- a/src/mali_normal.hpp
++++ b/src/mali_normal.hpp
+@@ -8,8 +8,15 @@ struct wl_surface;
+ struct banner_ahb_v1;
+ extern bool g_maliNormalSessionActive;
+ inline bool mali_normal_active() { return g_maliNormalSessionActive; }
+ inline bool mali_normal_verbose() { const char *v = getenv("MALI_VULKAN_VERBOSE"); return v && !strcmp(v, "1"); }
++// Local diagnostic control only; no Vulkan/broker protocol changes.
++inline unsigned mali_normal_parse_pacing(const char *value) {
++    if (!value || !*value || !strcmp(value, "60")) return 60;
++    if (!strcmp(value, "30")) return 30;
++    return 0;
++}
++unsigned mali_normal_pacing_hz();
+ void mali_normal_input(unsigned type, double x, double y, uint32_t code, uint32_t state);
+ void mali_normal_failure(const char *reason);
+ bool mali_normal_bind(wl_display *, wl_surface *, banner_ahb_v1 *);
+ bool mali_normal_buffer(unsigned index, uint32_t key, unsigned width, unsigned height);
+@@ -20,7 +27,12 @@ void mali_normal_destroy_buffers();
+ void mali_normal_released(unsigned index);
+ bool vulkan_mali_normal_init(unsigned width, unsigned height);
+ bool vulkan_mali_normal_outputs();
+ int vulkan_mali_normal_present(const FrameInfo_t *);
++bool vulkan_mali_normal_available();
++void vulkan_mali_normal_frame_begin();
++void vulkan_mali_normal_upload_done();
++void vulkan_mali_normal_frame_end(bool presented);
++void vulkan_mali_normal_tick();
+ int vulkan_mali_normal_stop();
+ int mali_normal_main(int argc, char **argv);
+ int mali_interactive_main();
+diff --git a/src/mali_normal.inc b/src/mali_normal.inc
+index 4df57b2..b7e5b32 100644
+--- a/src/mali_normal.inc
++++ b/src/mali_normal.inc
+@@ -4,13 +4,14 @@
+ #include "normal_api.h"
+ bool g_maliNormalSessionActive = false;
+ namespace {
+ struct NormalOutput {
+-    struct Slot { dd_interop_output ahb{}; gamescope::OwningRc<CVulkanTexture> texture; uint32_t key = 0, frame = 0; } slots[3];
++    struct Slot { dd_interop_output ahb{}; gamescope::OwningRc<CVulkanTexture> texture; uint32_t key = 0, frame = 0; uint64_t committedNs = 0; } slots[3];
+     MaliOutputPool ownership;
+     PFN_vkDroidDeckInteropTEST interop = nullptr;
+     PFN_vkDroidDeckWaylandMALI transport = nullptr;
+-    unsigned width = 0, height = 0, frame = 0, rendered = 0, presented = 0, released = 0, dropped = 0;
++    PFN_vkDroidDeckPerformanceMALI performance = nullptr;
++    unsigned width = 0, height = 0, frame = 0, rendered = 0, presented = 0, released = 0, dropped = 0, late = 0;
+     uint64_t sequence = 0;
+     bool begun = false, stopping = false;
+     unsigned timeouts = 0;
+ } normalOutput;
+@@ -29,18 +30,25 @@ static void NormalBaseline() {
+     for (unsigned i = 2; i < 20; ++i) MaliRequire(stats.counts[i] == 0, "normal native children did not return to baseline");
+     MaliRequire(stats.counts[0] == 1 && stats.counts[1] == 1 && !stats.owned && !stats.timeouts && stats.fds_created == stats.fds_closed,
+                 "normal final ownership/FD baseline");
+     normalOutput.dropped = normalOutput.presented - stats.presented;
+-    std::printf("normal actual Android output: presented=%u released=%u cancelled before display=%u\n", stats.presented, stats.released, normalOutput.dropped);
++    std::printf("normal actual Android output: presented=%u released=%u cancelled before display=%u late=%u\n", stats.presented, stats.released, normalOutput.dropped, normalOutput.late);
+     std::printf("normal final native children: AHB=0 sync=0 FDs=0 pending=0 AndroidHeld=0 release timeouts=0 exported=%u closed=%u; device/queue destroyed next\n", stats.fds_created, stats.fds_closed);
+ }
+ }
++#include "mali_normal_perf.inc"
+ bool vulkan_mali_normal_init(unsigned width, unsigned height) {
+-    normalOutput = {}; normalOutput.width = width; normalOutput.height = height;
++    MaliRequire(maliStaging.live() == 0, "normal staging survived previous session");
++    maliCompletedTimeline.reset(); maliLocalWaits = {}; maliStaging.stats = {}; maliStaging.backend.maps = {}; maliStaging.backend.staging = nullptr; maliStaging.backend.mapStaging = nullptr; maliStaging.cursor = 0; maliWaitProfilingActive = false;
++    maliCpuDetail = {};
++    normalOutput = {}; normalPerf = {}; normalOutput.width = width; normalOutput.height = height;
+     if (!MaliInitializeRenderer(true)) return false;
++    if (maliStaging.backend.resolve() != VK_SUCCESS) { g_device.ShutdownMaliDiagnostic(); return false; }
+     normalOutput.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
+     normalOutput.transport = (PFN_vkDroidDeckWaylandMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckWaylandMALI");
+-    if (!normalOutput.interop || !normalOutput.transport) { g_device.ShutdownMaliDiagnostic(); return false; }
++    normalOutput.performance = (PFN_vkDroidDeckPerformanceMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckPerformance2MALI");
++    if (!normalOutput.performance) normalOutput.performance = (PFN_vkDroidDeckPerformanceMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckPerformanceMALI");
++    if (!normalOutput.interop || !normalOutput.transport || !normalOutput.performance) { g_device.ShutdownMaliDiagnostic(); return false; }
+     dd_normal_input begin{}; begin.verbose = mali_normal_verbose();
+     if (!MaliResult(NormalRPC(MB_NORMAL_BEGIN, begin), "normal begin")) { g_device.ShutdownMaliDiagnostic(); return false; }
+     normalOutput.begun = true;
+     currentOutputWidth = width; currentOutputHeight = height;
+@@ -70,21 +78,29 @@ bool vulkan_mali_normal_outputs() {
+ }
+ void mali_normal_released(unsigned index) {
+     MaliRequire(index < 3 && normalOutput.ownership.released(index), "normal unexpected/duplicate Wayland buffer release");
+     ++normalOutput.released;
++    auto &slot = normalOutput.slots[index];
++    if (slot.committedNs) { normalPerf.ackNs += dd_perf_now() - slot.committedNs; ++normalPerf.ackCount; slot.committedNs = 0; }
+ }
+ int vulkan_mali_normal_present(const FrameInfo_t *frame) {
++    MaliCpuScope outputScope(DD_CPU_OTHER, DD_CPU_OUTPUT);
+     auto &s = normalOutput;
+     if (s.stopping) return -1;
++    uint64_t acquireStart = dd_perf_now();
+     int index = s.ownership.acquire(s.frame);
++    normalPerf.currentAcquire = dd_perf_now() - acquireStart;
+     if (index < 0) { ++s.dropped; return EAGAIN; } // dispatch real releases before any reuse
+     auto &slot = s.slots[index]; slot.frame = ++s.frame;
+     auto producer = NormalInterop(DD_FENCE_CREATE); g_device.m_maliProducerFence = producer.fence;
+     g_device.m_maliReadbackBuffer = VK_NULL_HANDLE;
+     FrameInfo_t mutableFrame = *frame;
++    uint64_t compositeStart = dd_perf_now();
+     auto sequence = vulkan_composite(&mutableFrame, nullptr, false, slot.texture.get(), false, nullptr);
++    normalPerf.currentComposite = dd_perf_now() - compositeStart;
+     MaliRequire(sequence.has_value(), "normal Wayland Gamescope BLIT");
+-    g_device.wait(*sequence, false); g_device.m_maliProducerFence = VK_NULL_HANDLE;
++    { MaliWaitScope site(DD_WAIT_OUTPUT_COMPLETION, index); g_device.wait(*sequence, false); }
++    g_device.m_maliProducerFence = VK_NULL_HANDLE;
+     MaliRequire(*sequence > s.sequence && g_device.completedSeqNo() >= *sequence, "normal monotonic KHR timeline");
+     s.sequence = *sequence; ++s.rendered;
+     dd_interop_input input{}; input.fence = producer.fence;
+     auto sync = NormalInterop(DD_SYNC_EXPORT, input); input = {}; input.sync = sync.sync;
+@@ -92,17 +108,29 @@ int vulkan_mali_normal_present(const FrameInfo_t *frame) {
+     MaliRequire(s.ownership.ready(index), "normal Rendering -> Ready");
+     dd_normal_input publish{}; publish.token = slot.ahb.token; publish.sync = sync.sync; publish.frame = slot.frame;
+     MaliRequire(MaliResult(NormalRPC(MB_NORMAL_PUBLISH, publish), "normal publish ownership"), "normal publish ownership");
+     MaliRequire(s.ownership.presented(index), "normal Ready -> Android-owned");
+-    mali_normal_commit(index); ++s.presented;
+-    g_device.wait(*sequence, true);
++    unsigned owned = 0;
++    for (unsigned i = 0; i < 3; ++i) owned += s.ownership.androidOwned(i);
++    normalPerf.maxAndroid = std::max(normalPerf.maxAndroid, owned);
++    uint64_t commitStart = dd_perf_now();
++    mali_normal_commit(index); ++s.presented; slot.committedNs = commitStart;
++    normalPerf.currentCommit = dd_perf_now() - commitStart;
++    { MaliWaitScope site(DD_WAIT_OUTPUT_RETIRE, index); g_device.wait(*sequence, true); }
+     input = {}; input.sync = sync.sync; NormalInterop(DD_SYNC_CLOSE, input);
+     auto destroyFence = (PFN_vkDestroyFence)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDestroyFence");
+     destroyFence(g_device.device(), producer.fence, nullptr);
+     return 0;
+ }
+ int vulkan_mali_normal_stop() {
+     auto &s = normalOutput; s.stopping = true;
++    VkResult stagingDrain = (VkResult)maliStaging.shutdown();
++    NormalStagingMapReport("teardown");
++    if (stagingDrain != VK_SUCCESS) {
++        std::fprintf(stderr, "normal staging drain FAILED: retained slots=%u VkResult=%d; no PASS\n", maliStaging.live(), int(stagingDrain));
++        g_device.FailMaliDiagnostic("normal staging drain", stagingDrain);
++    }
++    maliWaitProfilingActive = false;
+     if (!s.begun) { g_device.ShutdownMaliDiagnostic(); return 1; }
+     mali_normal_detach_output();
+     VkResult end = NormalRPC(MB_NORMAL_END);
+     if (end != VK_SUCCESS) {
+@@ -129,8 +157,9 @@ int vulkan_mali_normal_stop() {
+         MaliRequire(MaliResult(g_device.vk.EnumeratePhysicalDevices(g_device.instance(), &count, nullptr), "normal native device destroy acknowledgement"), "normal native device destroy acknowledgement");
+         MaliRequire(count != 0, "normal physical inventory after device destruction");
+         std::puts("normal native device/implicit queue destruction acknowledged; baseline devices=0 queues=0");
+     };
++    maliCompletedTimeline.reset();
+     g_device.ShutdownMaliDiagnostic(); s_maliSessionCheckCleanup = nullptr; s_maliSessionCheckDestroyed = nullptr;
+     std::printf("normal session stopped: rendered=%u committed=%u released=%u release timeouts=%u; clean teardown\n", s.rendered, s.presented, s.released, s.timeouts);
+     return 0;
+ }
+diff --git a/src/mali_normal_perf.inc b/src/mali_normal_perf.inc
+new file mode 100644
+index 0000000..6b5c318
+--- /dev/null
++++ b/src/mali_normal_perf.inc
+@@ -0,0 +1,153 @@
++/* Normal session only. Fixed-size counters; formatting/sorting once per 2 s. */
++#include <algorithm>
++#include "renderer_protocol.h"
++#include "interop_protocol.h"
++#include "normal_opcode_perf.h"
++namespace {
++struct NormalPerformance {
++    dd_perf_rpc rpc{}, outside{};
++    uint64_t begin = 0, cpuBegin = 0, cpuNs = 0, lastEnd = 0, report = 0, tick = 0;
++    uint64_t frameNs = 0, cadenceNs = 0, uploadNs = 0, compositeNs = 0, acquireNs = 0, commitNs = 0;
++    uint64_t currentUpload = 0, currentComposite = 0, currentAcquire = 0, currentCommit = 0;
++    uint64_t outputWaitNs = 0, occupiedNs = 0, androidNs = 0, ackNs = 0, ackCount = 0;
++    uint64_t samples[DD_PERF_SAMPLES]{}, cadence[DD_PERF_SAMPLES]{};
++    uint64_t lastFrameNs = 0, lastRpcNs = 0, lastRpcCount = 0, lastWorst = 0;
++    unsigned lastWorstOp = 0, frames = 0, attempts = 0, missed = 0, maxAndroid = 0, previousPresented = 0;
++    bool waitingOutput = false;
++} normalPerf;
++}
++
++static void NormalStagingMapReport(const char *phase) {
++    const auto &maps = maliStaging.backend.maps;
++    std::printf("MaliPerf staging-map: phase=%s persistent-maps-created=%llu persistent-map-reuse-hits=%llu unmaps=%llu map-failures=%llu mapped-slots-live=%u (window totals)\n",
++        phase, (unsigned long long)maps.created, (unsigned long long)maliStaging.stats.mapReuses,
++        (unsigned long long)maps.unmaps, (unsigned long long)maps.failures, maliStaging.mappedLive());
++}
++
++void vulkan_mali_normal_frame_begin() {
++    maliWaitProfilingActive = true;
++    dd_perf_rpc ignored{};
++    MaliRequire(MaliResult(normalOutput.performance(g_device.device(), &ignored, VK_TRUE), "normal local performance reset"), "normal local performance reset");
++    auto &p = normalPerf;
++    dd_perf_merge(&p.outside, &ignored); // Preserve RPCs between frame attempts.
++    p.begin = dd_perf_now(); p.cpuBegin = dd_perf_cpu_now(); maliCpuDetail.begin(); p.currentUpload = p.currentComposite = p.currentAcquire = p.currentCommit = 0;
++}
++void vulkan_mali_normal_upload_done() { normalPerf.currentUpload = dd_perf_now() - normalPerf.begin; }
++void vulkan_mali_normal_frame_end(bool presented) {
++    auto &p = normalPerf; dd_perf_rpc rpc{};
++    MaliRequire(MaliResult(normalOutput.performance(g_device.device(), &rpc, VK_TRUE), "normal local performance snapshot"), "normal local performance snapshot");
++    dd_perf_merge(&p.rpc, &rpc); ++p.attempts;
++    uint64_t now = dd_perf_now(), work = now - p.begin; maliCpuDetail.end();
++    p.cpuNs += dd_perf_cpu_now() - p.cpuBegin;
++    if (p.attempts <= DD_PERF_SAMPLES) p.samples[p.attempts - 1] = work;
++    p.frameNs += work; p.uploadNs += p.currentUpload; p.compositeNs += p.currentComposite;
++    p.acquireNs += p.currentAcquire; p.commitNs += p.currentCommit;
++    if (presented) {
++        uint64_t cadence = p.lastEnd ? now - p.lastEnd : work;
++        if (p.frames < DD_PERF_SAMPLES) p.cadence[p.frames] = cadence;
++        ++p.frames; p.cadenceNs += cadence; p.lastEnd = now;
++        /* Work over budget, or a missed completion-to-completion deadline.
++         * Keep the same 1 ms scheduler tolerance for either pacing target. */
++        uint64_t target = 1000000000ull / mali_normal_pacing_hz();
++        if (work > target || cadence > target + 1000000u) { ++p.missed; ++normalOutput.late; }
++    }
++    p.lastFrameNs = work; p.lastRpcNs = p.lastRpcCount = p.lastWorst = 0; p.lastWorstOp = 0;
++    for (unsigned i = 0; i < DD_PERF_OPS; ++i) {
++        auto &op = rpc.op[i]; p.lastRpcNs += op.ns; p.lastRpcCount += op.count;
++        if (op.worst > p.lastWorst) { p.lastWorst = op.worst; p.lastWorstOp = i; }
++    }
++}
++bool vulkan_mali_normal_available() {
++    for (unsigned i = 0; i < 3; ++i) if (normalOutput.ownership.free(i)) { normalPerf.waitingOutput = false; return true; }
++    normalPerf.waitingOutput = true;
++    return false; // Only observes ownership; never acquires, recycles or assumes release.
++}
++void vulkan_mali_normal_tick() {
++    auto &p = normalPerf; auto &s = normalOutput;
++    uint64_t now = dd_perf_now(); unsigned occupied = 0, android = 0;
++    for (unsigned i = 0; i < 3; ++i) { occupied += !s.ownership.free(i); android += s.ownership.androidOwned(i); }
++    uint64_t elapsed = p.tick ? now - p.tick : 0; p.tick = now;
++    // Occupancy samples are time weighted at event-loop ticks, not GPU telemetry.
++    p.occupiedNs += elapsed * occupied; p.androidNs += elapsed * android;
++    if (p.waitingOutput) p.outputWaitNs += elapsed;
++    p.maxAndroid = std::max(p.maxAndroid, android);
++    if (!p.report) {
++        // Discard initialization RPCs before the first normal-loop window.
++        dd_perf_rpc startup{};
++        MaliRequire(MaliResult(s.performance(g_device.device(), &startup, VK_TRUE), "normal initial performance reset"), "normal initial performance reset");
++        p.report = now; return;
++    }
++    if (now - p.report < DD_PERF_INTERVAL_NS) return;
++    dd_normal_output stats{};
++    MaliRequire(MaliResult(NormalRPC(MB_NORMAL_STATS, {}, &stats), "normal periodic accounting"), "normal periodic accounting");
++    dd_perf_rpc outside{};
++    MaliRequire(MaliResult(s.performance(g_device.device(), &outside, VK_TRUE), "normal outside-frame performance snapshot"), "normal outside-frame performance snapshot");
++    dd_perf_merge(&p.outside, &outside); // Includes this window's STATS round trip.
++    uint64_t count = 0, rpcNs = 0, worst = 0; unsigned worstOp = 0, top[3]{};
++    for (unsigned i = 0; i < DD_PERF_OPS; ++i) {
++        auto &op = p.rpc.op[i]; count += op.count; rpcNs += op.ns;
++        if (op.worst > worst) { worst = op.worst; worstOp = i; }
++        for (unsigned j = 0; j < 3; ++j) if (op.ns > p.rpc.op[top[j]].ns) {
++            for (unsigned k = 2; k > j; --k) top[k] = top[k - 1];
++            top[j] = i; break;
++        }
++    }
++    double window = double(now - p.report), frames = p.frames ? p.frames : 1;
++    double attempts = p.attempts ? p.attempts : 1;
++    uint64_t syncWait = p.rpc.op[MB_RENDERER_WAIT].ns + p.rpc.op[MB_SYNC_WAIT].ns;
++    uint64_t nonRpc = p.frameNs > rpcNs ? p.frameNs - rpcNs : 0;
++    uint64_t outsideFrames = uint64_t(window) > p.frameNs ? uint64_t(window) - p.frameNs : 0;
++    std::printf("MaliPerf frame: committed-FPS=%.2f Android-FPS=%.2f frames=%u attempts=%u work-avg/p95=%.3f/%.3fms cadence-avg/p95=%.3f/%.3fms missed=%u last-work=%.3fms last-RPCs=%llu last-RPC=%.3fms last-worst=%.3fms opcode=%u target=%uHz default=60Hz\n",
++        p.frames * 1e9 / window, (stats.presented - p.previousPresented) * 1e9 / window, p.frames, p.attempts,
++        p.frameNs / attempts / 1e6, dd_perf_p95(p.samples, p.attempts) / 1e6, p.cadenceNs / frames / 1e6,
++        dd_perf_p95(p.cadence, p.frames) / 1e6, p.missed, p.lastFrameNs / 1e6,
++        (unsigned long long)p.lastRpcCount, p.lastRpcNs / 1e6, p.lastWorst / 1e6, p.lastWorstOp, mali_normal_pacing_hz());
++    std::printf("MaliPerf stages ms/attempt: SHM-import-upload=%.3f compositor-CPU=%.3f pool-acquire=%.3f queue-submit-RPC=%.3f timeline-RPC=%.3f SYNC_FD-export-RPC=%.3f sync-wait-RPC=%.3f publish-RPC=%.3f Wayland-commit-CPU=%.3f release-ack-lifetime=%.3fms/%llu (CPU stages include nested RPCs; no GPU timestamps)\n",
++        p.uploadNs / attempts / 1e6, p.compositeNs / attempts / 1e6, p.acquireNs / attempts / 1e6,
++        p.rpc.op[MB_RENDERER_SUBMIT].ns / attempts / 1e6, p.rpc.op[MB_RENDERER_WAIT].ns / attempts / 1e6,
++        p.rpc.op[MB_SYNC_EXPORT].ns / attempts / 1e6, p.rpc.op[MB_SYNC_WAIT].ns / attempts / 1e6,
++        p.rpc.op[MB_NORMAL_PUBLISH].ns / attempts / 1e6, p.commitNs / attempts / 1e6,
++        p.ackCount ? p.ackNs / double(p.ackCount) / 1e6 : 0, (unsigned long long)p.ackCount);
++    std::printf("MaliPerf RPC: per-frame=%.2f total=%llu total=%.3fms latency-avg=%.3fms worst=%.3fms opcode=%u uploads/frame=%.0fbytes write-RPCs/frame=%.2f copies/frame=%.2f compute-blits/frame=%.2f read-RPCs=%llu AHB-creates=%llu idle-RPCs=%llu fence-creates=%llu image-creates=%llu allocations=%llu client-RTT/frame=%.3fms\n",
++        count / frames, (unsigned long long)count, rpcNs / 1e6, count ? rpcNs / double(count) / 1e6 : 0,
++        worst / 1e6, worstOp, p.rpc.upload_bytes / frames, p.rpc.op[MB_MEMORY_WRITE].count / frames,
++        (p.rpc.op[MB_RENDERER_COPY].count + p.rpc.op[MB_COMMAND_COPY].count) / frames,
++        p.rpc.op[MB_RENDERER_DISPATCH].count / frames, (unsigned long long)p.rpc.op[MB_MEMORY_READ].count,
++        (unsigned long long)p.rpc.op[MB_AHB_CREATE].count, (unsigned long long)p.rpc.op[MB_RENDERER_IDLE].count,
++        (unsigned long long)p.rpc.op[MB_SYNC_FENCE_CREATE].count,
++        (unsigned long long)(p.rpc.op[MB_IMAGE_CREATE].count + p.rpc.op[MB_RENDERER_IMAGE].count),
++        (unsigned long long)p.rpc.op[MB_MEMORY_ALLOCATE].count, rpcNs / frames / 1e6);
++    std::printf("MaliPerf budget window: main-thread-CPU=%.3fms off-CPU=%.3fms RPC-sync-wait=%.3fms other-RPC=%.3fms host-non-RPC=%.3fms outside-frames=%.3fms output-backpressure=%.3fms pool-occupied-avg=%.2f/3 guest-Android-owned-avg/max=%.2f/%u native-owned-current=%u pending-GPU=%u open-FDs=%u top-RPC=%u:%.3fms,%u:%.3fms,%u:%.3fms (CPU/off-CPU partitions frame work and overlaps RPC buckets; off-CPU includes waits/scheduling/other processes; other-RPC includes native execution/transport/scheduling; outside includes client/pacing/events; backpressure overlaps outside)\n",
++        p.cpuNs / 1e6, (p.frameNs > p.cpuNs ? p.frameNs - p.cpuNs : 0) / 1e6,
++        syncWait / 1e6, (rpcNs - syncWait) / 1e6, nonRpc / 1e6, outsideFrames / 1e6,
++        p.outputWaitNs / 1e6, p.occupiedNs / window, p.androidNs / window, p.maxAndroid, stats.owned,
++        stats.counts[19], stats.counts[18], top[0], p.rpc.op[top[0]].ns / 1e6,
++        top[1], p.rpc.op[top[1]].ns / 1e6, top[2], p.rpc.op[top[2]].ns / 1e6);
++    maliCpuDetail.report(p.attempts, p.compositeNs / attempts / 1e6);
++    dd_perf_report_opcodes(stdout, &p.rpc, &p.outside, p.frames, p.attempts);
++    uint64_t attributed = 0;
++    for (unsigned i = 0; i < DD_WAIT_REASONS; ++i) {
++        dd_wait_report(stdout, i, &p.rpc.wait[i], &p.outside.wait[i], p.frames);
++        attributed += p.rpc.wait[i].count + p.outside.wait[i].count;
++    }
++    std::printf("MaliPerf wait coverage: opcode63=%llu attributed=%llu (missing attribution is not assumed satisfied; native off-CPU is an estimate, not GPU execution)\n",
++        (unsigned long long)(p.rpc.op[MB_RENDERER_WAIT].count + p.outside.op[MB_RENDERER_WAIT].count), (unsigned long long)attributed);
++    dd_perf_report_resources(stdout, &p.rpc, &p.outside, p.frames);
++    for (unsigned i = 0; i < DD_WAIT_REASONS; ++i) {
++        std::printf("MaliPerf local-wait: wait-reason=%s requests=%llu locally-completed=%llu forwarded=%llu requests/frame=%.2f forwarded/frame=%.2f\n",
++            dd_wait_names[i], (unsigned long long)maliLocalWaits.requests[i], (unsigned long long)maliLocalWaits.skipped[i],
++            (unsigned long long)maliLocalWaits.forwarded[i], maliLocalWaits.requests[i] / double(p.frames ? p.frames : 1),
++            maliLocalWaits.forwarded[i] / double(p.frames ? p.frames : 1));
++    }
++    auto &staging = maliStaging.stats;
++    std::printf("MaliPerf staging: hits=%llu misses=%llu reuse-waits=%llu resources-created=%llu resized=%llu failures=%llu live=%u limit=3 (buffer+memory pairs; window totals)\n",
++        (unsigned long long)staging.hits, (unsigned long long)staging.misses, (unsigned long long)staging.waits,
++        (unsigned long long)staging.created, (unsigned long long)staging.resized, (unsigned long long)staging.failures, maliStaging.live());
++    NormalStagingMapReport("window");
++    maliLocalWaits = {}; staging = {}; maliStaging.backend.maps = {};
++    std::fflush(stdout); // Pipe-backed session logs must not hold a report until exit.
++    unsigned previous = stats.presented; uint64_t lastEnd = p.lastEnd;
++    bool waiting = p.waitingOutput;
++    p = {}; p.report = p.tick = dd_perf_now(); p.previousPresented = previous;
++    p.lastEnd = lastEnd; p.waitingOutput = waiting;
++}
+diff --git a/src/mali_staging.inc b/src/mali_staging.inc
+new file mode 100644
+index 0000000..434926e
+--- /dev/null
++++ b/src/mali_staging.inc
+@@ -0,0 +1,88 @@
++/* Normal staging slots own their whole-allocation coherent mapping. The pool
++ * proves completion before CPU reuse, resizing, unmapping or destruction. */
++#include "staging_api.h"
++struct MaliStagingBackend {
++    struct Resource {
++        VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
++        void *mapped = nullptr; uint64_t mappedBytes = 0;
++    };
++    struct MapCounters { uint64_t created = 0, unmaps = 0, failures = 0; } maps;
++    PFN_vkDroidDeckStagingMALI staging = nullptr;
++    PFN_vkDroidDeckMapStagingMALI mapStaging = nullptr;
++    VkResult resolve() {
++        staging = reinterpret_cast<PFN_vkDroidDeckStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckStagingMALI"));
++        mapStaging = reinterpret_cast<PFN_vkDroidDeckMapStagingMALI>(g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckMapStagingMALI"));
++        if (!staging || !mapStaging) {
++            std::fprintf(stderr, "persistent staging API unavailable: device lookup returned null for %s\n",
++                         !staging ? "vkDroidDeckStagingMALI" : "vkDroidDeckMapStagingMALI");
++            return VK_ERROR_FEATURE_NOT_PRESENT;
++        }
++        VkResult result = mapStaging(g_device.device(), VK_NULL_HANDLE, nullptr);
++        if (result != VK_SUCCESS) {
++            std::fprintf(stderr, "persistent staging API unavailable: wire-v7/normal-mode probe VkResult=%d (see proxy reason)\n", int(result));
++            staging = nullptr; mapStaging = nullptr;
++            return result;
++        }
++        std::fputs("persistent staging API: available\n", stderr);
++        return VK_SUCCESS;
++    }
++    static constexpr int invalid = VK_ERROR_INITIALIZATION_FAILED;
++    bool completed(uint64_t value) {
++        return maliCompletedTimeline.covers(g_device.device(), g_device.maliScratchTimeline(), value);
++    }
++    int wait(uint64_t value, const Resource &r) {
++        VkSemaphore semaphore = g_device.maliScratchTimeline();
++        VkSemaphoreWaitInfo info{}; info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
++        info.semaphoreCount = 1; info.pSemaphores = &semaphore; info.pValues = &value;
++        MaliWaitScope reason(DD_WAIT_SHM_STAGING_REUSE, (uint64_t)(uintptr_t)r.buffer);
++        VkResult result = MaliProfiledWait(g_device.vk.WaitSemaphores, g_device.vk.GetDeviceProcAddr, g_device.device(), &info, 5000000000ull);
++        if (result == VK_SUCCESS) g_device.resetCmdBuffers(value);
++        return result;
++    }
++    void destroy(Resource &r, uint64_t completedSequence = 0) {
++        // Buffer destruction also requires recorded references to be retired.
++        // The pool only supplies a nonzero sequence after proving completion.
++        if (completedSequence) g_device.resetCmdBuffers(completedSequence);
++        if (r.mapped) {
++            g_device.vk.UnmapMemory(g_device.device(), r.memory); ++maps.unmaps;
++            r.mapped = nullptr; r.mappedBytes = 0;
++        }
++        if (r.buffer) g_device.vk.DestroyBuffer(g_device.device(), r.buffer, nullptr);
++        if (r.memory) g_device.vk.FreeMemory(g_device.device(), r.memory, nullptr);
++        r = {};
++    }
++    int create(uint64_t bytes, Resource &r) {
++        if (!staging || !mapStaging) { VkResult result = resolve(); if (result != VK_SUCCESS) return result; }
++        VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++        bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++        VkResult result = g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &r.buffer);
++        if (result != VK_SUCCESS) return result;
++        VkMemoryRequirements requirements{};
++        g_device.vk.GetBufferMemoryRequirements(g_device.device(), r.buffer, &requirements);
++        uint32_t type = g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, requirements.memoryTypeBits);
++        if (type == ~0u || requirements.size < bytes) {
++            std::fprintf(stderr, "persistent staging acquire unavailable: host-visible/coherent type=%u memoryTypeBits=0x%x allocation=%llu requested=%llu\n",
++                         type, requirements.memoryTypeBits, (unsigned long long)requirements.size, (unsigned long long)bytes);
++            destroy(r); return VK_ERROR_FEATURE_NOT_PRESENT;
++        }
++        VkMemoryAllocateInfo allocation{}; allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
++        result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
++        if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
++        if (result == VK_SUCCESS) {
++            result = mapStaging(g_device.device(), r.memory, &r.mapped);
++            if (result == VK_SUCCESS) { ++maps.created; r.mappedBytes = requirements.size; }
++            else {
++                ++maps.failures; r.mapped = nullptr;
++                std::fprintf(stderr, "persistent staging acquire failed: vkDroidDeckMapStagingMALI VkResult=%d\n", int(result));
++            }
++        }
++        if (result != VK_SUCCESS) destroy(r);
++        return result;
++    }
++    VkResult prepare(const Resource &r, VkCommandBuffer command) {
++        if (!r.mapped || !r.mappedBytes || !staging || !command) return VK_ERROR_INITIALIZATION_FAILED;
++        return staging(g_device.device(), r.memory, command);
++    }
++};
++static MaliStagingPool<MaliStagingBackend> maliStaging;
+diff --git a/src/mali_staging_pool.hpp b/src/mali_staging_pool.hpp
+new file mode 100644
+index 0000000..59f4cd0
+--- /dev/null
++++ b/src/mali_staging_pool.hpp
+@@ -0,0 +1,75 @@
++/* Fixed slot count; completion knowledge is supplied by the real backend.
++ * No slot destructor frees Vulkan resources: shutdown must prove safety. */
++#pragma once
++#include <cstdint>
++inline thread_local bool maliStagingUploadRecording = false;
++struct MaliStagingUploadScope {
++    bool previous = maliStagingUploadRecording;
++    MaliStagingUploadScope() { maliStagingUploadRecording = true; }
++    ~MaliStagingUploadScope() { maliStagingUploadRecording = previous; }
++};
++template<class Backend> struct MaliStagingPool {
++    static constexpr unsigned limit = 3, preferred = 2;
++    using Resource = typename Backend::Resource;
++    struct Slot { Resource resource{}; uint64_t capacity = 0, sequence = 0; bool live = false, reserved = false; };
++    struct Counters { uint64_t hits = 0, misses = 0, waits = 0, created = 0, resized = 0, failures = 0, mapReuses = 0; } stats;
++    Backend backend;
++    Slot slots[limit]{};
++    unsigned cursor = 0;
++    unsigned live() const { unsigned n = 0; for (const auto &s : slots) n += s.live; return n; }
++    unsigned mappedLive() const { unsigned n = 0; for (const auto &s : slots) n += s.live && s.resource.mapped; return n; }
++    bool safe(const Slot &s) { return !s.sequence || backend.completed(s.sequence); }
++    int make(Slot &s, uint64_t bytes, Slot *&out) {
++        int result = backend.create(bytes, s.resource);
++        if (result) { ++stats.failures; return result; }
++        s.live = s.reserved = true; s.capacity = bytes; s.sequence = 0;
++        ++stats.created; out = &s; return 0;
++    }
++    int acquire(uint64_t bytes, Slot *&out) {
++        out = nullptr;
++        if (!bytes) return Backend::invalid;
++        // Warm up two slots, then prefer completed resources over growing.
++        if (live() < preferred) for (auto &s : slots) if (!s.live) {
++            ++stats.misses; return make(s, bytes, out);
++        }
++        for (unsigned i = 0; i < limit; ++i) {
++            unsigned index = (cursor + i) % limit; auto &s = slots[index];
++            if (!s.live || s.reserved || s.capacity < bytes || !safe(s)) continue;
++            ++stats.hits; ++stats.mapReuses; s.reserved = true; cursor = (index + 1) % limit; out = &s; return 0;
++        }
++        ++stats.misses;
++        // Resize only a proven completed slot. Never destroy pending storage.
++        for (auto &s : slots) if (s.live && !s.reserved && safe(s)) {
++            backend.destroy(s.resource, s.sequence); s = {}; ++stats.resized; return make(s, bytes, out);
++        }
++        for (auto &s : slots) if (!s.live) return make(s, bytes, out);
++        Slot *oldest = nullptr;
++        for (auto &s : slots) if (!s.reserved && (!oldest || s.sequence < oldest->sequence)) oldest = &s;
++        if (!oldest) { ++stats.failures; return Backend::invalid; }
++        ++stats.waits;
++        int result = backend.wait(oldest->sequence, oldest->resource);
++        if (result || !safe(*oldest)) { ++stats.failures; return result ? result : Backend::invalid; }
++        if (oldest->capacity < bytes) {
++            backend.destroy(oldest->resource, oldest->sequence); *oldest = {}; ++stats.resized; return make(*oldest, bytes, out);
++        }
++        ++stats.mapReuses; oldest->reserved = true; out = oldest; return 0;
++    }
++    struct Lease {
++        Slot *slot = nullptr;
++        Lease() = default;
++        Lease(const Lease &) = delete;
++        Lease &operator=(const Lease &) = delete;
++        ~Lease() { if (slot) slot->reserved = false; }
++        void submitted(uint64_t sequence) { slot->sequence = sequence; slot->reserved = false; slot = nullptr; }
++    };
++    int shutdown() {
++        int first = 0;
++        for (auto &s : slots) {
++            if (!s.live) continue;
++            int result = s.reserved ? Backend::invalid : safe(s) ? 0 : backend.wait(s.sequence, s.resource);
++            if (result || !safe(s)) { if (!first) first = result ? result : Backend::invalid; continue; }
++            backend.destroy(s.resource, s.sequence); s = {};
++        }
++        return first; // Failed/pending slots remain live, never assumed released.
++    }
++};
+diff --git a/src/mali_wait_profile.hpp b/src/mali_wait_profile.hpp
+new file mode 100644
+index 0000000..bb34e76
+--- /dev/null
++++ b/src/mali_wait_profile.hpp
+@@ -0,0 +1,60 @@
++/* Included only by the renderer TU. Normal-only completion knowledge; never
++ * infer completion from submission, elapsed time or Android ownership. */
++#pragma once
++#include "normal_api.h"
++static thread_local bool maliWaitProfilingActive = false;
++struct MaliCompletedTimeline {
++    VkDevice device{}; VkSemaphore semaphore{}; uint64_t value = 0;
++    VkDevice producerDevice{}; VkSemaphore producerSemaphore{}; uint64_t producerValue = 0;
++    bool valid = false, producerSucceeded = false;
++    void reset() { *this = {}; }
++    bool covers(VkDevice d, VkSemaphore s, uint64_t v) const {
++        return valid && device == d && semaphore == s && v <= value;
++    }
++    void observe(VkDevice d, VkSemaphore s, uint64_t v, VkResult result) {
++        if (!d || !s || result != VK_SUCCESS) return;
++        if (!valid || device != d || semaphore != s) { device = d; semaphore = s; value = v; valid = true; }
++        else if (v > value) value = v;
++    }
++    bool producerCovers(VkDevice d, VkSemaphore s, uint64_t v) const {
++        return producerSucceeded && producerDevice == d && producerSemaphore == s && producerValue == v && covers(d, s, v);
++    }
++};
++static thread_local MaliCompletedTimeline maliCompletedTimeline;
++struct MaliLocalWaitCounters {
++    uint64_t requests[DD_WAIT_REASONS]{}, skipped[DD_WAIT_REASONS]{}, forwarded[DD_WAIT_REASONS]{};
++};
++static thread_local MaliLocalWaitCounters maliLocalWaits;
++struct MaliWaitContext { uint32_t reason = DD_WAIT_UNATTRIBUTED; uint64_t resource = 0; };
++static thread_local MaliWaitContext maliWaitContext;
++struct MaliWaitScope {
++    MaliWaitContext previous;
++    MaliWaitScope(uint32_t reason, uint64_t resource) : previous(maliWaitContext) { maliWaitContext = {reason, resource}; }
++    ~MaliWaitScope() { maliWaitContext = previous; }
++};
++static VkResult MaliProfiledWait(PFN_vkWaitSemaphores original, PFN_vkGetDeviceProcAddr lookup,
++        VkDevice device, const VkSemaphoreWaitInfo *info, uint64_t timeout) {
++    if (!maliWaitProfilingActive) return original(device, info, timeout);
++    const unsigned reason = maliWaitContext.reason;
++    const bool single = info && info->sType == VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO && !info->pNext && !info->flags && info->semaphoreCount == 1 && info->pSemaphores && info->pValues;
++    if (reason < DD_WAIT_REASONS) ++maliLocalWaits.requests[reason];
++    if (reason == DD_WAIT_OUTPUT_COMPLETION) maliCompletedTimeline.producerSucceeded = false;
++    const bool reusable = reason == DD_WAIT_DESCRIPTOR_REUSE || reason == DD_WAIT_SHM_STAGING_REUSE;
++    if (single && ((reusable && maliCompletedTimeline.covers(device, info->pSemaphores[0], info->pValues[0])) ||
++        (reason == DD_WAIT_OUTPUT_RETIRE && maliCompletedTimeline.producerCovers(device, info->pSemaphores[0], info->pValues[0])))) {
++        ++maliLocalWaits.skipped[reason]; return VK_SUCCESS;
++    }
++    if (reason < DD_WAIT_REASONS) ++maliLocalWaits.forwarded[reason];
++    static auto profiled = reinterpret_cast<PFN_vkDroidDeckProfiledWaitMALI>(lookup(device, "vkDroidDeckProfiledWaitMALI"));
++    // Mixed/older assets keep the real wait. The aggregate coverage reports
++    // missing attribution instead of guessing a reason or claiming native data.
++    VkResult result = profiled ? profiled(device, info, timeout, reason, maliWaitContext.resource) : original(device, info, timeout);
++    if (single) {
++        maliCompletedTimeline.observe(device, info->pSemaphores[0], info->pValues[0], result);
++        if (reason == DD_WAIT_OUTPUT_COMPLETION && result == VK_SUCCESS) {
++            maliCompletedTimeline.producerDevice = device; maliCompletedTimeline.producerSemaphore = info->pSemaphores[0];
++            maliCompletedTimeline.producerValue = info->pValues[0]; maliCompletedTimeline.producerSucceeded = true;
++        }
++    }
++    return result;
++}
+diff --git a/src/normal_opcode_perf.h b/src/normal_opcode_perf.h
+new file mode 100644
+index 0000000..b7d7313
+--- /dev/null
++++ b/src/normal_opcode_perf.h
+@@ -0,0 +1,214 @@
++/* Normal-session report formatting only. No wire or hot-path changes. */
++#ifndef DD_NORMAL_OPCODE_PERF_H
++#define DD_NORMAL_OPCODE_PERF_H
++#include "normal_perf.h"
++#include <stdio.h>
++
++enum dd_perf_category {
++    DD_PERF_MEMORY, DD_PERF_RECORDING, DD_PERF_UPDATES, DD_PERF_SUBMIT,
++    DD_PERF_SYNC, DD_PERF_RESOURCES, DD_PERF_PRESENT, DD_PERF_OTHER,
++    DD_PERF_CATEGORIES
++};
++static const char *const dd_perf_category_names[DD_PERF_CATEGORIES] = {
++    "mapped-memory-transfer", "command-recording", "descriptor-resource-updates",
++    "queue-submit", "timeline-synchronization", "allocation-resource-management",
++    "AHB-presentation", "other"
++};
++struct dd_perf_opcode_info { const char *name; enum dd_perf_category category; };
++/* Indexed by the existing wire opcode. The parity test checks every entry
++ * against protocol headers (including the implicit submit enum values).
++ * Classify by opcode, not payload: generic RENDERER_DESTROY is management,
++ * even for a semaphore; semaphore/fence/event creation is also management.
++ * Memory binds are updates, map/unmap/flush/invalidate are mapped transfer,
++ * and normal/diagnostic output-session lifecycle/STATS are presentation. */
++static const struct dd_perf_opcode_info dd_perf_opcodes[] = {
++    {"UNKNOWN", DD_PERF_OTHER}, /* 0 */
++    {"MB_ENUMERATE", DD_PERF_OTHER}, /* 1 */
++    {"MB_CREATE", DD_PERF_RESOURCES}, /* 2 */
++    {"MB_DESTROY", DD_PERF_RESOURCES}, /* 3 */
++    {"MB_LIST", DD_PERF_OTHER}, /* 4 */
++    {"MB_PROPERTIES", DD_PERF_OTHER}, /* 5 */
++    {"MB_GLOBAL", DD_PERF_OTHER}, /* 6 */
++    {"MB_CAPS", DD_PERF_OTHER}, /* 7 */
++    {"MB_FORMAT", DD_PERF_OTHER}, /* 8 */
++    {"MB_IMAGE", DD_PERF_OTHER}, /* 9 */
++    {"MB_BUFFER", DD_PERF_OTHER}, /* 10 */
++    {"MB_SEMAPHORE", DD_PERF_OTHER}, /* 11 */
++    {"MB_FENCE", DD_PERF_OTHER}, /* 12 */
++    {"MB_SPARSE", DD_PERF_OTHER}, /* 13 */
++    {"MB_DEVICE_CREATE", DD_PERF_RESOURCES}, /* 14 */
++    {"MB_DEVICE_QUEUE", DD_PERF_RESOURCES}, /* 15 */
++    {"MB_DEVICE_DESTROY", DD_PERF_RESOURCES}, /* 16 */
++    {"MB_POOL_CREATE", DD_PERF_RESOURCES}, /* 17 */
++    {"MB_POOL_DESTROY", DD_PERF_RESOURCES}, /* 18 */
++    {"MB_COMMAND_ALLOCATE", DD_PERF_RESOURCES}, /* 19 */
++    {"MB_COMMAND_FREE", DD_PERF_RESOURCES}, /* 20 */
++    {"MB_COMMAND_BEGIN", DD_PERF_RECORDING}, /* 21 */
++    {"MB_COMMAND_END", DD_PERF_RECORDING}, /* 22 */
++    {"MB_EVENT_CREATE", DD_PERF_RESOURCES}, /* 23 */
++    {"MB_EVENT_DESTROY", DD_PERF_RESOURCES}, /* 24 */
++    {"MB_EVENT_STATUS", DD_PERF_SYNC}, /* 25 */
++    {"MB_COMMAND_SET_EVENT", DD_PERF_RECORDING}, /* 26 */
++    {"MB_FENCE_CREATE", DD_PERF_RESOURCES}, /* 27 */
++    {"MB_FENCE_DESTROY", DD_PERF_RESOURCES}, /* 28 */
++    {"MB_FENCE_STATUS", DD_PERF_SYNC}, /* 29 */
++    {"MB_FENCE_WAIT", DD_PERF_SYNC}, /* 30 */
++    {"MB_QUEUE_SUBMIT", DD_PERF_SUBMIT}, /* 31 */
++    {"MB_BUFFER_CREATE", DD_PERF_RESOURCES}, /* 32 */
++    {"MB_BUFFER_DESTROY", DD_PERF_RESOURCES}, /* 33 */
++    {"MB_BUFFER_REQUIREMENTS", DD_PERF_RESOURCES}, /* 34 */
++    {"MB_MEMORY_ALLOCATE", DD_PERF_RESOURCES}, /* 35 */
++    {"MB_MEMORY_FREE", DD_PERF_RESOURCES}, /* 36 */
++    {"MB_BUFFER_BIND", DD_PERF_UPDATES}, /* 37 */
++    {"MB_MEMORY_MAP", DD_PERF_MEMORY}, /* 38 */
++    {"MB_MEMORY_UNMAP", DD_PERF_MEMORY}, /* 39 */
++    {"MB_MEMORY_READ", DD_PERF_MEMORY}, /* 40 */
++    {"MB_MEMORY_WRITE", DD_PERF_MEMORY}, /* 41 */
++    {"MB_MEMORY_FLUSH", DD_PERF_MEMORY}, /* 42 */
++    {"MB_MEMORY_INVALIDATE", DD_PERF_MEMORY}, /* 43 */
++    {"MB_IMAGE_CREATE", DD_PERF_RESOURCES}, /* 44 */
++    {"MB_IMAGE_DESTROY", DD_PERF_RESOURCES}, /* 45 */
++    {"MB_IMAGE_REQUIREMENTS", DD_PERF_RESOURCES}, /* 46 */
++    {"MB_IMAGE_BIND", DD_PERF_UPDATES}, /* 47 */
++    {"MB_COMMAND_FILL", DD_PERF_RECORDING}, /* 48 */
++    {"MB_COMMAND_BARRIER", DD_PERF_RECORDING}, /* 49 */
++    {"MB_COMMAND_CLEAR", DD_PERF_RECORDING}, /* 50 */
++    {"MB_COMMAND_COPY", DD_PERF_RECORDING}, /* 51 */
++    {"MB_AHB_CREATE", DD_PERF_PRESENT}, /* 52 */
++    {"MB_AHB_RELEASE", DD_PERF_PRESENT}, /* 53 */
++    {"MB_SYNC_FENCE_CREATE", DD_PERF_RESOURCES}, /* 54 */
++    {"MB_SYNC_EXPORT", DD_PERF_SYNC}, /* 55 */
++    {"MB_SYNC_WAIT", DD_PERF_SYNC}, /* 56 */
++    {"MB_SYNC_CLOSE", DD_PERF_SYNC}, /* 57 */
++    {"MB_AHB_INSPECT", DD_PERF_PRESENT}, /* 58 */
++    {"MB_AHB_PRESENT", DD_PERF_PRESENT}, /* 59 */
++    {"MB_RENDERER_SEMAPHORE_CREATE", DD_PERF_RESOURCES}, /* 60 */
++    {"MB_RENDERER_DESTROY", DD_PERF_RESOURCES}, /* 61 */
++    {"MB_RENDERER_COUNTER", DD_PERF_SYNC}, /* 62 */
++    {"MB_RENDERER_WAIT", DD_PERF_SYNC}, /* 63 */
++    {"MB_RENDERER_VIEW", DD_PERF_RESOURCES}, /* 64 */
++    {"MB_RENDERER_SAMPLER", DD_PERF_RESOURCES}, /* 65 */
++    {"MB_RENDERER_SET_LAYOUT", DD_PERF_RESOURCES}, /* 66 */
++    {"MB_RENDERER_PIPELINE_LAYOUT", DD_PERF_RESOURCES}, /* 67 */
++    {"MB_RENDERER_POOL", DD_PERF_RESOURCES}, /* 68 */
++    {"MB_RENDERER_SETS", DD_PERF_RESOURCES}, /* 69 */
++    {"MB_RENDERER_UPDATE", DD_PERF_UPDATES}, /* 70 */
++    {"MB_RENDERER_SHADER", DD_PERF_RESOURCES}, /* 71 */
++    {"MB_RENDERER_PIPELINE", DD_PERF_RESOURCES}, /* 72 */
++    {"MB_RENDERER_BIND_PIPELINE", DD_PERF_RECORDING}, /* 73 */
++    {"MB_RENDERER_BIND_SET", DD_PERF_RECORDING}, /* 74 */
++    {"MB_RENDERER_DISPATCH", DD_PERF_RECORDING}, /* 75 */
++    {"MB_RENDERER_SUBMIT", DD_PERF_SUBMIT}, /* 76 */
++    {"MB_RENDERER_RESET_COMMAND", DD_PERF_RECORDING}, /* 77 */
++    {"MB_RENDERER_IMAGE", DD_PERF_RESOURCES}, /* 78 */
++    {"MB_RENDERER_BARRIER", DD_PERF_RECORDING}, /* 79 */
++    {"MB_RENDERER_COPY", DD_PERF_RECORDING}, /* 80 */
++    {"MB_RENDERER_CLEAR", DD_PERF_RECORDING}, /* 81 */
++    {"MB_RENDERER_IDLE", DD_PERF_SYNC}, /* 82 */
++    {"MB_SESSION_BEGIN", DD_PERF_PRESENT}, /* 83 */
++    {"MB_SESSION_PRESENT", DD_PERF_PRESENT}, /* 84 */
++    {"MB_SESSION_END", DD_PERF_PRESENT}, /* 85 */
++    {"MB_SESSION_STATS", DD_PERF_PRESENT}, /* 86 */
++    {"MB_NORMAL_BEGIN", DD_PERF_PRESENT}, /* 87 */
++    {"MB_NORMAL_REGISTER", DD_PERF_PRESENT}, /* 88 */
++    {"MB_NORMAL_PUBLISH", DD_PERF_PRESENT}, /* 89 */
++    {"MB_NORMAL_END", DD_PERF_PRESENT}, /* 90 */
++    {"MB_NORMAL_STATS", DD_PERF_PRESENT}, /* 91 */
++};
++#ifdef __cplusplus
++static_assert(sizeof(dd_perf_opcodes) / sizeof(dd_perf_opcodes[0]) == DD_PERF_OPS, "opcode profile coverage");
++#else
++_Static_assert(sizeof(dd_perf_opcodes) / sizeof(dd_perf_opcodes[0]) == DD_PERF_OPS, "opcode profile coverage");
++#endif
++
++static inline void dd_perf_op_merge(struct dd_perf_op *p, const struct dd_perf_op *q) {
++    p->count += q->count; p->ns += q->ns;
++    if (q->worst > p->worst) p->worst = q->worst;
++}
++static inline double dd_perf_percent(uint64_t value, uint64_t total) {
++    return total ? 100.0 * (double)value / (double)total : 0;
++}
++static inline struct dd_perf_op dd_perf_categories(const struct dd_perf_rpc *rpc,
++        struct dd_perf_op categories[DD_PERF_CATEGORIES]) {
++    struct dd_perf_op total = {0, 0, 0};
++    for (unsigned i = 0; i < DD_PERF_CATEGORIES; ++i) categories[i] = total;
++    for (unsigned i = 0; i < DD_PERF_OPS; ++i) {
++        dd_perf_op_merge(&total, &rpc->op[i]);
++        dd_perf_op_merge(&categories[dd_perf_opcodes[i].category], &rpc->op[i]);
++    }
++    return total;
++}
++/* Called only at the existing two-second report boundary. All values are
++ * client request/reply wall time, including failed calls. No timers, heap
++ * allocations, locks or RPCs here. Frames retains the existing count scope;
++ * outside includes periodic STATS/events, excluding startup and teardown. */
++static inline void dd_perf_report_opcodes(FILE *out, const struct dd_perf_rpc *frame,
++        const struct dd_perf_rpc *outside, unsigned frames, unsigned attempts) {
++    struct dd_perf_rpc window = *frame;
++    struct dd_perf_op categories[DD_PERF_CATEGORIES], frame_categories[DD_PERF_CATEGORIES];
++    dd_perf_merge(&window, outside);
++    struct dd_perf_op total = dd_perf_categories(&window, categories);
++    struct dd_perf_op frame_total = dd_perf_categories(frame, frame_categories);
++    double denominator = frames ? frames : 1;
++    unsigned most_count = DD_PERF_OPS, most_time = DD_PERF_OPS, most_category = DD_PERF_CATEGORIES;
++    fprintf(out, "MaliPerf opcode-window: scope=normal-loop frames=%u attempts=%u count=%llu frame-count=%llu outside-count=%llu frame-RPCs/frame=%.2f client-RTT=%.3fms (frame counts match existing RPC report; includes failed calls)\n",
++        frames, attempts, (unsigned long long)total.count, (unsigned long long)frame_total.count,
++        (unsigned long long)(total.count - frame_total.count), frame_total.count / denominator, total.ns / 1e6);
++    for (unsigned i = 0; i < DD_PERF_OPS; ++i) {
++        const struct dd_perf_op *op = &window.op[i];
++        if (!op->count) continue;
++        if (frame->op[i].count && (most_count == DD_PERF_OPS || frame->op[i].count > frame->op[most_count].count)) most_count = i;
++        if (most_time == DD_PERF_OPS || op->ns > window.op[most_time].ns) most_time = i;
++        fprintf(out, "MaliPerf opcode: op=%u name=%s category=%s count=%llu count-pct=%.2f frame-count=%llu outside-count=%llu frame-RPCs/frame=%.2f RTT-total=%.3fms RTT-avg=%.3fms RTT-max=%.3fms\n",
++            i, dd_perf_opcodes[i].name, dd_perf_category_names[dd_perf_opcodes[i].category],
++            (unsigned long long)op->count, dd_perf_percent(op->count, total.count),
++            (unsigned long long)frame->op[i].count, (unsigned long long)outside->op[i].count,
++            frame->op[i].count / denominator, op->ns / 1e6, op->ns / (double)op->count / 1e6, op->worst / 1e6);
++    }
++    for (unsigned i = 0; i < DD_PERF_CATEGORIES; ++i) {
++        const struct dd_perf_op *op = &categories[i];
++        if (op->count && (most_category == DD_PERF_CATEGORIES || op->ns > categories[most_category].ns)) most_category = i;
++        fprintf(out, "MaliPerf category: name=%s count=%llu count-pct=%.2f frame-count=%llu outside-count=%llu frame-RPCs/frame=%.2f RTT-total=%.3fms RTT-pct=%.2f RTT-avg=%.3fms RTT-max=%.3fms\n",
++            dd_perf_category_names[i], (unsigned long long)op->count, dd_perf_percent(op->count, total.count),
++            (unsigned long long)frame_categories[i].count, (unsigned long long)(op->count - frame_categories[i].count),
++            frame_categories[i].count / denominator, op->ns / 1e6, dd_perf_percent(op->ns, total.ns),
++            op->count ? op->ns / (double)op->count / 1e6 : 0, op->worst / 1e6);
++    }
++    fprintf(out, "MaliPerf RPC leaders: most-frame-count-op=%s largest-RTT-op=%s largest-RTT-category=%s command-recording-RTT-pct=%.2f\n",
++        most_count < DD_PERF_OPS ? dd_perf_opcodes[most_count].name : "none",
++        most_time < DD_PERF_OPS ? dd_perf_opcodes[most_time].name : "none",
++        most_category < DD_PERF_CATEGORIES ? dd_perf_category_names[most_category] : "none",
++        dd_perf_percent(categories[DD_PERF_RECORDING].ns, total.ns));
++}
++/* These are source resources, not AHB outputs. Requirements queries are
++ * management calls too. MB_RENDERER_DESTROY is split by its successful kind. */
++static inline void dd_perf_report_resources(FILE *out, const struct dd_perf_rpc *frame,
++        const struct dd_perf_rpc *outside, unsigned frames) {
++    const char *names[] = {"SHM-staging-buffer", "memory", "source-image", "image-view", "producer-fence"};
++    uint64_t typed[2] = {0, 0};
++    for (unsigned kind = 0; kind < 5; ++kind) {
++        uint64_t counts[2][3] = {{0, 0, 0}, {0, 0, 0}};
++        for (unsigned phase = 0; phase < 2; ++phase) {
++            const struct dd_perf_rpc *p = phase ? outside : frame;
++            switch (kind) {
++            case 0: counts[phase][0] = p->op[32].count; counts[phase][1] = p->op[34].count; counts[phase][2] = p->op[33].count; break;
++            case 1: counts[phase][0] = p->op[35].count; counts[phase][2] = p->op[36].count; break;
++            case 2: counts[phase][0] = p->op[44].count + p->op[78].count; counts[phase][1] = p->op[46].count; counts[phase][2] = p->op[45].count; break;
++            case 3: counts[phase][0] = p->op[64].count; counts[phase][2] = p->renderer_destroy_kind[2]; break;
++            case 4: counts[phase][0] = p->op[27].count + p->op[54].count; counts[phase][2] = p->op[28].count; break;
++            }
++            typed[phase] += counts[phase][0] + counts[phase][1] + counts[phase][2];
++        }
++        fprintf(out, "MaliPerf resource: type=%s frame-create/query/destroy=%llu/%llu/%llu outside-create/query/destroy=%llu/%llu/%llu frame-management-RPCs/frame=%.2f\n",
++            names[kind], (unsigned long long)counts[0][0], (unsigned long long)counts[0][1], (unsigned long long)counts[0][2],
++            (unsigned long long)counts[1][0], (unsigned long long)counts[1][1], (unsigned long long)counts[1][2],
++            (counts[0][0] + counts[0][1] + counts[0][2]) / (double)(frames ? frames : 1));
++    }
++    struct dd_perf_op categories[DD_PERF_CATEGORIES];
++    dd_perf_categories(frame, categories); uint64_t frame_count = categories[DD_PERF_RESOURCES].count;
++    dd_perf_categories(outside, categories); uint64_t outside_count = categories[DD_PERF_RESOURCES].count;
++    fprintf(out, "MaliPerf resource coverage: typed-frame=%llu other-management-frame=%llu typed-outside=%llu other-management-outside=%llu (memory includes staging and source allocations; outside includes FrameInfo source destruction)\n",
++        (unsigned long long)typed[0], (unsigned long long)(frame_count - typed[0]),
++        (unsigned long long)typed[1], (unsigned long long)(outside_count - typed[1]));
++}
++#endif
+diff --git a/src/renderer_protocol.h b/src/renderer_protocol.h
+new file mode 100644
+index 0000000..82ca9f6
+--- /dev/null
++++ b/src/renderer_protocol.h
+@@ -0,0 +1,43 @@
++/* v7: isolated real Gamescope BLIT renderer subset. LE scalars; no native handles. */
++#ifndef DD_RENDERER_PROTOCOL_H
++#define DD_RENDERER_PROTOCOL_H
++#define MB_RENDERER_VERSION 7u
++#define MB_RENDERER_MAX_SHADER (512u * 1024u)
++#define MB_RENDERER_MAX_REQUEST (MB_RENDERER_MAX_SHADER + 256u)
++#define MB_RENDERER_MAX_OBJECTS 128u
++#define MB_RENDERER_MAX_DESCRIPTORS 64u
++#define MB_RENDERER_SEMAPHORE_CREATE 60u /* device,u64 initial -> ID */
++#define MB_RENDERER_DESTROY 61u /* device,kind,ID */
++#define MB_RENDERER_COUNTER 62u /* device,semaphore -> u64 counter */
++#define MB_RENDERER_WAIT 63u /* device,semaphore,u64 value,u64 timeout */
++#define MB_RENDERER_VIEW 64u /* device,image,type,format,usage -> ID */
++#define MB_RENDERER_SAMPLER 65u /* device,nearest,unnormalized -> ID */
++#define MB_RENDERER_SET_LAYOUT 66u /* device,count; binding,type,count,immutableSampler each -> ID */
++#define MB_RENDERER_PIPELINE_LAYOUT 67u /* device,setLayout -> ID */
++#define MB_RENDERER_POOL 68u /* device,maxSets,count; type,count each -> ID */
++#define MB_RENDERER_SETS 69u /* device,pool,count,layout[count] -> IDs[count] */
++#define MB_RENDERER_UPDATE 70u /* device,count; set,binding,element,type,count then descriptors */
++#define MB_RENDERER_SHADER 71u /* device,byteLength,exact aligned SPIR-V -> ID */
++#define MB_RENDERER_PIPELINE 72u /* device,shader,layout,7 specialization u32 -> ID */
++#define MB_RENDERER_BIND_PIPELINE 73u /* device,command,pipeline */
++#define MB_RENDERER_BIND_SET 74u /* device,command,layout,set */
++#define MB_RENDERER_DISPATCH 75u /* device,command,x,y,z */
++#define MB_RENDERER_SUBMIT 76u /* device,queue,command,fence,semaphore,u64 signal */
++#define MB_RENDERER_RESET_COMMAND 77u /* device,command */
++#define MB_RENDERER_IMAGE 78u /* device,type,width,height,depth,usage,flags,formatCount,formats[] -> ID */
++#define MB_RENDERER_BARRIER 79u /* device,command,srcStage,dstStage,count; image,srcAccess,dstAccess,old,new,srcFamily,dstFamily each */
++#define MB_RENDERER_COPY 80u /* device,command,image,buffer,layout,direction,u64 offset,width,height,depth */
++#define MB_RENDERER_CLEAR 81u /* device,command,image,layout,4 binary32 */
++#define MB_RENDERER_IDLE 82u /* device */
++/* Explicit opt-in sub-protocol on v7; legacy renderer requests are unchanged. */
++#define MB_SESSION_BEGIN 83u /* device -> no payload */
++#define MB_SESSION_PRESENT 84u /* device,AHB,sync -> previous released AHB ID */
++#define MB_SESSION_END 85u /* device -> last released AHB ID */
++#define MB_SESSION_STATS 86u /* device -> 20 live counts + presented/released/FD totals */
++#define MB_SESSION_COUNTS 20u
++/* devices,queues,command pools,commands,semaphores,fences,buffers,memory,
++ * images,views,samplers,descriptor pools,sets,shaders,pipelines,layouts,
++ * AHB tokens,sync tokens,open exported FDs,pending commands. */
++enum mb_renderer_kind { MB_R_SEMAPHORE=1, MB_R_VIEW, MB_R_SAMPLER, MB_R_SET_LAYOUT,
++ MB_R_PIPELINE_LAYOUT, MB_R_POOL, MB_R_SET, MB_R_SHADER, MB_R_PIPELINE };
++#endif
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index 8729375..da447e0 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -13,8 +13,10 @@
+ #include <bitset>
+ #include <deque>
+ #include <dlfcn.h>
+ #include "vulkan_include.h"
++#include "mali_wait_profile.hpp"
++#include "mali_staging_pool.hpp"
+ #include "Utils/Algorithm.h"
+
+ #if defined(__linux__)
+ #include <sys/sysmacros.h>
+@@ -1432,9 +1434,10 @@ VkDescriptorSet CVulkanDevice::descriptorSet( CVulkanCmdBuffer *pCmdBuffer )
+ 			.semaphoreCount = 1,
+ 			.pSemaphores = &m_scratchTimelineSemaphore,
+ 			.pValues = &ulSeqNo,
+ 		};
+-		vk_check( vk.WaitSemaphores( device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
++		MaliWaitScope site(DD_WAIT_DESCRIPTOR_REUSE, uIndex);
++		vk_check( MaliProfiledWait( vk.WaitSemaphores, vk.GetDeviceProcAddr, device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
+ 	}
+
+ 	pCmdBuffer->AddDescriptorSet( uIndex );
+ 	return m_descriptorSets[ uIndex ];
+@@ -1449,9 +1452,11 @@ uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
+
+ uint64_t CVulkanDevice::completedSeqNo()
+ {
+ 	uint64_t ulSeqNo = 0;
+-	vk_check( vk.GetSemaphoreCounterValue( device(), m_scratchTimelineSemaphore, &ulSeqNo ) );
++	VkResult result = vk.GetSemaphoreCounterValue( device(), m_scratchTimelineSemaphore, &ulSeqNo );
++	if (maliWaitProfilingActive) maliCompletedTimeline.observe(device(), m_scratchTimelineSemaphore, ulSeqNo, result);
++	vk_check( result );
+ 	return ulSeqNo;
+ }
+
+ void CVulkanDevice::garbageCollect( void )
+@@ -1601,9 +1606,9 @@ void CVulkanDevice::wait(uint64_t sequence, bool reset)
+ 		.pSemaphores = &m_scratchTimelineSemaphore,
+ 		.pValues = &sequence,
+ 	} ;
+
+-	vk_check( vk.WaitSemaphores( device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
++	vk_check( MaliProfiledWait( vk.WaitSemaphores, vk.GetDeviceProcAddr, device(), &waitInfo, m_maliDiagnostic ? 5000000000ull : ~0ull ) );
+
+ 	if (reset)
+ 		resetCmdBuffers(sequence);
+ }
+@@ -2051,9 +2056,9 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
+ 		VkImageMemoryBarrier memoryBarrier =
+ 		{
+ 			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+ 			.srcAccessMask = m_device->IsMaliDiagnostic() && isExport ? read_bits | write_bits : state.dirty ? write_bits : 0u,
+-			.dstAccessMask = flush ? 0u : (m_device->IsMaliDiagnostic() && !image->MaliStorageImage() ? read_bits | VK_ACCESS_TRANSFER_WRITE_BIT : read_bits | write_bits),
++			.dstAccessMask = maliStagingUploadRecording && flush && !image->externalImage() ? VK_ACCESS_SHADER_READ_BIT : flush ? 0u : (m_device->IsMaliDiagnostic() && !image->MaliStorageImage() ? read_bits | VK_ACCESS_TRANSFER_WRITE_BIT : read_bits | write_bits),
+ 			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+ 			.newLayout = isPresent ? GetBackend()->GetPresentLayout() : VK_IMAGE_LAYOUT_GENERAL,
+ 			.srcQueueFamilyIndex = isExport ? image->queueFamily : state.needsImport ? externalQueue : image->queueFamily,
+ 			.dstQueueFamilyIndex = isExport ? externalQueue : state.needsImport ? m_queueFamily : m_queueFamily,
+@@ -4815,8 +4820,10 @@ struct wlr_renderer *vulkan_renderer_create( void )
+     wlr_renderer_init(&renderer->base, g_device.IsMaliDiagnostic() ? &mali_impl : &renderer_impl, WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_DATA_PTR);
+ 	return &renderer->base;
+ }
+
++#include "mali_staging.inc"
++
+ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+ {
+
+ 	struct wlr_dmabuf_attributes dmabuf = {0};
+@@ -4837,63 +4844,88 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+
+ 	uint32_t width = buf->width;
+ 	uint32_t height = buf->height;
+
+-	VkBufferCreateInfo bufferCreateInfo = {
+-		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+-		.size = stride * height,
+-		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+-	};
+-	VkBuffer buffer;
+-	result = g_device.vk.CreateBuffer( g_device.device(), &bufferCreateInfo, nullptr, &buffer );
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkCreateBuffer SHM upload", result);
+-		return nullptr;
+-	}
++	MaliStagingPool<MaliStagingBackend>::Lease staging;
++	VkBuffer buffer = VK_NULL_HANDLE;
++	VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
++	if (maliWaitProfilingActive) {
++		if (!height || !stride || stride > UINT64_MAX / height) {
++			wlr_buffer_end_data_ptr_access(buf);
++			g_device.FailMaliDiagnostic("normal SHM staging range overflow", VK_ERROR_INITIALIZATION_FAILED);
++			return nullptr;
++		}
++		result = (VkResult)maliStaging.acquire(uint64_t(stride) * height, staging.slot);
++		if (result != VK_SUCCESS) {
++			wlr_buffer_end_data_ptr_access(buf);
++			g_device.FailMaliDiagnostic("normal SHM staging acquire", result);
++			return nullptr;
++		}
++		buffer = staging.slot->resource.buffer; bufferMemory = staging.slot->resource.memory;
++	} else {
++		VkBufferCreateInfo bufferCreateInfo = {
++			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++			.size = stride * height,
++			.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++		};
++		result = g_device.vk.CreateBuffer( g_device.device(), &bufferCreateInfo, nullptr, &buffer );
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkCreateBuffer SHM upload", result);
++			return nullptr;
++		}
+
+-	VkMemoryRequirements memRequirements;
+-	g_device.vk.GetBufferMemoryRequirements(g_device.device(), buffer, &memRequirements);
++		VkMemoryRequirements memRequirements;
++		g_device.vk.GetBufferMemoryRequirements(g_device.device(), buffer, &memRequirements);
+
+-	uint32_t memTypeIndex =  g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
+-	if ( memTypeIndex == ~0u )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("SHM HOST_VISIBLE/COHERENT memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+-		return nullptr;
+-	}
++		uint32_t memTypeIndex =  g_device.findMemoryType(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
++		if ( memTypeIndex == ~0u )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("SHM HOST_VISIBLE/COHERENT memory type", VK_ERROR_FEATURE_NOT_PRESENT);
++			return nullptr;
++		}
+
+-	VkMemoryAllocateInfo allocInfo = {
+-		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-		.allocationSize = memRequirements.size,
+-		.memoryTypeIndex = memTypeIndex,
+-	};
++		VkMemoryAllocateInfo allocInfo = {
++			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++			.allocationSize = memRequirements.size,
++			.memoryTypeIndex = memTypeIndex,
++		};
+
+-	VkDeviceMemory bufferMemory;
+-	result = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &bufferMemory);
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkAllocateMemory SHM upload", result);
+-		return nullptr;
+-	}
++		result = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &bufferMemory);
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkAllocateMemory SHM upload", result);
++			return nullptr;
++		}
++
++		result = g_device.vk.BindBufferMemory( g_device.device(), buffer, bufferMemory, 0 );
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++	        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkBindBufferMemory SHM upload", result);
++			return nullptr;
++		}
+
+-	result = g_device.vk.BindBufferMemory( g_device.device(), buffer, bufferMemory, 0 );
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkBindBufferMemory SHM upload", result);
+-		return nullptr;
+ 	}
+
+-	void *dst;
+-	result = g_device.vk.MapMemory( g_device.device(), bufferMemory, 0, VK_WHOLE_SIZE, 0, &dst );
+-	if ( result != VK_SUCCESS )
+-	{
+-		wlr_buffer_end_data_ptr_access( buf );
+-        if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkMapMemory SHM upload", result);
+-		return nullptr;
++	void *dst = staging.slot ? staging.slot->resource.mapped : nullptr;
++	if (staging.slot) {
++		if (!dst || uint64_t(stride) * height > staging.slot->resource.mappedBytes) {
++			wlr_buffer_end_data_ptr_access(buf);
++			g_device.FailMaliDiagnostic("normal SHM persistent mapped range", VK_ERROR_INITIALIZATION_FAILED);
++			return nullptr;
++		}
++	} else {
++		result = g_device.vk.MapMemory( g_device.device(), bufferMemory, 0, VK_WHOLE_SIZE, 0, &dst );
++		if ( result != VK_SUCCESS )
++		{
++			wlr_buffer_end_data_ptr_access( buf );
++            if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkMapMemory SHM upload", result);
++			return nullptr;
++		}
+ 	}
+
+ 	memcpy( dst, src, stride * height );
+     if (g_device.IsMaliDiagnostic() && (drmFormat == DRM_FORMAT_ARGB8888 || drmFormat == DRM_FORMAT_XRGB8888)) {
+@@ -4904,9 +4936,9 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+             if (drmFormat == DRM_FORMAT_XRGB8888) pixel[3] = 255;
+         }
+         drmFormat = DRM_FORMAT_ABGR8888;
+     }
+-	g_device.vk.UnmapMemory( g_device.device(), bufferMemory );
++	if (!staging.slot) g_device.vk.UnmapMemory( g_device.device(), bufferMemory );
+
+ 	wlr_buffer_end_data_ptr_access( buf );
+
+ 	gamescope::OwningRc<CVulkanTexture> pTex = new CVulkanTexture();
+@@ -4921,14 +4953,22 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+
+ 	cmdBuffer->copyBufferToImage( buffer, 0, stride / DRMFormatGetBPP(drmFormat), pTex);
+ 	// TODO: Sync this copyBufferToImage
+
+-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+-
+-	g_device.wait(sequence);
+-
+-	g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
+-	g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);
++	if (staging.slot) {
++		result = maliStaging.backend.prepare(staging.slot->resource, cmdBuffer->rawBuffer());
++		if (result != VK_SUCCESS) g_device.FailMaliDiagnostic("normal SHM coherent upload arm", result);
++		// The existing end-of-upload barrier makes transfer writes visible to
++		// later compute on this same queue; retaining storage removes the CPU wait.
++		MaliStagingUploadScope recording;
++		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
++		staging.submitted(sequence);
++	} else {
++		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
++		g_device.wait(sequence);
++		g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
++		g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);
++	}
+
+ 	return pTex;
+ }
+
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index cd21597..1fc7945 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -870,8 +870,9 @@ public:
+ 	inline VkCommandPool commandPool() {return m_commandPool;}
+ 	inline VkCommandPool generalCommandPool() {return m_generalCommandPool;}
+ 	inline uint32_t queueFamily() {return m_queueFamily;}
+ 	uint64_t completedSeqNo();
++	inline VkSemaphore maliScratchTimeline() const { return m_scratchTimelineSemaphore; }
+ 	inline uint32_t generalQueueFamily() {return m_generalQueueFamily;}
+ 	inline VkBuffer uploadBuffer() {return m_uploadBuffer;}
+ 	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
+ 	inline int drmRenderFd() {return m_drmRendererFd;}
+diff --git a/src/staging_api.h b/src/staging_api.h
+new file mode 100644
+index 0000000..c3a61ae
+--- /dev/null
++++ b/src/staging_api.h
+@@ -0,0 +1,14 @@
++/* Private normal-renderer contract, not a Vulkan extension or wire opcode.
++ * MapStaging maps a whole fresh coherent allocation without downloading bytes;
++ * the caller must overwrite the complete SHM image before arming its upload.
++ * (memory=NULL, out=NULL) probes wire-v7/normal-mode availability without RPCs.
++ * Staging with NULL command can also register an existing whole mapping.
++ * Before submitting each upload, arm its command after writing the safe slot.
++ * The proxy acknowledges the existing bulk upload before that QueueSubmit and
++ * does not re-upload this allocation for unrelated submits. Unmap ends opt-in. */
++#ifndef DD_STAGING_API_H
++#define DD_STAGING_API_H
++#include <vulkan/vulkan.h>
++typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckStagingMALI)(VkDevice, VkDeviceMemory, VkCommandBuffer);
++typedef VkResult (VKAPI_PTR *PFN_vkDroidDeckMapStagingMALI)(VkDevice, VkDeviceMemory, void **);
++#endif

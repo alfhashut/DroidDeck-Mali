@@ -1,0 +1,799 @@
+diff --git a/src/frame_trace.h b/src/frame_trace.h
+new file mode 100644
+index 0000000..aa07a8a
+--- /dev/null
++++ b/src/frame_trace.h
+@@ -0,0 +1,98 @@
++/* Development-only journal. No renderer/wire/ownership changes. */
++#ifndef DD_FRAME_TRACE_H
++#define DD_FRAME_TRACE_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++enum dd_ft_stage {
++    DD_FT_COMMIT, DD_FT_SELECT, DD_FT_COALESCE, DD_FT_DISCARD,
++    DD_FT_FRAME_BEGIN, DD_FT_FRAME_END, DD_FT_SHM_BEGIN, DD_FT_SHM_END,
++    DD_FT_ACQUIRE_BEGIN, DD_FT_ACQUIRE_END, DD_FT_RENDER_BEGIN, DD_FT_RENDER_END,
++    DD_FT_WAIT_BEGIN, DD_FT_WAIT_END, DD_FT_SUBMIT_BEGIN, DD_FT_SUBMIT_END,
++    DD_FT_PUBLISH, DD_FT_OUTER_COMMIT, DD_FT_OUTER_RELEASE, DD_FT_POOL_BLOCKED,
++    DD_FT_HANDOFF_BEGIN, DD_FT_HANDOFF_END, DD_FT_ANDROID_SUBMIT, DD_FT_ANDROID_REPEAT,
++    DD_FT_RELEASE_CALLBACK, DD_FT_RELEASE_QUEUED, DD_FT_RELEASE_FENCE_PENDING,
++    DD_FT_RELEASE_FENCE_OBSERVED, DD_FT_POOL_RETURN, DD_FT_CANCEL,
++    DD_FT_TRANSACTION_COMPLETE, DD_FT_LATCH_TIME, DD_FT_COPY_BEGIN, DD_FT_COPY_END,
++    DD_FT_SHM_LOOKUP_BEGIN, DD_FT_SHM_LOOKUP_END, DD_FT_SHM_SOURCE_BEGIN, DD_FT_SHM_SOURCE_END,
++    DD_FT_STAGING_ACQUIRE_BEGIN, DD_FT_STAGING_ACQUIRE_END,
++    DD_FT_STAGING_CREATE_BEGIN, DD_FT_STAGING_CREATE_END,
++    DD_FT_STAGING_MAP_BEGIN, DD_FT_STAGING_MAP_END,
++    DD_FT_STAGING_VALIDATE_BEGIN, DD_FT_STAGING_VALIDATE_END,
++    DD_FT_SHM_SOURCE_RELEASE_BEGIN, DD_FT_SHM_SOURCE_RELEASE_END,
++    DD_FT_TEXTURE_CREATE_BEGIN, DD_FT_TEXTURE_CREATE_END,
++    DD_FT_UPLOAD_RECORD_BEGIN, DD_FT_UPLOAD_RECORD_END,
++    DD_FT_UPLOAD_PREPARE_BEGIN, DD_FT_UPLOAD_PREPARE_END,
++    DD_FT_UPLOAD_SUBMIT_BEGIN, DD_FT_UPLOAD_SUBMIT_END,
++    DD_FT_UPLOAD_FINALIZE_BEGIN, DD_FT_UPLOAD_FINALIZE_END,
++    DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END,
++    DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END,
++    DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END,
++    DD_FT_PROXY_PREPARE_BEGIN, DD_FT_PROXY_PREPARE_END,
++    DD_FT_PROXY_LOCK_BEGIN, DD_FT_PROXY_LOCK_END,
++    DD_FT_PROXY_MIRROR_BEGIN, DD_FT_PROXY_MIRROR_END,
++    DD_FT_PROXY_BULK_SETUP_BEGIN, DD_FT_PROXY_BULK_SETUP_END,
++    DD_FT_PROXY_BULK_PACK_BEGIN, DD_FT_PROXY_BULK_PACK_END,
++    DD_FT_PROXY_BULK_RPC_BEGIN, DD_FT_PROXY_BULK_RPC_END,
++    DD_FT_PROXY_BULK_ACK_BEGIN, DD_FT_PROXY_BULK_ACK_END,
++    DD_FT_PROXY_SUBMIT_PACK_BEGIN, DD_FT_PROXY_SUBMIT_PACK_END,
++    DD_FT_PROXY_SUBMIT_RPC_BEGIN, DD_FT_PROXY_SUBMIT_RPC_END,
++    DD_FT_PROXY_REPLY_HANDLE_BEGIN, DD_FT_PROXY_REPLY_HANDLE_END,
++    DD_FT_PROXY_FINALIZE_BEGIN, DD_FT_PROXY_FINALIZE_END,
++    DD_FT_RPC_HEADER_BEGIN, DD_FT_RPC_HEADER_END,
++    DD_FT_RPC_SEND_BEGIN, DD_FT_RPC_SEND_END,
++    DD_FT_RPC_RECEIVE_BEGIN, DD_FT_RPC_RECEIVE_END,
++    DD_FT_RPC_DECODE_BEGIN, DD_FT_RPC_DECODE_END,
++    DD_FT_BROKER_RECEIVE_BEGIN, DD_FT_BROKER_RECEIVE_END,
++    DD_FT_BROKER_DISPATCH_BEGIN, DD_FT_BROKER_DISPATCH_END,
++    DD_FT_BROKER_REPLY_BEGIN, DD_FT_BROKER_REPLY_END,
++    DD_FT_BROKER_MAPPED_COPY_BEGIN, DD_FT_BROKER_MAPPED_COPY_END,
++    DD_FT_PROXY_DIRTY_BEGIN, DD_FT_PROXY_DIRTY_END,
++    DD_FT_RPC_EXCHANGE_BEGIN, DD_FT_RPC_EXCHANGE_END,
++    DD_FT_PROXY_SUBMIT_LINK, DD_FT_PROXY_DETAIL_POLICY,
++    DD_FT_PROXY_SHARED_RPC_BEGIN, DD_FT_PROXY_SHARED_RPC_END,
++    DD_FT_BROKER_SHARED_COPY_BEGIN, DD_FT_BROKER_SHARED_COPY_END, DD_FT_COUNT
++};
++/* Diagnostic-only ordered-stream sampler. Both endpoints count fence-less
++ * MB_RENDERER_SUBMIT requests since MB_NORMAL_BEGIN. Bulk writes precede that
++ * submit, so select the NEXT ordinal. No wire metadata, locks or RPC changes. */
++#define DD_FT_UPLOAD_DETAIL_STRIDE 16u
++static inline int dd_ft_upload_detail_selected(uint64_t completed) {
++    return completed % DD_FT_UPLOAD_DETAIL_STRIDE == DD_FT_UPLOAD_DETAIL_STRIDE - 1;
++}
++/* fence is the broker producer-fence resource ID, not a VkFence handle or FD.
++ * sync is the broker resource ID of the exported SYNC_FD wrapper, not its FD. */
++struct dd_ft_id { uint64_t client, attempt, scope; uint32_t frame, key, sync, fence; };
++typedef void (*dd_ft_sink)(enum dd_ft_stage, struct dd_ft_id, uint64_t, uint64_t, int32_t, int);
++/* Private in-process ICD callback. Context is thread-local and cleared after
++ * QueueSubmit. scope becomes a process-local connection pointer identity;
++ * it is never a native fence, FD, or cross-process wire ID. */
++typedef void (*PFN_dd_ft_context)(void *device, dd_ft_sink, const struct dd_ft_id *);
++/* Call init only at normal-session start, after an explicit adb-created arm
++ * marker. Disabled calls do no clocks, locks, allocations, or file access. */
++void dd_ft_init(const char *role);
++void dd_ft_shutdown(void);
++int dd_ft_active(void);
++/* Native-only diagnostic namespace; never sent over the renderer protocol. */
++uint64_t dd_ft_new_scope(void);
++void dd_ft_event(enum dd_ft_stage stage, struct dd_ft_id id,
++                 uint64_t object, uint64_t value, int32_t status, int sample_cpu);
++#ifdef __cplusplus
++}
++struct DDFrameScope {
++    dd_ft_stage end; dd_ft_id id; uint64_t object, value;
++    DDFrameScope(dd_ft_stage begin, dd_ft_stage finishStage, dd_ft_id identity,
++                 uint64_t obj = 0, uint64_t val = 0, bool enabled = true)
++        : end(enabled ? finishStage : DD_FT_COUNT), id(identity), object(obj), value(val) {
++        if (enabled) dd_ft_event(begin, id, object, value, 0, 1);
++    }
++    DDFrameScope(const DDFrameScope &) = delete;
++    DDFrameScope &operator=(const DDFrameScope &) = delete;
++    void finish() {
++        if (end != DD_FT_COUNT) { dd_ft_event(end, id, object, value, 0, 1); end = DD_FT_COUNT; }
++    }
++    ~DDFrameScope() { finish(); }
++};
++#endif
++#endif
+diff --git a/src/frame_trace.inc b/src/frame_trace.inc
+new file mode 100644
+index 0000000..5fd4c55
+--- /dev/null
++++ b/src/frame_trace.inc
+@@ -0,0 +1,195 @@
++/* Compiled once into maliahb, and once into the normal Gamescope TU.
++ * Armed at startup only. A worker handles control/output off the hot path.
++ * Records stop at capacity; never overwrite and silently lose frame identity.
++ */
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include "frame_trace.h"
++#include <errno.h>
++#include <inttypes.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
++#ifndef DD_FT_ROOT
++#define DD_FT_ROOT NULL
++#endif
++#ifndef DD_FT_CAPACITY
++#define DD_FT_CAPACITY 65536u
++#endif
++struct dd_ft_record {
++    uint64_t wall, cpu, object, value;
++    struct dd_ft_id id;
++    uint32_t tid, stage;
++    int32_t status;
++};
++static const char *dd_ft_names[] = {
++    "client_commit", "client_select", "client_coalesced", "client_discarded",
++    "frame_begin", "frame_end", "shm_import_begin", "shm_import_end",
++    "ahb_acquire_begin", "ahb_acquire_end", "render_begin", "render_end",
++    "wait_begin", "wait_end", "vk_submit_begin", "vk_submit_end",
++    "publish", "outer_commit", "outer_release", "output_pool_blocked",
++    "android_handoff_begin", "android_handoff_end", "android_submit", "android_repeat",
++    "release_callback", "release_queued", "release_fence_pending",
++    "release_fence_observed", "pool_return", "cancel_unsubmitted",
++    "transaction_complete", "android_latch_time", "shm_copy_begin", "shm_copy_end",
++    "shm_lookup_begin", "shm_lookup_end", "shm_source_begin", "shm_source_end",
++    "staging_acquire_begin", "staging_acquire_end", "staging_create_begin", "staging_create_end",
++    "staging_map_begin", "staging_map_end", "staging_validate_begin", "staging_validate_end",
++    "shm_source_release_begin", "shm_source_release_end", "texture_create_begin", "texture_create_end",
++    "upload_record_begin", "upload_record_end", "upload_prepare_begin", "upload_prepare_end",
++    "upload_submit_begin", "upload_submit_end", "upload_finalize_begin", "upload_finalize_end",
++    "upload_queue_begin", "upload_queue_end", "upload_wait_begin", "upload_wait_end",
++    "shm_cleanup_begin", "shm_cleanup_end",
++    "proxy_prepare_begin", "proxy_prepare_end",
++    "proxy_lock_begin", "proxy_lock_end",
++    "proxy_mirror_begin", "proxy_mirror_end",
++    "proxy_bulk_setup_begin", "proxy_bulk_setup_end",
++    "proxy_bulk_pack_begin", "proxy_bulk_pack_end",
++    "proxy_bulk_rpc_begin", "proxy_bulk_rpc_end",
++    "proxy_bulk_ack_begin", "proxy_bulk_ack_end",
++    "proxy_submit_pack_begin", "proxy_submit_pack_end",
++    "proxy_submit_rpc_begin", "proxy_submit_rpc_end",
++    "proxy_reply_handle_begin", "proxy_reply_handle_end",
++    "proxy_finalize_begin", "proxy_finalize_end",
++    "rpc_header_begin", "rpc_header_end",
++    "rpc_send_begin", "rpc_send_end",
++    "rpc_receive_begin", "rpc_receive_end",
++    "rpc_decode_begin", "rpc_decode_end",
++    "broker_receive_begin", "broker_receive_end",
++    "broker_dispatch_begin", "broker_dispatch_end",
++    "broker_reply_begin", "broker_reply_end",
++    "broker_mapped_copy_begin", "broker_mapped_copy_end",
++    "proxy_dirty_begin", "proxy_dirty_end",
++    "rpc_exchange_begin", "rpc_exchange_end",
++    "proxy_submit_link", "proxy_detail_policy",
++    "proxy_shared_rpc_begin", "proxy_shared_rpc_end",
++    "broker_shared_copy_begin", "broker_shared_copy_end"
++};
++static pthread_mutex_t dd_ft_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_t dd_ft_thread;
++static struct dd_ft_record *dd_ft_records;
++static unsigned dd_ft_used, dd_ft_enabled, dd_ft_running, dd_ft_stop, dd_ft_dropped;
++static uint64_t dd_ft_run, dd_ft_start, dd_ft_end, dd_ft_last_run, dd_ft_ready_ns;
++static unsigned dd_ft_cpu_stride = 8;
++static const char *dd_ft_role;
++static char dd_ft_root[400];
++static __thread uint32_t dd_ft_tid;
++static uint64_t dd_ft_scope_sequence;
++uint64_t dd_ft_new_scope(void) { return __atomic_add_fetch(&dd_ft_scope_sequence, 1, __ATOMIC_RELAXED); }
++static uint64_t dd_ft_now(clockid_t clock) {
++    struct timespec t;
++    return clock_gettime(clock, &t) ? 0 : (uint64_t)t.tv_sec * UINT64_C(1000000000) + (uint64_t)t.tv_nsec;
++}
++#define DD_FT_ON (1u << 31)
++int dd_ft_active(void) { return (__atomic_load_n(&dd_ft_enabled, __ATOMIC_ACQUIRE) & DD_FT_ON) != 0; }
++void dd_ft_event(enum dd_ft_stage stage, struct dd_ft_id id,
++                 uint64_t object, uint64_t value, int32_t status, int sample_cpu) {
++    unsigned gate = __atomic_load_n(&dd_ft_enabled, __ATOMIC_ACQUIRE);
++    do { if (!(gate & DD_FT_ON)) return; }
++    while (!__atomic_compare_exchange_n(&dd_ft_enabled, &gate, gate+1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
++    uint64_t wall = dd_ft_now(CLOCK_MONOTONIC);
++    /* Never wait behind journal I/O or another observer. Drop with accounting. */
++    if (pthread_mutex_trylock(&dd_ft_lock)) {
++        __atomic_add_fetch(&dd_ft_dropped, 1, __ATOMIC_RELAXED);
++        __atomic_sub_fetch(&dd_ft_enabled, 1, __ATOMIC_RELEASE); return;
++    }
++    if (wall < dd_ft_start || wall >= dd_ft_end) {
++        pthread_mutex_unlock(&dd_ft_lock); __atomic_sub_fetch(&dd_ft_enabled, 1, __ATOMIC_RELEASE); return;
++    }
++    if ((unsigned)stage >= DD_FT_COUNT || dd_ft_used == DD_FT_CAPACITY || !wall) {
++        __atomic_add_fetch(&dd_ft_dropped, 1, __ATOMIC_RELAXED);
++    } else {
++        struct dd_ft_record *r = &dd_ft_records[dd_ft_used++];
++        r->wall = wall; r->cpu = 0; r->id = id; r->stage = stage;
++        r->object = object; r->value = value; r->status = status;
++        if (!dd_ft_tid) dd_ft_tid = (uint32_t)syscall(SYS_gettid);
++        r->tid = dd_ft_tid;
++        uint64_t sequence = id.attempt ? id.attempt : id.frame ? id.frame : id.client ? id.client : id.fence ? id.fence : value;
++        if (sample_cpu && sequence && sequence % dd_ft_cpu_stride == 0)
++            r->cpu = dd_ft_now(CLOCK_THREAD_CPUTIME_ID);
++    }
++    pthread_mutex_unlock(&dd_ft_lock);
++    __atomic_sub_fetch(&dd_ft_enabled, 1, __ATOMIC_RELEASE);
++}
++static void dd_ft_dump(int complete) {
++    __atomic_fetch_and(&dd_ft_enabled, ~DD_FT_ON, __ATOMIC_ACQ_REL);
++    while (__atomic_load_n(&dd_ft_enabled, __ATOMIC_ACQUIRE)) {
++        struct timespec delay = {0, 1000000}; nanosleep(&delay, NULL);
++    }
++    pthread_mutex_lock(&dd_ft_lock);
++    char path[512];
++    snprintf(path, sizeof(path), "%s/trace-%" PRIu64 "-%d-%s.jsonl", dd_ft_root, dd_ft_run, (int)getpid(), dd_ft_role);
++    FILE *file = fopen(path, "wx");
++    if (file) {
++        fprintf(file, "{\"type\":\"header\",\"version\":1,\"run\":%" PRIu64 ",\"pid\":%d,\"role\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"start_ns\":%" PRIu64 ",\"end_ns\":%" PRIu64 ",\"cpu_stride\":%u,\"capacity\":%u,\"ready_ns\":%" PRIu64 "}\n",
++                dd_ft_run, (int)getpid(), dd_ft_role, dd_ft_start, dd_ft_end, dd_ft_cpu_stride, DD_FT_CAPACITY, dd_ft_ready_ns);
++        for (unsigned i = 0; i < dd_ft_used; ++i) {
++            const struct dd_ft_record *r = &dd_ft_records[i];
++            fprintf(file, "{\"type\":\"event\",\"event_seq\":%u,\"stage\":\"%s\",\"mono_ns\":%" PRIu64 ",\"cpu_ns\":%" PRIu64 ",\"tid\":%u,\"client\":%" PRIu64 ",\"attempt\":%" PRIu64 ",\"scope\":%" PRIu64 ",\"frame\":%u,\"key\":%u,\"sync\":%u,\"fence\":%u,\"object\":%" PRIu64 ",\"value\":%" PRIu64 ",\"status\":%d}\n",
++                    i+1, dd_ft_names[r->stage], r->wall, r->cpu, r->tid, r->id.client, r->id.attempt, r->id.scope,
++                    r->id.frame, r->id.key, r->id.sync, r->id.fence, r->object, r->value, r->status);
++        }
++        fprintf(file, "{\"type\":\"footer\",\"count\":%u,\"dropped\":%u,\"complete\":%s}\n",
++                dd_ft_used, __atomic_load_n(&dd_ft_dropped, __ATOMIC_RELAXED), complete ? "true" : "false");
++        if (fclose(file)) fprintf(stderr, "DroidDeck frame trace output failed: %s\n", strerror(errno));
++    } else fprintf(stderr, "DroidDeck frame trace open failed: %s\n", strerror(errno));
++    dd_ft_last_run = dd_ft_run;
++    pthread_mutex_unlock(&dd_ft_lock);
++}
++static void *dd_ft_worker(void *unused) {
++    (void)unused;
++    dd_ft_records = (struct dd_ft_record *)calloc(DD_FT_CAPACITY, sizeof(*dd_ft_records));
++    if (!dd_ft_records) return NULL;
++    char path[512]; snprintf(path, sizeof(path), "%s/ready-%d-%s", dd_ft_root, (int)getpid(), dd_ft_role);
++    FILE *ready = fopen(path, "w");
++    if (ready) { fprintf(ready, "version=1 pid=%d role=%s\n", (int)getpid(), dd_ft_role); fclose(ready); }
++    while (!__atomic_load_n(&dd_ft_stop, __ATOMIC_ACQUIRE)) {
++        uint64_t now = dd_ft_now(CLOCK_MONOTONIC);
++        if (dd_ft_active() && now >= dd_ft_end) dd_ft_dump(1);
++        char armed[512]; snprintf(armed, sizeof(armed), "%s/armed", dd_ft_root);
++        if (access(armed, F_OK)) break;
++        if (!dd_ft_active()) {
++            uint64_t run = 0, start = 0, end = 0; unsigned stride = 0; char extra;
++            char control_path[512]; snprintf(control_path, sizeof(control_path), "%s/control", dd_ft_root);
++            FILE *control = fopen(control_path, "r");
++            int n = control ? fscanf(control, "%" SCNu64 " %" SCNu64 " %" SCNu64 " %u %c", &run, &start, &end, &stride, &extra) : 0;
++            if (control) fclose(control);
++            if (n == 4 && run && run != dd_ft_last_run && stride && stride <= 64 &&
++                    end > start && end-start <= UINT64_C(30000000000) && start <= now + UINT64_C(60000000000) && now < end) {
++                pthread_mutex_lock(&dd_ft_lock);
++                dd_ft_ready_ns = now; dd_ft_run = run; dd_ft_start = start; dd_ft_end = end; dd_ft_cpu_stride = stride; dd_ft_used = 0;
++                __atomic_store_n(&dd_ft_dropped, 0, __ATOMIC_RELAXED);
++                __atomic_store_n(&dd_ft_enabled, DD_FT_ON, __ATOMIC_RELEASE);
++                pthread_mutex_unlock(&dd_ft_lock);
++            }
++        }
++        struct timespec delay = {0, 100000000}; nanosleep(&delay, NULL);
++    }
++    if (dd_ft_active()) dd_ft_dump(dd_ft_now(CLOCK_MONOTONIC) >= dd_ft_end);
++    unlink(path); free(dd_ft_records); dd_ft_records = NULL;
++    return NULL;
++}
++void dd_ft_init(const char *role) {
++    /* Startup-only arm marker. No polling thread exists in default sessions. */
++    const char *root = getenv("DROIDDECK_FRAME_TRACE_DIR");
++    if (!root || !*root) root = DD_FT_ROOT;
++    if (!root || root[0] != '/' || strlen(root) >= sizeof(dd_ft_root)) return;
++    char armed[512]; snprintf(armed, sizeof(armed), "%s/armed", root);
++    if (access(armed, F_OK)) return;
++    unsigned expected = 0;
++    if (!__atomic_compare_exchange_n(&dd_ft_running, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
++    snprintf(dd_ft_root, sizeof(dd_ft_root), "%s", root);
++    dd_ft_role = role; __atomic_store_n(&dd_ft_stop, 0, __ATOMIC_RELEASE);
++    if (pthread_create(&dd_ft_thread, NULL, dd_ft_worker, NULL)) __atomic_store_n(&dd_ft_running, 0, __ATOMIC_RELEASE);
++}
++void dd_ft_shutdown(void) {
++    if (!__atomic_load_n(&dd_ft_running, __ATOMIC_ACQUIRE)) return;
++    __atomic_store_n(&dd_ft_stop, 1, __ATOMIC_RELEASE);
++    pthread_join(dd_ft_thread, NULL);
++    __atomic_store_n(&dd_ft_running, 0, __ATOMIC_RELEASE);
++}
+diff --git a/src/mali_normal.cpp b/src/mali_normal.cpp
+index 4cb8631..93223d7 100644
+--- a/src/mali_normal.cpp
++++ b/src/mali_normal.cpp
+@@ -1,8 +1,10 @@
+ /* Experimental normal single-client session. Output is the actual CWaylandBackend,
+  * input uses its existing seat listeners, SHM imports use Gamescope's renderer.
+  * The application is an argv child, with no diagnostic frame limit/injection. */
+ #include "mali_normal.hpp"
++#include "frame_trace.inc"
++dd_ft_id g_maliFrameTrace{};
+ #include "normal_detail_perf.hpp"
+ #include "backend.h"
+ #include "backends.h"
+ #include "rendervulkan.hpp"
+@@ -48,9 +50,9 @@ struct Input { unsigned type; double x, y; uint32_t code, state; };
+ static std::mutex inputLock;
+ static std::deque<Input> inputs;
+ struct Host {
+     wl_display *display = nullptr; wl_surface *surface = nullptr; banner_ahb_v1 *manager = nullptr;
+-    struct Buffer { wl_buffer *buffer = nullptr; unsigned index = 0; bool busy = false; } buffers[3];
++    struct Buffer { wl_buffer *buffer = nullptr; unsigned index = 0; bool busy = false; dd_ft_id trace{}; } buffers[3];
+ } host;
+ struct Server {
+     wl_display *display = nullptr; wlr_renderer *renderer = nullptr; wlr_surface *surface = nullptr;
+     wlr_seat *seat = nullptr; wlr_keyboard *keyboard = nullptr;
+@@ -63,11 +65,37 @@ struct Server {
+     wlr_output *x11Output = nullptr;
+     wl_listener x11ReadyListener{}, x11Created{};
+     unsigned commits = 0, frames = 0, motions = 0, buttons = 0, keys = 0;
+ } server;
++// Diagnostic state only; never drives pending/mapping/render/pacing decisions.
++static uint64_t traceClientSequence, traceAttempt, tracePending, traceLastRendered;
++static uint64_t TraceCommit(wlr_surface *surface, uint64_t window, bool selected) {
++    dd_ft_id id{}; id.client = ++traceClientSequence;
++    dd_ft_event(DD_FT_COMMIT, id, window, uint64_t(surface && surface->mapped), selected, 0);
++    if (selected) {
++        if (server.pending && tracePending &&
++                (!g_maliFrameTrace.attempt || tracePending != g_maliFrameTrace.client)) {
++            dd_ft_id old{}; old.client = tracePending;
++            dd_ft_event(DD_FT_COALESCE, old, window, id.client, 0, 0);
++        }
++        tracePending = id.client;
++    }
++    return id.client;
++}
++static void TraceSelect(uint64_t client, uint64_t window) {
++    if (server.pending && tracePending &&
++            (!g_maliFrameTrace.attempt || tracePending != g_maliFrameTrace.client)) {
++        dd_ft_id old{}; old.client = tracePending;
++        dd_ft_event(DD_FT_DISCARD, old, window, client, 1, 0); // focus/surface replacement
++    }
++    tracePending = client;
++    dd_ft_id id{}; id.client = client;
++    dd_ft_event(DD_FT_SELECT, id, window, 0, client ? 0 : 1, 0); // zero = pre-capture/unknown commit
++}
+ static void Released(void *data, wl_buffer *) {
+     auto b = static_cast<Host::Buffer *>(data);
+     if (!b->busy) { mali_normal_failure("duplicate output wl_buffer.release"); return; }
++    dd_ft_event(DD_FT_OUTER_RELEASE, b->trace, b->index, 0, 0, 0);
+     b->busy = false; mali_normal_released(b->index);
+ }
+ static const wl_buffer_listener releaseListener{Released};
+ static bool Roundtrip() {
+@@ -85,12 +113,13 @@ static bool Roundtrip() {
+     wl_callback_destroy(callback); return done;
+ }
+ #include "mali_x11.inc"
+ static void Commit(wl_listener *, void *) {
+-    if (server.surface && wlr_surface_has_buffer(server.surface)) { server.pending = true; ++server.commits; }
++    if (server.surface && wlr_surface_has_buffer(server.surface)) { TraceCommit(server.surface, 0, true); server.pending = true; ++server.commits; }
+ }
+ static void Destroy(wl_listener *, void *) {
+     wl_list_remove(&server.committed.link); wl_list_remove(&server.destroyed.link);
++    TraceSelect(0, 0);
+     server.surface = nullptr; server.pending = false;
+ }
+ static void NewSurface(wl_listener *, void *data) {
+     if (server.x11) return; // XWM associates windows, not cursor/unpaired wl_surfaces.
+@@ -230,10 +259,12 @@ bool mali_normal_buffer(unsigned index, uint32_t key, unsigned width, unsigned h
+ }
+ void mali_normal_commit(unsigned index) {
+     auto &b = host.buffers[index];
+     if (b.busy || !b.buffer || !host.surface) { mali_normal_failure("normal output wl_buffer reused while busy"); return; }
++    b.trace = g_maliFrameTrace;
+     b.busy = true; wl_surface_attach(host.surface, b.buffer, 0, 0);
+     wl_surface_damage_buffer(host.surface, 0, 0, INT32_MAX, INT32_MAX); wl_surface_commit(host.surface);
++    dd_ft_event(DD_FT_OUTER_COMMIT, b.trace, index, 0, 0, 0);
+     if (wl_display_flush(host.display) < 0 && errno != EAGAIN) mali_normal_failure("outer Wayland commit failed");
+ }
+ void mali_normal_stop_client() { StopServer(); }
+ void mali_normal_detach_output() {
+@@ -270,8 +301,9 @@ int mali_normal_main(int argc, char **argv) {
+     if (!normalPacingHz) { std::fputs("invalid diagnostic Mali pacing: MALI_VULKAN_PERF_HZ must be 30 or 60\n", stderr); return 1; }
+     const auto framePeriod = std::chrono::nanoseconds(1000000000ull / normalPacingHz);
+     std::printf("MaliPerf pacing: target=%uHz period=%.3fms mode=%s event-loop-yield=2ms\n",
+         normalPacingHz, framePeriod.count() / 1e6, normalPacingHz == 60 ? "normal/default" : "diagnostic override");
++    dd_ft_init("gamescope");
+     g_maliNormalSessionActive = true; failed = false; stopped = 0;
+     std::signal(SIGTERM, Stop); std::signal(SIGINT, Stop); std::signal(SIGHUP, Stop);
+     g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
+     g_nNestedRefresh = g_nOutputRefresh = normalPacingHz * 1000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
+@@ -308,14 +340,21 @@ int mali_normal_main(int argc, char **argv) {
+         }
+         vulkan_mali_normal_tick();
+         auto now = std::chrono::steady_clock::now();
+         if (server.pending && server.surface && now >= next && (perfBaseline || vulkan_mali_normal_available())) {
++            g_maliFrameTrace = {}; g_maliFrameTrace.client = tracePending; g_maliFrameTrace.attempt = ++traceAttempt;
++            dd_ft_event(DD_FT_FRAME_BEGIN, g_maliFrameTrace, 0, 0,
++                tracePending && tracePending == traceLastRendered, 1);
+             vulkan_mali_normal_frame_begin();
++            dd_ft_event(DD_FT_SHM_BEGIN, g_maliFrameTrace, 0, 0, 0, 1);
++            DDFrameScope traceLookup(DD_FT_SHM_LOOKUP_BEGIN, DD_FT_SHM_LOOKUP_END, g_maliFrameTrace);
+             auto texture = wlr_surface_get_texture(server.surface);
++            traceLookup.finish();
+             auto wrapped = reinterpret_cast<VulkanWlrTexture_t *>(texture);
+             auto source = wrapped && wrapped->buf ? vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr) : nullptr;
++            dd_ft_event(DD_FT_SHM_END, g_maliFrameTrace, uint64_t(uintptr_t(wrapped ? wrapped->buf : nullptr)), 0, source ? 0 : -1, 1);
+             vulkan_mali_normal_upload_done();
+-            if (!source) { vulkan_mali_normal_frame_end(false); ok = false; break; }
++            if (!source) { vulkan_mali_normal_frame_end(false); dd_ft_event(DD_FT_FRAME_END, g_maliFrameTrace, 0, 0, -1, 1); g_maliFrameTrace = {}; ok = false; break; }
+             MaliCpuScope sceneScope(DD_CPU_SCENE, DD_CPU_FRAME);
+             FrameInfo_t frame{}; auto &layer = *frame.layers.push();
+             layer.tex = source.get(); layer.opacity = 1.0f; layer.filter = GamescopeUpscaleFilter::NEAREST;
+             layer.scale = {source->width() / float(width), source->height() / float(height)};
+@@ -324,15 +363,23 @@ int mali_normal_main(int argc, char **argv) {
+             int result = connector->Present(&frame, false);
+             // Include import texture cleanup in frame/RPC accounting.
+             { MaliCpuScope retire(DD_CPU_RETIRE, DD_CPU_FRAME); source = nullptr; }
+             vulkan_mali_normal_frame_end(result == 0);
++            dd_ft_event(DD_FT_FRAME_END, g_maliFrameTrace, 0, 0, result, 1);
+             if (result == 0) {
++                traceLastRendered = g_maliFrameTrace.client;
+                 timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time); wlr_surface_send_frame_done(server.surface, &time);
+                 if (server.x11) X11Presented();
++                if (tracePending && tracePending != g_maliFrameTrace.client) {
++                    dd_ft_id erased{}; erased.client = tracePending;
++                    dd_ft_event(DD_FT_DISCARD, erased, 0, g_maliFrameTrace.client, 2, 0);
++                }
++                tracePending = 0;
+                 server.pending = false; ++server.frames; wl_display_flush_clients(server.display); progress = now;
+             } else if (result != EAGAIN) { ok = false; break; }
+             // Pace from frame start: a slow render must not pay another target period.
+             // No catch-up burst: the next iteration starts a fresh deadline.
++            g_maliFrameTrace = {};
+             next = (perfBaseline ? std::chrono::steady_clock::now() : now) + framePeriod;
+         }
+         // Steam's bootstrap can download for minutes; an idle UI also needs no redraw.
+         // Child exit, Xwayland and outer socket failures remain fatal.
+@@ -344,8 +391,9 @@ int mali_normal_main(int argc, char **argv) {
+     if (renderer) ok &= vulkan_mali_normal_stop() == 0;
+     connector.reset(); gamescope::IBackend::Set(nullptr);
+     if (host.manager) banner_ahb_v1_destroy(host.manager);
+     if (host.display) wl_display_disconnect(host.display);
++    dd_ft_shutdown();
+     host = {}; g_maliNormalSessionActive = false;
+     std::printf("normal Mali Wayland session exit=%d client status=%d\n", ok ? 0 : 1, childStatus);
+     if (x11) std::printf("Mali Steam Gamescope pid=%d exit=%d; Mali release/drain result=%s\n",
+         int(getpid()), ok ? 0 : 1, ok ? "clean" : "failed (see release accounting)");
+diff --git a/src/mali_normal.hpp b/src/mali_normal.hpp
+index 28d87f4..88471e2 100644
+--- a/src/mali_normal.hpp
++++ b/src/mali_normal.hpp
+@@ -1,5 +1,8 @@
+ #pragma once
++#include "frame_trace.h"
++extern dd_ft_id g_maliFrameTrace;
++extern PFN_dd_ft_context g_maliProxyFrameTrace;
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ struct FrameInfo_t;
+diff --git a/src/mali_normal.inc b/src/mali_normal.inc
+index b7e5b32..416eab9 100644
+--- a/src/mali_normal.inc
++++ b/src/mali_normal.inc
+@@ -42,8 +42,9 @@ bool vulkan_mali_normal_init(unsigned width, unsigned height) {
+     maliCpuDetail = {};
+     normalOutput = {}; normalPerf = {}; normalOutput.width = width; normalOutput.height = height;
+     if (!MaliInitializeRenderer(true)) return false;
+     if (maliStaging.backend.resolve() != VK_SUCCESS) { g_device.ShutdownMaliDiagnostic(); return false; }
++    g_maliProxyFrameTrace = (PFN_dd_ft_context)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckFrameTraceMALI");
+     normalOutput.interop = (PFN_vkDroidDeckInteropTEST)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckInteropTEST");
+     normalOutput.transport = (PFN_vkDroidDeckWaylandMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckWaylandMALI");
+     normalOutput.performance = (PFN_vkDroidDeckPerformanceMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckPerformance2MALI");
+     if (!normalOutput.performance) normalOutput.performance = (PFN_vkDroidDeckPerformanceMALI)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDroidDeckPerformanceMALI");
+@@ -86,37 +87,47 @@ int vulkan_mali_normal_present(const FrameInfo_t *frame) {
+     MaliCpuScope outputScope(DD_CPU_OTHER, DD_CPU_OUTPUT);
+     auto &s = normalOutput;
+     if (s.stopping) return -1;
+     uint64_t acquireStart = dd_perf_now();
++    dd_ft_event(DD_FT_ACQUIRE_BEGIN, g_maliFrameTrace, 0, 0, 0, 1);
+     int index = s.ownership.acquire(s.frame);
+     normalPerf.currentAcquire = dd_perf_now() - acquireStart;
+-    if (index < 0) { ++s.dropped; return EAGAIN; } // dispatch real releases before any reuse
+-    auto &slot = s.slots[index]; slot.frame = ++s.frame;
++    if (index < 0) { dd_ft_event(DD_FT_ACQUIRE_END, g_maliFrameTrace, 0, 0, EAGAIN, 1); ++s.dropped; return EAGAIN; } // dispatch real releases before any reuse
++    auto &slot = s.slots[index]; uint32_t previousFrame = slot.frame; slot.frame = ++s.frame;
++    g_maliFrameTrace.frame = slot.frame; g_maliFrameTrace.key = slot.key;
++    dd_ft_event(DD_FT_ACQUIRE_END, g_maliFrameTrace, index, previousFrame, 0, 1);
+     auto producer = NormalInterop(DD_FENCE_CREATE); g_device.m_maliProducerFence = producer.fence;
++    g_maliFrameTrace.fence = producer.token; // Broker fence ID, never the local VkFence handle.
+     g_device.m_maliReadbackBuffer = VK_NULL_HANDLE;
+     FrameInfo_t mutableFrame = *frame;
+     uint64_t compositeStart = dd_perf_now();
++    dd_ft_event(DD_FT_RENDER_BEGIN, g_maliFrameTrace, index, 0, 0, 1);
+     auto sequence = vulkan_composite(&mutableFrame, nullptr, false, slot.texture.get(), false, nullptr);
++    dd_ft_event(DD_FT_RENDER_END, g_maliFrameTrace, index, sequence.value_or(0), sequence.has_value() ? 0 : -1, 1);
+     normalPerf.currentComposite = dd_perf_now() - compositeStart;
+     MaliRequire(sequence.has_value(), "normal Wayland Gamescope BLIT");
+-    { MaliWaitScope site(DD_WAIT_OUTPUT_COMPLETION, index); g_device.wait(*sequence, false); }
++    { DDFrameScope trace(DD_FT_WAIT_BEGIN, DD_FT_WAIT_END, g_maliFrameTrace, DD_WAIT_OUTPUT_COMPLETION, *sequence); MaliWaitScope site(DD_WAIT_OUTPUT_COMPLETION, index); g_device.wait(*sequence, false); }
+     g_device.m_maliProducerFence = VK_NULL_HANDLE;
+     MaliRequire(*sequence > s.sequence && g_device.completedSeqNo() >= *sequence, "normal monotonic KHR timeline");
+     s.sequence = *sequence; ++s.rendered;
+     dd_interop_input input{}; input.fence = producer.fence;
+     auto sync = NormalInterop(DD_SYNC_EXPORT, input); input = {}; input.sync = sync.sync;
++    g_maliFrameTrace.sync = sync.sync;
++    dd_ft_event(DD_FT_WAIT_BEGIN, g_maliFrameTrace, DD_SYNC_WAIT, sync.sync, 0, 1);
+     NormalInterop(DD_SYNC_WAIT, input); // real producer fence, never a fabricated acquire
++    dd_ft_event(DD_FT_WAIT_END, g_maliFrameTrace, DD_SYNC_WAIT, sync.sync, 0, 1);
+     MaliRequire(s.ownership.ready(index), "normal Rendering -> Ready");
+     dd_normal_input publish{}; publish.token = slot.ahb.token; publish.sync = sync.sync; publish.frame = slot.frame;
+     MaliRequire(MaliResult(NormalRPC(MB_NORMAL_PUBLISH, publish), "normal publish ownership"), "normal publish ownership");
++    dd_ft_event(DD_FT_PUBLISH, g_maliFrameTrace, index, *sequence, 0, 0);
+     MaliRequire(s.ownership.presented(index), "normal Ready -> Android-owned");
+     unsigned owned = 0;
+     for (unsigned i = 0; i < 3; ++i) owned += s.ownership.androidOwned(i);
+     normalPerf.maxAndroid = std::max(normalPerf.maxAndroid, owned);
+     uint64_t commitStart = dd_perf_now();
+     mali_normal_commit(index); ++s.presented; slot.committedNs = commitStart;
+     normalPerf.currentCommit = dd_perf_now() - commitStart;
+-    { MaliWaitScope site(DD_WAIT_OUTPUT_RETIRE, index); g_device.wait(*sequence, true); }
++    { DDFrameScope trace(DD_FT_WAIT_BEGIN, DD_FT_WAIT_END, g_maliFrameTrace, DD_WAIT_OUTPUT_RETIRE, *sequence); MaliWaitScope site(DD_WAIT_OUTPUT_RETIRE, index); g_device.wait(*sequence, true); }
+     input = {}; input.sync = sync.sync; NormalInterop(DD_SYNC_CLOSE, input);
+     auto destroyFence = (PFN_vkDestroyFence)g_device.vk.GetDeviceProcAddr(g_device.device(), "vkDestroyFence");
+     destroyFence(g_device.device(), producer.fence, nullptr);
+     return 0;
+diff --git a/src/mali_normal_perf.inc b/src/mali_normal_perf.inc
+index 6b5c318..ef19249 100644
+--- a/src/mali_normal_perf.inc
++++ b/src/mali_normal_perf.inc
+@@ -57,9 +57,10 @@ void vulkan_mali_normal_frame_end(bool presented) {
+         if (op.worst > p.lastWorst) { p.lastWorst = op.worst; p.lastWorstOp = i; }
+     }
+ }
+ bool vulkan_mali_normal_available() {
+-    for (unsigned i = 0; i < 3; ++i) if (normalOutput.ownership.free(i)) { normalPerf.waitingOutput = false; return true; }
++    for (unsigned i = 0; i < 3; ++i) if (normalOutput.ownership.free(i)) { if (normalPerf.waitingOutput) dd_ft_event(DD_FT_POOL_BLOCKED, {}, i, 0, 0, 0); normalPerf.waitingOutput = false; return true; }
++    if (!normalPerf.waitingOutput) dd_ft_event(DD_FT_POOL_BLOCKED, {}, 3, 3, 1, 0);
+     normalPerf.waitingOutput = true;
+     return false; // Only observes ownership; never acquires, recycles or assumes release.
+ }
+ void vulkan_mali_normal_tick() {
+diff --git a/src/mali_staging.inc b/src/mali_staging.inc
+index 434926e..4350dc5 100644
+--- a/src/mali_staging.inc
++++ b/src/mali_staging.inc
+@@ -33,10 +33,13 @@ struct MaliStagingBackend {
+     int wait(uint64_t value, const Resource &r) {
+         VkSemaphore semaphore = g_device.maliScratchTimeline();
+         VkSemaphoreWaitInfo info{}; info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+         info.semaphoreCount = 1; info.pSemaphores = &semaphore; info.pValues = &value;
++        DDFrameScope traceWait(DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END, g_maliFrameTrace,
++            uint64_t(uintptr_t(r.buffer)), value, g_maliFrameTrace.attempt != 0);
+         MaliWaitScope reason(DD_WAIT_SHM_STAGING_REUSE, (uint64_t)(uintptr_t)r.buffer);
+         VkResult result = MaliProfiledWait(g_device.vk.WaitSemaphores, g_device.vk.GetDeviceProcAddr, g_device.device(), &info, 5000000000ull);
++        traceWait.finish();
+         if (result == VK_SUCCESS) g_device.resetCmdBuffers(value);
+         return result;
+     }
+     void destroy(Resource &r, uint64_t completedSequence = 0) {
+@@ -51,8 +54,10 @@ struct MaliStagingBackend {
+         if (r.memory) g_device.vk.FreeMemory(g_device.device(), r.memory, nullptr);
+         r = {};
+     }
+     int create(uint64_t bytes, Resource &r) {
++        DDFrameScope traceCreate(DD_FT_STAGING_CREATE_BEGIN, DD_FT_STAGING_CREATE_END, g_maliFrameTrace,
++            0, bytes, g_maliFrameTrace.attempt != 0);
+         if (!staging || !mapStaging) { VkResult result = resolve(); if (result != VK_SUCCESS) return result; }
+         VkBufferCreateInfo bufferInfo{}; bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+         bufferInfo.size = bytes; bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+         VkResult result = g_device.vk.CreateBuffer(g_device.device(), &bufferInfo, nullptr, &r.buffer);
+@@ -69,9 +74,12 @@ struct MaliStagingBackend {
+         allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
+         result = g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &r.memory);
+         if (result == VK_SUCCESS) result = g_device.vk.BindBufferMemory(g_device.device(), r.buffer, r.memory, 0);
+         if (result == VK_SUCCESS) {
++            DDFrameScope traceMap(DD_FT_STAGING_MAP_BEGIN, DD_FT_STAGING_MAP_END, g_maliFrameTrace,
++                uint64_t(uintptr_t(r.memory)), requirements.size, g_maliFrameTrace.attempt != 0);
+             result = mapStaging(g_device.device(), r.memory, &r.mapped);
++            traceMap.finish();
+             if (result == VK_SUCCESS) { ++maps.created; r.mappedBytes = requirements.size; }
+             else {
+                 ++maps.failures; r.mapped = nullptr;
+                 std::fprintf(stderr, "persistent staging acquire failed: vkDroidDeckMapStagingMALI VkResult=%d\n", int(result));
+diff --git a/src/mali_x11.inc b/src/mali_x11.inc
+index 9932d51..347d7c3 100644
+--- a/src/mali_x11.inc
++++ b/src/mali_x11.inc
+@@ -3,8 +3,9 @@
+  * the existing SHM import; bootstrapping, modal windows and replacement are allowed.
+  * No Gamescope game/scaler capability properties are advertised here. */
+ struct MaliXWindow {
+     wlr_xwayland_surface *window = nullptr;
++    uint64_t traceClient = 0;
+     bool dirty = false, presented = false, bufferLogged = false;
+     wl_listener associate{}, dissociate{}, destroy{}, configure{}, activate{}, fullscreen{};
+     wl_listener map{}, unmap{}, commit{};
+ };
+@@ -40,8 +41,9 @@ static void X11Select(MaliXWindow *chosen = nullptr) {
+         if (previous) wlr_xwayland_surface_activate(previous, false);
+     }
+     wlr_seat_pointer_clear_focus(server.seat);
+     wlr_seat_keyboard_clear_focus(server.seat);
++    TraceSelect(chosen ? chosen->traceClient : 0, chosen ? chosen->window->window_id : 0);
+     server.surface = surface;
+     server.pending = surface && wlr_surface_has_buffer(surface);
+     if (chosen) {
+         xWindows.erase(std::find(xWindows.begin(), xWindows.end(), chosen));
+@@ -56,8 +58,9 @@ static void X11Select(MaliXWindow *chosen = nullptr) {
+ }
+ static void X11Commit(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, commit);
+     if (wlr_surface_has_buffer(w->window->surface)) {
++        w->traceClient = TraceCommit(w->window->surface, w->window->window_id, server.surface == w->window->surface);
+         w->dirty = true;
+         if (!w->bufferLogged) { w->bufferLogged = true; X11Trace("first-buffer-commit", w); }
+         if (server.surface == w->window->surface) { server.pending = true; ++server.commits; }
+     }
+@@ -76,8 +79,9 @@ static void X11Unmap(wl_listener *listener, void *) {
+ static void X11Dissociate(wl_listener *listener, void *) {
+     MaliXWindow *w = wl_container_of(listener, w, dissociate);
+     if (server.surface == w->window->surface) {
+         wlr_seat_pointer_clear_focus(server.seat); wlr_seat_keyboard_clear_focus(server.seat);
++        TraceSelect(0, w->window->window_id);
+         server.surface = nullptr; server.pending = false;
+     }
+     X11Unlisten(w->map); X11Unlisten(w->unmap); X11Unlisten(w->commit);
+ }
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index e7bce3b..43721e5 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -1,5 +1,6 @@
+ #include "mali_normal.hpp"
++PFN_dd_ft_context g_maliProxyFrameTrace = nullptr;
+ #include "normal_detail_perf.hpp"
+ // Initialize Vulkan and composite stuff with a compute queue
+
+ #include <cassert>
+@@ -1376,9 +1377,12 @@ std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer()
+ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
+ {
+ 	MaliCpuScope cpuScope(DD_CPU_SUBMIT);
+
++	DDFrameScope traceFinalize(DD_FT_UPLOAD_FINALIZE_BEGIN, DD_FT_UPLOAD_FINALIZE_END, g_maliFrameTrace,
++	    uint64_t(uintptr_t(cmdBuffer->rawBuffer())), 0, maliStagingUploadRecording && g_maliFrameTrace.attempt);
+ 	cmdBuffer->end();
++	traceFinalize.finish();
+
+ 	// The seq no of the last submission.
+ 	const uint64_t lastSubmissionSeqNo = m_submissionSeqNo++;
+
+@@ -1435,9 +1439,15 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
+ 	};
+
+     // Explicitly seals even an empty epoch (normal SHM U has no ring stores).
+     uploadRingOperation(DD_RING_SEAL, 0, 0, rawCmdBuffer);
++	DDFrameScope traceQueue(DD_FT_UPLOAD_QUEUE_BEGIN, DD_FT_UPLOAD_QUEUE_END, g_maliFrameTrace,
++	    uint64_t(uintptr_t(rawCmdBuffer)), nextSeqNo, maliStagingUploadRecording && g_maliFrameTrace.attempt);
++    const bool traceProxy = g_maliProxyFrameTrace && g_maliFrameTrace.attempt && dd_ft_active();
++    if (traceProxy) g_maliProxyFrameTrace((void *)device(), dd_ft_event, &g_maliFrameTrace);
+ 	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, m_maliDiagnostic ? m_maliProducerFence : VK_NULL_HANDLE ) );
++    if (traceProxy) g_maliProxyFrameTrace((void *)device(), nullptr, nullptr);
++	traceQueue.finish();
+
+ 	return nextSeqNo;
+ }
+
+@@ -4882,8 +4892,9 @@ struct wlr_renderer *vulkan_renderer_create( void )
+
+ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+ {
+ 	MaliCpuScope shmScope(DD_CPU_SHM_ACCESS, DD_CPU_SHM);
++	DDFrameScope traceSource(DD_FT_SHM_SOURCE_BEGIN, DD_FT_SHM_SOURCE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)));
+
+
+ 	struct wlr_dmabuf_attributes dmabuf = {0};
+ 	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
+@@ -4903,9 +4914,11 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+
+ 	uint32_t width = buf->width;
+ 	uint32_t height = buf->height;
+
++	traceSource.finish();
+ 	shmScope.set(DD_CPU_POOL);
++	DDFrameScope traceAcquire(DD_FT_STAGING_ACQUIRE_BEGIN, DD_FT_STAGING_ACQUIRE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)), uint64_t(stride) * height);
+ 	MaliStagingPool<MaliStagingBackend>::Lease staging;
+ 	VkBuffer buffer = VK_NULL_HANDLE;
+ 	VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
+ 	if (maliWaitProfilingActive) {
+@@ -4969,26 +4982,32 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+ 		}
+
+ 	}
+
++	traceAcquire.finish();
++	DDFrameScope traceValidate(DD_FT_STAGING_VALIDATE_BEGIN, DD_FT_STAGING_VALIDATE_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)), uint64_t(stride) * height);
+ 	void *dst = staging.slot ? staging.slot->resource.mapped : nullptr;
+ 	if (staging.slot) {
+ 		if (!dst || uint64_t(stride) * height > staging.slot->resource.mappedBytes) {
+ 			wlr_buffer_end_data_ptr_access(buf);
+ 			g_device.FailMaliDiagnostic("normal SHM persistent mapped range", VK_ERROR_INITIALIZATION_FAILED);
+ 			return nullptr;
+ 		}
+ 	} else {
++		DDFrameScope traceMap(DD_FT_STAGING_MAP_BEGIN, DD_FT_STAGING_MAP_END, g_maliFrameTrace, uint64_t(uintptr_t(bufferMemory)), uint64_t(stride) * height);
+ 		result = g_device.vk.MapMemory( g_device.device(), bufferMemory, 0, VK_WHOLE_SIZE, 0, &dst );
++		traceMap.finish();
+ 		if ( result != VK_SUCCESS )
+ 		{
+ 			wlr_buffer_end_data_ptr_access( buf );
+             if (g_device.IsMaliDiagnostic()) g_device.FailMaliDiagnostic("vkMapMemory SHM upload", result);
+ 			return nullptr;
+ 		}
+ 	}
+
++	traceValidate.finish();
+ 	shmScope.set(DD_CPU_COPY);
++	dd_ft_event(DD_FT_COPY_BEGIN, g_maliFrameTrace, uint64_t(uintptr_t(buf)), stride * height, 0, 1);
+ 	memcpy( dst, src, stride * height );
+     if (maliCpuDetail.active) maliCpuDetail.shmBytes += uint64_t(stride) * height;
+     if (g_device.IsMaliDiagnostic() && (drmFormat == DRM_FORMAT_ARGB8888 || drmFormat == DRM_FORMAT_XRGB8888)) {
+         auto bytes = static_cast<uint8_t *>(dst);
+@@ -4998,40 +5017,55 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+             if (drmFormat == DRM_FORMAT_XRGB8888) pixel[3] = 255;
+         }
+         drmFormat = DRM_FORMAT_ABGR8888;
+     }
++	dd_ft_event(DD_FT_COPY_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)), stride * height, 0, 1);
+ 	shmScope.set(DD_CPU_SHM_ACCESS);
++	DDFrameScope traceRelease(DD_FT_SHM_SOURCE_RELEASE_BEGIN, DD_FT_SHM_SOURCE_RELEASE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)));
+ 	if (!staging.slot) g_device.vk.UnmapMemory( g_device.device(), bufferMemory );
+
+ 	wlr_buffer_end_data_ptr_access( buf );
+
++	traceRelease.finish();
+ 	shmScope.set(DD_CPU_SOURCE);
++	DDFrameScope traceTexture(DD_FT_TEXTURE_CREATE_BEGIN, DD_FT_TEXTURE_CREATE_END, g_maliFrameTrace, uint64_t(uintptr_t(buf)));
+ 	gamescope::OwningRc<CVulkanTexture> pTex = new CVulkanTexture();
+ 	CVulkanTexture::createFlags texCreateFlags;
+ 	texCreateFlags.bSampled = true;
+ 	texCreateFlags.bTransferDst = true;
+ 	texCreateFlags.bFlippable = !g_device.IsMaliDiagnostic();
+ 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
+ 		return nullptr;
+
++	traceTexture.finish();
+ 	shmScope.set(DD_CPU_COMMANDS);
++	DDFrameScope traceRecord(DD_FT_UPLOAD_RECORD_BEGIN, DD_FT_UPLOAD_RECORD_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 	auto cmdBuffer = g_device.commandBuffer();
+
+ 	cmdBuffer->copyBufferToImage( buffer, 0, stride / DRMFormatGetBPP(drmFormat), pTex);
+ 	// TODO: Sync this copyBufferToImage
++	traceRecord.finish();
+
+ 	shmScope.set(DD_CPU_SUBMIT);
+ 	if (staging.slot) {
++		DDFrameScope tracePrepare(DD_FT_UPLOAD_PREPARE_BEGIN, DD_FT_UPLOAD_PREPARE_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 		result = maliStaging.backend.prepare(staging.slot->resource, cmdBuffer->rawBuffer());
+ 		if (result != VK_SUCCESS) g_device.FailMaliDiagnostic("normal SHM coherent upload arm", result);
++		tracePrepare.finish();
+ 		// The existing end-of-upload barrier makes transfer writes visible to
+ 		// later compute on this same queue; retaining storage removes the CPU wait.
+ 		MaliStagingUploadScope recording;
++		DDFrameScope traceSubmit(DD_FT_UPLOAD_SUBMIT_BEGIN, DD_FT_UPLOAD_SUBMIT_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
++		traceSubmit.finish();
+ 		staging.submitted(sequence);
+ 	} else {
++		DDFrameScope traceSubmit(DD_FT_UPLOAD_SUBMIT_BEGIN, DD_FT_UPLOAD_SUBMIT_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)));
+ 		uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+-		g_device.wait(sequence);
++		traceSubmit.finish();
++		{ DDFrameScope traceWait(DD_FT_UPLOAD_WAIT_BEGIN, DD_FT_UPLOAD_WAIT_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)), sequence);
++		g_device.wait(sequence); }
++		DDFrameScope traceCleanup(DD_FT_SHM_CLEANUP_BEGIN, DD_FT_SHM_CLEANUP_END, g_maliFrameTrace, uint64_t(uintptr_t(buffer)), sequence);
+ 		g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
+ 		g_device.vk.FreeMemory(g_device.device(), bufferMemory, nullptr);
+ 	}
+
+--
+DroidDeck Mali phase 4

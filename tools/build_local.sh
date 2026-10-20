@@ -186,6 +186,7 @@ docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
         set -euo pipefail
         tools/mali-vulkan/build-probe.sh
         tools/mali-vulkan/build-icd.sh
+        python3 -B tools/mali-vulkan/stage-diagnostics.py
     '
 
 vr_out="${linuxfs_dir}/usr/local/lib/droiddeck-vr"

@@ -158,7 +158,7 @@ class ControlTests(unittest.TestCase):
         # Compile the actual patched assignment against the private ABI. This
         # catches using a VkFence pointer as a uint32_t journal identity, without
         # building Gamescope. The real proxy-ID export is exercised by test_registry.
-        patch=(ROOT.parent/'gamescope/patches/0126-mali-frame-trace.patch').read_text()
+        patch=(ROOT.parent/'gamescope/patches/0217-mali-frame-trace.patch').read_text()
         assignments=[line[1:] for line in patch.splitlines()
                      if line.startswith('+') and 'g_maliFrameTrace.fence =' in line]
         self.assertEqual(len(assignments),1)
@@ -203,8 +203,8 @@ int main() {
             self.assertFalse((root/'control').exists())
 
     def test_patch_carries_exact_canonical_c_and_header(self):
-        patch=(ROOT.parent/'gamescope/patches/0126-mali-frame-trace.patch').read_text()
+        patch=(ROOT.parent/'gamescope/patches/0217-mali-frame-trace.patch').read_text()
         for filename,canonical in [('frame_trace.h','frame_trace.h'),('frame_trace.inc','frame_trace.c')]:
-            section=patch.split('+++ b/src/'+filename+'\n',1)[1].split('\n--- ',1)[0]
-            actual='\n'.join(line[1:] for line in section.splitlines() if line.startswith('+'))+'\n'
+            from gamescope_source import source
+            actual=(source()/'src'/filename).read_text()
             self.assertEqual(actual,(ROOT/canonical).read_text())

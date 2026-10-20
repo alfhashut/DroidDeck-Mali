@@ -62,7 +62,7 @@ class SessionBoundaryTests(unittest.TestCase):
         self.assertIn('SessionFiles.stage(this, root)', normal)
         self.assertIn('openSessionFolder()', normal)
         self.assertIn('SessionState.runtimeDriver = null', normal)
-        self.assertNotIn('extraEnv()', normal)
+        self.assertIn('MaliSessionControls.environment(extraEnv())', normal)
         self.assertNotIn('debugLogDir', normal)
 
     def test_shared_staging_and_panvk_are_not_normal_session_options(self):
@@ -71,9 +71,10 @@ class SessionBoundaryTests(unittest.TestCase):
         self.assertNotIn('shared-staging.enabled', broker)
         self.assertNotIn('Panvk', broker)
         shell = (ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-session').read_text()
-        self.assertIn('if [ "$mode" = mali-wayland ]; then', shell)
+        self.assertIn('if [ "$mode" = mali-wayland ] ||', shell)
         self.assertIn('[ "${MALI_VULKAN_SHARED_STAGING:-0}" = 0 ]', shell)
-        self.assertNotIn('BL_MALI_STEAM_UI', shell)
+        self.assertNotIn('-cef-use-vulkan', shell)
+        self.assertNotIn('droiddeck-steam-client-panvk', shell)
 
     def test_ahb_only_buffer_has_no_dmabuf_planes_or_export(self):
         source = (CPP / 'waylandcomp/src/compositor.c').read_text()
@@ -89,7 +90,7 @@ class SessionBoundaryTests(unittest.TestCase):
         self.assertIn('mb_normal_submit(ab->broker_key)', registry)
         self.assertIn('mb_normal_not_submitted(ab->broker_key)', registry)
         self.assertIn('POLLERR | POLLNVAL', registry)
-        self.assertNotIn('dd_ft_event(', registry)
+        self.assertIn('!state.owned', registry)
 
 
 class PatchContractTests(unittest.TestCase):
@@ -117,7 +118,8 @@ class PatchContractTests(unittest.TestCase):
         prefixes = [p.name[:4] for p in self.patches]
         self.assertEqual(len(prefixes), len(set(prefixes)))
         self.assertEqual([p for p in prefixes if p.startswith('02')],
-                         ['0200', '0201', '0202', '0203', '0204', '0205', '0206', '0210', '0211'])
+                         ['0200', '0201', '0202', '0203', '0204', '0205', '0206', '0210', '0211',
+                          '0212', '0213', '0214', '0215', '0216', '0217', '0218'])
         self.assertNotIn('offset', self.output)
         self.assertNotIn('fuzz', self.output)
 
@@ -146,12 +148,12 @@ class PatchContractTests(unittest.TestCase):
         stop = source.split('int vulkan_mali_normal_stop()', 1)[1]
         self.assertLess(stop.index('NormalRPC(MB_NORMAL_END)'), stop.index('mali_normal_destroy_buffers()'))
         self.assertLess(stop.index('FailMaliDiagnostic("normal Android release drain"'), stop.index('DestroyImage('))
-        self.assertNotIn('mali_staging', source)
-        self.assertNotIn('mali_normal_perf', source)
-        self.assertNotIn('dd_ft_event', source)
+        self.assertLess(stop.index('maliStaging.shutdown()'), stop.index('mali_normal_destroy_buffers()'))
+        self.assertIn('mali_normal_perf.inc', source)
+        self.assertIn('MB_NORMAL_END', source)
         normal = (self.source / 'src/mali_normal.cpp').read_text()
         self.assertIn('unsetenv("MALI_VULKAN_BROKER_SOCKET")', normal)
-        self.assertNotIn('mali-xwayland', normal)
+        self.assertIn('mali-xwayland', normal)
         touch = (self.source / 'src/Backends/WaylandBackend.cpp').read_text()
         self.assertIn('m_TouchSurfaces[ nId ] = pSurface', touch)
         self.assertIn('wlserver_touchdown( flX, flY, nId + 1', touch)

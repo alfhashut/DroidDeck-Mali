@@ -80,6 +80,13 @@ static struct ahb_buf *find_buf(uint64_t id) {
     return NULL;
 }
 
+struct dd_ft_id ahb_swapchain_trace_identity(void *token) {
+    struct dd_ft_id empty = {0};
+    if (!dd_ft_active() || !token) return empty;
+    struct ahb_buf *ab = find_buf((uint64_t)(uintptr_t)token);
+    return ab && ab->broker_key ? mb_normal_trace_identity(ab->broker_key) : empty;
+}
+
 static void buf_free(struct ahb_buf *ab) {
     if (ab->resource) { wl_list_remove(&ab->resource_destroy.link); ab->resource = NULL; }
     if (ab->fence_src) { wl_event_source_remove(ab->fence_src); ab->fence_src = NULL; }
@@ -119,6 +126,7 @@ static int on_fence_readable(int fd, uint32_t mask, void *data) {
         if (!(mask & WL_EVENT_READABLE) || poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN) || (p.revents & (POLLERR | POLLNVAL)))
             return 0; /* fail closed: an error is not a release acknowledgement */
     }
+    if (ab->broker_key) mb_normal_trace(ab->broker_key, DD_FT_RELEASE_FENCE_OBSERVED, ab->id, 0, 0);
     wl_event_source_remove(ab->fence_src);
     ab->fence_src = NULL;
     close(ab->fence_fd);
@@ -131,6 +139,7 @@ static int on_fence_readable(int fd, uint32_t mask, void *data) {
 static void handle_released(uint64_t id, int fd) {
     struct ahb_buf *ab = find_buf(id);
     if (!ab) { if (fd >= 0) close(fd); return; }
+    if (ab->broker_key) mb_normal_trace(ab->broker_key, DD_FT_RELEASE_QUEUED, ab->id, fd >= 0, 0);
     ab->on_layer = 0;
     if (fd >= 0) {
         struct droiddeck_dma_buf_sync_file imp = {.flags = DROIDDECK_DMA_BUF_SYNC_READ, .fd = fd};
@@ -145,8 +154,10 @@ static void handle_released(uint64_t id, int fd) {
             }
             struct pollfd p = {.fd = fd, .events = POLLIN};
             if (poll(&p, 1, 0) > 0 && (!ab->broker_key || ((p.revents & POLLIN) && !(p.revents & (POLLERR | POLLNVAL))))) {
+                if (ab->broker_key) mb_normal_trace(ab->broker_key, DD_FT_RELEASE_FENCE_OBSERVED, ab->id, 0, 0);
                 close(fd);
             } else {
+                if (ab->broker_key) mb_normal_trace(ab->broker_key, DD_FT_RELEASE_FENCE_PENDING, ab->id, 0, 0);
                 ab->fence_fd = fd;
                 ab->fence_src = wl_event_loop_add_fd(g_loop, fd, WL_EVENT_READABLE, on_fence_readable, ab);
                 if (!ab->fence_src) {
@@ -223,8 +234,13 @@ int ahb_swapchain_present(struct dmabuf_buffer *b, struct surface *s, int scene_
         int r;
         do { r = poll(&p, 1, 100); } while (r < 0 && errno == EINTR);
     }
+    struct dd_ft_id trace = ab->broker_key ? mb_normal_trace_identity(ab->broker_key) : (struct dd_ft_id){0};
+    if (ab->broker_key) dd_ft_event(DD_FT_HANDOFF_BEGIN, trace, ab->id, 0, 0, 1);
+    int64_t present_start = ab->broker_key ? now_ns() : 0;
     int r = sc_layer_present_ahb(ab->ahb, ab->w, ab->h, acquire, (void *)(uintptr_t)ab->id, scene_w, scene_h,
                                  s ? droiddeck_surface_color(s) : NULL, ab->format);
+    if (ab->broker_key) dd_ft_event(DD_FT_HANDOFF_END, trace, ab->id, 0, r, 1);
+    if (ab->broker_key) mb_normal_present_timing(ab->broker_key, (uint64_t)(now_ns() - present_start));
     if (ab->broker_key && r != 0) {
         /* sc_layer did not apply a transaction. Cancel only an unpublished commit;
          * an older submission still requires its actual release callback. */

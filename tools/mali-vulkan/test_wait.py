@@ -1,6 +1,7 @@
 """Wait attribution helpers only: fake Vulkan/clock/transport; no project build."""
 from pathlib import Path
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -111,8 +112,8 @@ int main(int argc, char **) {
         self.assertIn('MaliStagingUploadScope recording;', patch)
         self.assertIn('staging.submitted(sequence);', patch)
         normal = added_file(PATCH, 'mali_normal.inc')
-        self.assertIn('{ MaliWaitScope site(DD_WAIT_OUTPUT_COMPLETION, index); g_device.wait(*sequence, false); }', normal)
-        self.assertIn('{ MaliWaitScope site(DD_WAIT_OUTPUT_RETIRE, index); g_device.wait(*sequence, true); }', normal)
+        self.assertRegex(normal, r'MaliWaitScope site\(DD_WAIT_OUTPUT_COMPLETION, index\);[^}]*g_device\.wait\(\*sequence, false\)')
+        self.assertRegex(normal, r'MaliWaitScope site\(DD_WAIT_OUTPUT_RETIRE, index\);[^}]*g_device\.wait\(\*sequence, true\)')
         self.assertIn('maliWaitProfilingActive = false;', normal.split('int vulkan_mali_normal_stop()', 1)[1])
         perf = added_file(PATCH, 'mali_normal_perf.inc')
         self.assertIn('maliWaitProfilingActive = true;', perf.split('void vulkan_mali_normal_frame_begin()', 1)[1])

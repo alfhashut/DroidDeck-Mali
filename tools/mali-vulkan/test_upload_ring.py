@@ -9,7 +9,7 @@ import unittest
 from test_perf import PATCH
 
 ROOT = Path(__file__).resolve().parent
-RING_PATCH = PATCH.with_name('0123-mali-upload-ring-ranges.patch')
+RING_PATCH = PATCH.with_name('0214-mali-upload-ring-ranges.patch')
 
 
 class UploadRingTests(unittest.TestCase):

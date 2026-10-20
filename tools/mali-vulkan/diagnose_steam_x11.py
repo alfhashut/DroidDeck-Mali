@@ -263,8 +263,7 @@ def steam_evidence(client):
 
 
 def run():
-    # The receiver's fixed entrypoint is a launcher for this diagnostic run.
-    from run_panvk_phone_test_impl import client_environment
+    from steam_client_environment import client_environment
     # Use only the proven session's X11 connection coordinates. No graphics
     # selectors copied, no PanVK/ANGLE DSOs loaded, no renderer validation relaxed.
     client = client_environment()

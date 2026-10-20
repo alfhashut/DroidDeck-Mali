@@ -23,6 +23,7 @@ class DiagnosticBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='mali-diagnostic-smoke-') as directory:
             binary = Path(directory) / 'gamescope'
             binary.write_text('''#!/usr/bin/env python3
+# --mali-xwayland vkDroidDeckStagingMALI vkDroidDeckMapStagingMALI vkDroidDeckUploadRingMALI vkDroidDeckFrameTraceMALI
 import os, sys
 options = ''' + repr(tuple('--' + option for option in options)) + '''
 if sys.argv[1:] == ['--help']:

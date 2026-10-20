@@ -22,6 +22,8 @@ SOURCE_PATHS = ['app/build.gradle', 'app/src/main/cpp/fakeinput_steam.cpp', 'app
                 'app/src/main/cpp/waylandcomp/src/spatialpose_shm.h',
                 'app/src/main/cpp/adrenotools/src/hook/kgsl.h',
                 'app/src/main/cpp/CMakeLists.txt', 'app/src/main/cpp/malivulkan', 'tools/mali-vulkan',
+                'tools/panvk/analyze_frame_journal.py', 'tools/panvk/analyze_steam_frames.py',
+                'tools/panvk/summarize_affinity.py',
                 'app/src/main/assets/graphics_driver/adrenotools-turnip25.1.0.tzst']
 MALI_ASSETS = ('broker_probe', 'libdroiddeck_mali_proxy.so', 'mali_proxy_icd.json',
                'vulkan_loader_test', 'capability_inventory')

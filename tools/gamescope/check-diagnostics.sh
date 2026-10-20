@@ -10,6 +10,9 @@ options=(vk-enumerate-only vk-capabilities vk-create-device-test vk-submit-test
 for option in "${options[@]}"; do
     grep -a -q -F -- "--$option" "$binary"
 done
+for marker in --mali-xwayland vkDroidDeckStagingMALI vkDroidDeckMapStagingMALI vkDroidDeckUploadRingMALI vkDroidDeckFrameTraceMALI; do
+    grep -a -q -F -- "$marker" "$binary"
+done
 [[ "$mode" != --markers-only ]] || exit 0
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT

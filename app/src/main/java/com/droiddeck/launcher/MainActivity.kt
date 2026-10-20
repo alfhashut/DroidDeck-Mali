@@ -1980,8 +1980,9 @@ class MainActivity : ComponentActivity() {
             android.widget.Toast.makeText(this, R.string.storage_cleanup_busy, android.widget.Toast.LENGTH_SHORT).show()
             return false
         }
-        if (!steamSession && intent.getStringExtra(SessionService.EXTRA_MODE) == SessionService.MODE_DESKTOP &&
-            !intent.hasExtra(SessionService.EXTRA_STEAM_UI)) {
+        if ((steamSession && !intent.getBooleanExtra(SessionActivity.EXTRA_STEAMVR, false)) ||
+            (!steamSession && intent.getStringExtra(SessionService.EXTRA_MODE) == SessionService.MODE_DESKTOP &&
+                !intent.hasExtra(SessionService.EXTRA_STEAM_UI))) {
             val gpu = com.droiddeck.launcher.gpu.VulkanInfo.cachedOrNull()
             if (gpu == null) {
                 if (selectingSessionGpu) return false
@@ -1997,7 +1998,12 @@ class MainActivity : ComponentActivity() {
             }
             if (com.droiddeck.launcher.gpu.MaliSessionSelection.supported(gpu)) {
                 if (!SessionState.running && SessionState.phase !in setOf(SessionPhase.IDLE, SessionPhase.FAILED)) return false
-                intent.putExtra(SessionService.EXTRA_MODE, com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
+                if (steamSession) {
+                    intent.putExtra(SessionService.EXTRA_MODE, SessionService.MODE_STEAM)
+                    intent.putExtra(SessionService.EXTRA_MALI_BACKEND, true)
+                } else {
+                    intent.putExtra(SessionService.EXTRA_MODE, com.droiddeck.launcher.gpu.MaliSessionSelection.MODE)
+                }
             }
         }
         refreshPhantomStatus()

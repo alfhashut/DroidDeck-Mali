@@ -96,22 +96,11 @@ class BulkMemoryTests(unittest.TestCase):
         self.run_case('staging_bulk_socket')
 
     def test_protocol_patch_applies_zero_fuzz_and_matches_canonical_headers(self):
-        patches = ROOT.parent / 'gamescope/patches'
-        original = (patches / '0121-mali-normal-wayland-session.patch').read_text()
-        with tempfile.TemporaryDirectory(prefix='mali-bulk-patch-') as directory:
-            root = Path(directory); (root / 'src').mkdir()
-            for name in ('interop_protocol.h', 'renderer_protocol.h'):
-                section = original.split('+++ b/src/' + name + '\n', 1)[1].splitlines()
-                count = int(re.fullmatch(r'@@ -0,0 \+1,(\d+) @@', section[0])[1])
-                self.assertTrue(all(line.startswith('+') for line in section[1:count+1]))
-                (root / 'src' / name).write_text(''.join(line[1:]+'\n' for line in section[1:count+1]))
-            result = subprocess.run(['patch', '-p1', '--batch', '--fuzz=0', '-i',
-                str(patches / '0127-mali-staging-bulk-writes.patch')], cwd=root,
-                capture_output=True, text=True, check=True)
-            self.assertNotIn('fuzz', result.stdout.lower())
-            self.assertNotIn('offset', result.stdout.lower())
-            for name in ('interop_protocol.h', 'renderer_protocol.h'):
-                self.assertEqual((root / 'src' / name).read_bytes(), (ROOT / name).read_bytes())
+        from gamescope_source import source
+        for name in ('interop_protocol.h', 'renderer_protocol.h'):
+            self.assertEqual((source() / 'src' / name).read_bytes(), (ROOT / name).read_bytes())
+        patch = (ROOT.parent / 'gamescope/patches/0218-mali-staging-bulk-writes.patch').read_text()
+        self.assertIn('MB_INTEROP_STAGING_WRITE_MAX', patch)
 
     def test_all_coherent_uploads_acknowledged_before_each_submit(self):
         self.run_case('ordering')

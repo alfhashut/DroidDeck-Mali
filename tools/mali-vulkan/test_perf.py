@@ -8,21 +8,22 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent
-PATCH = ROOT.parent / 'gamescope/patches/0121-mali-normal-wayland-session.patch'
+PATCH = ROOT.parent / 'gamescope/patches/0212-mali-optimized-normal-resources.patch'
 
 
 def added_file(patch, name):
-    section = patch.read_text().split('+++ b/src/' + name + '\n', 1)[1].split('\n--- a/', 1)[0]
-    lines = section.splitlines()
-    count = int(re.fullmatch(r'@@ -0,0 \+1,(\d+) @@', lines[0])[1])
-    assert len(lines[1:]) == count and all(line.startswith('+') for line in lines[1:])
-    return ''.join(line[1:] + '\n' for line in lines[1:])
+    from gamescope_source import source
+    return (source() / 'src' / name).read_text()
 
 
 class PerformanceTests(unittest.TestCase):
     def test_header_copies_and_wire_unchanged(self):
         for name in ('normal_api.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'mali_wait_profile.hpp', 'mali_staging_pool.hpp', 'mali_staging.inc', 'staging_api.h', 'normal_protocol.h', 'renderer_protocol.h', 'interop_protocol.h'):
-            self.assertEqual(added_file(PATCH, name), (ROOT / name).read_text(), name)
+            actual = added_file(PATCH, name)
+            if name == 'mali_staging.inc':
+                actual = re.sub(r'^\s*DDFrameScope \w+\([^;]+;\n', '', actual, flags=re.M)
+                actual = re.sub(r'^\s*trace(?:Wait|Map)\.finish\(\);\n', '', actual, flags=re.M)
+            self.assertEqual(actual, (ROOT / name).read_text(), name)
         self.assertNotIn('Performance', (ROOT / 'normal_protocol.h').read_text())
         local = (ROOT / 'interop_icd.h').read_text().split('proxy_DroidDeckPerformanceMALI', 1)[1].split('proxy_DroidDeckWaylandMALI', 1)[0]
         self.assertNotIn('interop_rpc(', local)  # Snapshots add no round trips.
@@ -128,8 +129,8 @@ int main(void) {
         self.assertIn('MALI_VULKAN_PERF_BASELINE', main)
         service = (ROOT.parents[1] / 'app/src/main/java/com/droiddeck/launcher/session/SessionService.kt').read_text()
         normal = service.split('private fun runMaliSession', 1)[1].split('private fun stopMaliGuest', 1)[0]
-        self.assertIn('extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_BASELINE=0" || it == "MALI_VULKAN_PERF_BASELINE=1" }', normal)
-        self.assertIn('extraEnv().lastOrNull { it == "MALI_VULKAN_PERF_HZ=30" || it == "MALI_VULKAN_PERF_HZ=60" }', normal)
+        self.assertIn("MaliSessionControls.environment(extraEnv())", normal)
+        self.assertIn('"MALI_VULKAN_PERF_HZ" to setOf("30", "60")', (ROOT.parents[1] / "app/src/main/java/com/droiddeck/launcher/gpu/MaliSessionControls.kt").read_text())
         self.assertNotIn('guest.addAll(extraEnv())', normal)
         present = added_file(PATCH, 'mali_normal.inc').split('int vulkan_mali_normal_present', 1)[1].split('int vulkan_mali_normal_stop', 1)[0]
         for required in ('ownership.acquire', 'ownership.ready', 'ownership.presented', 'DD_SYNC_EXPORT', 'DD_SYNC_WAIT', 'MB_NORMAL_PUBLISH', 'g_device.wait(*sequence, false)', 'g_device.wait(*sequence, true)'):
@@ -142,6 +143,7 @@ int main(void) {
         with tempfile.TemporaryDirectory(prefix='mali-pacing-') as directory:
             root = Path(directory)
             (root / 'mali_normal.hpp').write_text(added_file(PATCH, 'mali_normal.hpp'))
+            (root / 'frame_trace.h').write_text((ROOT / 'frame_trace.h').read_text())
             (root / 'test.cpp').write_text('''
 #include <cassert>
 #include <initializer_list>
@@ -176,12 +178,12 @@ int main() {
         # includes rendervulkan.cpp, Vulkan headers, the ICD, or native broker.
         with tempfile.TemporaryDirectory(prefix='mali-perf-') as directory:
             root = Path(directory)
-            for name in ('mali_normal_perf.inc', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'renderer_protocol.h', 'interop_protocol.h'):
+            for name in ('mali_normal_perf.inc', 'frame_trace.h', 'normal_perf.h', 'normal_opcode_perf.h', 'normal_wait_perf.h', 'renderer_protocol.h', 'interop_protocol.h'):
                 (root / name).write_text(added_file(PATCH, name))
             wrapper = (ROOT / 'icd_proxy.c').read_text().split('static VkResult rpc(struct proxy_instance *s,', 1)[1].split('static void proxy_free_logical', 1)[0]
             (root / 'rpc_metric.inc').write_text('static VkResult rpc(struct proxy_instance *s,' + wrapper)
             (root / 'normal_detail_perf.hpp').write_text((ROOT / 'normal_detail_perf.hpp').read_text())
-            (root / 'mali_output_pool.hpp').write_text(added_file(PATCH.with_name('0120-mali-persistent-session.patch'), 'mali_output_pool.hpp'))
+            (root / 'mali_output_pool.hpp').write_text(added_file(PATCH.with_name('0210-mali-persistent-session.patch'), 'mali_output_pool.hpp'))
             (root / 'test.cpp').write_text(r'''
 #include <cassert>
 #include <cstdio>
@@ -203,15 +205,17 @@ static int fake_clock_gettime(clockid_t clock, timespec *t) {
 #include "renderer_protocol.h"
 using VkResult = int;
 static constexpr int VK_SUCCESS = 0;
-struct proxy_instance { int perf_enabled = 1; dd_perf_rpc perf{}; };
+struct proxy_instance { int perf_enabled = 1; dd_perf_rpc perf{}; uint64_t trace_upload_completed = 0; };
 static int exchangeResult;
 static VkResult rpc_exchange(proxy_instance *, uint32_t, const uint8_t *, uint32_t, uint8_t *, uint32_t *, uint32_t) {
     fakeNow += 1000; return exchangeResult;
 }
 static uint32_t mb_get_u32(const uint8_t *p) { return p[0] | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; }
+#define MB_NORMAL_BEGIN 87u
 #include "rpc_metric.inc"
 #define VK_TRUE 1
 #define MB_NORMAL_STATS 91u
+#define MB_NORMAL_BEGIN 87u
 #define MB_NORMAL_PUBLISH 89u
 static dd_perf_rpc pending;
 static bool maliWaitProfilingActive;
@@ -232,6 +236,8 @@ static int NormalRPC(unsigned op, int, dd_normal_output *) {
 }
 static bool MaliResult(int result, const char *) { return result == 0; }
 static void MaliRequire(bool ok, const char *) { assert(ok); }
+#include "frame_trace.h"
+extern "C" void dd_ft_event(dd_ft_stage, dd_ft_id, uint64_t, uint64_t, int32_t, int) {}
 #include "mali_normal_perf.inc"
 int main() {
     dd_perf_rpc a{}, b{}; dd_perf_add(&a, 41, 3); dd_perf_add(&a, 41, 9);

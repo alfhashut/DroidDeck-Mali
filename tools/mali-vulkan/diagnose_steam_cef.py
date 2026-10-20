@@ -94,7 +94,7 @@ def processes(client):
 
 
 def run():
-    from run_panvk_phone_test_impl import client_environment
+    from steam_client_environment import client_environment
     client = client_environment()
     emit('CEF-argv-audit', dict(time=time.strftime('%Y-%m-%d %H:%M:%S %z'), display=client['DISPLAY'],
                               graphics_calls=0, session_changes=False))

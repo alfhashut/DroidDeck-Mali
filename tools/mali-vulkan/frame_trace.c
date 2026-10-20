@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 #ifndef DD_FT_ROOT
-#define DD_FT_ROOT "/storage/emulated/0/Download/DroidDeckFrameTrace"
+#define DD_FT_ROOT NULL
 #endif
 #ifndef DD_FT_CAPACITY
 #define DD_FT_CAPACITY 65536u
@@ -77,6 +77,7 @@ static unsigned dd_ft_used, dd_ft_enabled, dd_ft_running, dd_ft_stop, dd_ft_drop
 static uint64_t dd_ft_run, dd_ft_start, dd_ft_end, dd_ft_last_run, dd_ft_ready_ns;
 static unsigned dd_ft_cpu_stride = 8;
 static const char *dd_ft_role;
+static char dd_ft_root[400];
 static __thread uint32_t dd_ft_tid;
 static uint64_t dd_ft_scope_sequence;
 uint64_t dd_ft_new_scope(void) { return __atomic_add_fetch(&dd_ft_scope_sequence, 1, __ATOMIC_RELAXED); }
@@ -122,7 +123,7 @@ static void dd_ft_dump(int complete) {
     }
     pthread_mutex_lock(&dd_ft_lock);
     char path[512];
-    snprintf(path, sizeof(path), DD_FT_ROOT "/trace-%" PRIu64 "-%d-%s.jsonl", dd_ft_run, (int)getpid(), dd_ft_role);
+    snprintf(path, sizeof(path), "%s/trace-%" PRIu64 "-%d-%s.jsonl", dd_ft_root, dd_ft_run, (int)getpid(), dd_ft_role);
     FILE *file = fopen(path, "wx");
     if (file) {
         fprintf(file, "{\"type\":\"header\",\"version\":1,\"run\":%" PRIu64 ",\"pid\":%d,\"role\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"start_ns\":%" PRIu64 ",\"end_ns\":%" PRIu64 ",\"cpu_stride\":%u,\"capacity\":%u,\"ready_ns\":%" PRIu64 "}\n",
@@ -144,16 +145,18 @@ static void *dd_ft_worker(void *unused) {
     (void)unused;
     dd_ft_records = (struct dd_ft_record *)calloc(DD_FT_CAPACITY, sizeof(*dd_ft_records));
     if (!dd_ft_records) return NULL;
-    char path[512]; snprintf(path, sizeof(path), DD_FT_ROOT "/ready-%d-%s", (int)getpid(), dd_ft_role);
+    char path[512]; snprintf(path, sizeof(path), "%s/ready-%d-%s", dd_ft_root, (int)getpid(), dd_ft_role);
     FILE *ready = fopen(path, "w");
     if (ready) { fprintf(ready, "version=1 pid=%d role=%s\n", (int)getpid(), dd_ft_role); fclose(ready); }
     while (!__atomic_load_n(&dd_ft_stop, __ATOMIC_ACQUIRE)) {
         uint64_t now = dd_ft_now(CLOCK_MONOTONIC);
         if (dd_ft_active() && now >= dd_ft_end) dd_ft_dump(1);
-        if (access(DD_FT_ROOT "/armed", F_OK)) break;
+        char armed[512]; snprintf(armed, sizeof(armed), "%s/armed", dd_ft_root);
+        if (access(armed, F_OK)) break;
         if (!dd_ft_active()) {
             uint64_t run = 0, start = 0, end = 0; unsigned stride = 0; char extra;
-            FILE *control = fopen(DD_FT_ROOT "/control", "r");
+            char control_path[512]; snprintf(control_path, sizeof(control_path), "%s/control", dd_ft_root);
+            FILE *control = fopen(control_path, "r");
             int n = control ? fscanf(control, "%" SCNu64 " %" SCNu64 " %" SCNu64 " %u %c", &run, &start, &end, &stride, &extra) : 0;
             if (control) fclose(control);
             if (n == 4 && run && run != dd_ft_last_run && stride && stride <= 64 &&
@@ -173,9 +176,14 @@ static void *dd_ft_worker(void *unused) {
 }
 void dd_ft_init(const char *role) {
     /* Startup-only arm marker. No polling thread exists in default sessions. */
-    if (access(DD_FT_ROOT "/armed", F_OK)) return;
+    const char *root = getenv("DROIDDECK_FRAME_TRACE_DIR");
+    if (!root || !*root) root = DD_FT_ROOT;
+    if (!root || root[0] != '/' || strlen(root) >= sizeof(dd_ft_root)) return;
+    char armed[512]; snprintf(armed, sizeof(armed), "%s/armed", root);
+    if (access(armed, F_OK)) return;
     unsigned expected = 0;
     if (!__atomic_compare_exchange_n(&dd_ft_running, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
+    snprintf(dd_ft_root, sizeof(dd_ft_root), "%s", root);
     dd_ft_role = role; __atomic_store_n(&dd_ft_stop, 0, __ATOMIC_RELEASE);
     if (pthread_create(&dd_ft_thread, NULL, dd_ft_worker, NULL)) __atomic_store_n(&dd_ft_running, 0, __ATOMIC_RELEASE);
 }

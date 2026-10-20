@@ -378,9 +378,9 @@ class LogTail:
 
 
 def run(seconds, swap_details=False, client_affinity=None, frame_details=False):
-    from run_panvk_phone_test_impl import client_environment
+    from steam_client_environment import client_environment
     client = client_environment()
-    os.environ.update({key: client[key] for key in ('DISPLAY', 'XAUTHORITY') if key in client})
+    os.environ.update({key: client[key] for key in ('DISPLAY', 'XAUTHORITY', 'DROIDDECK_FRAME_TRACE_DIR') if key in client})
     initial = processes()
     emit('perf-metadata', dict(seconds=seconds, hz=os.sysconf('SC_CLK_TCK'),
          clock='monotonic_ns; trace ts is Chromium microseconds; XDamage timestamp is X server milliseconds',

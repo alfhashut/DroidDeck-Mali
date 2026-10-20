@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-session'
-PATCH = ROOT / 'tools/gamescope/patches/0124-mali-steam-xwayland-client.patch'
+PATCH = ROOT / 'tools/gamescope/patches/0215-mali-steam-xwayland-client.patch'
 
 
 def added_source(patch, name):
@@ -171,34 +171,7 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
             BL_DESKTOP='1', BL_LOSSLESS_OWNED='1', BL_STEAMDECK='0', BL_ADDED_GAMES='',
             XDG_DATA_HOME=str(home / '.local/share'), XDG_CONFIG_HOME=str(home / '.config'),
             XDG_CACHE_HOME=str(home / '.cache'), BL_CLIENT_CPUS='')
-        if experimental:
-            helper = self.bin / 'droiddeck-steam-client-panvk'
-            helper.write_bytes((ROOT / 'tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-client-panvk').read_bytes())
-            target = home / 'panvk-test' / ('a' * 64)
-            target.mkdir(parents=True)
-            native = bytearray(20)
-            native[:6] = b'\x7fELF\x02\x01'
-            struct.pack_into('<H', native, 18, 183)
-            for path in (target / 'libvulkan_panfrost.so', steam / 'steamrtarm64/libEGL.so',
-                         steam / 'steamrtarm64/libGLESv2.so', steam / 'steamrtarm64/libvulkan.so'):
-                path.write_bytes(native)
-            (target / 'panvk-local.json').write_text(json.dumps({'file_format_version': '1.0.1', 'ICD': {
-                'library_path': './libvulkan_panfrost.so', 'api_version': '1.3.354', 'library_arch': '64'}}))
-            script = target / 'probe_steam_angle.py'
-            script.write_bytes((ROOT / 'tools/mali-vulkan/probe_steam_angle.py').read_bytes())
-            import hashlib
-            self.shared_config = self.root / 'shared-client-config.json'
-            self.shared_config.write_text(json.dumps({'version': 1, 'atom_stride': '56',
-                'target': str(target), 'steam_root': str(steam), 'angle_dir': str(steam / 'steamrtarm64'),
-                'probe_sha256': hashlib.sha256(script.read_bytes()).hexdigest(),
-                'driver_sha256': hashlib.sha256((target / 'libvulkan_panfrost.so').read_bytes()).hexdigest()}))
-            pointer = home / '.config/droiddeck/steam-client-panvk.json'
-            pointer.parent.mkdir(parents=True)
-            pointer.symlink_to(self.shared_config)
-            # Model Gamescope's existing post-fork client isolation accurately.
-            self.inner_env.update(MALI_VULKAN_NORMAL_SESSION='', MALI_VULKAN_BROKER_SOCKET='',
-                VK_DRIVER_FILES='', VK_ICD_FILENAMES='', LIBGL_ALWAYS_SOFTWARE='1',
-                MESA_LOADER_DRIVER_OVERRIDE='swrast', GALLIUM_DRIVER='llvmpipe')
+
         result = self.run_session(env=self.inner_env)
         return result, json.loads((self.root / 'calls.json').read_text())
 
@@ -209,12 +182,12 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
         for args in calls:
             self.assertIn('-gamepadui', args)
             self.assertIn('-cef-use-angle=gl', args)
-            self.assertEqual(args[args.index('-clientbeta') + 1], 'publicbeta')
+            self.assertEqual(args[args.index('-clientbeta') + 1], 'steamdeck_publicbeta')
             self.assertNotIn('-cef-use-angle=vulkan', args)
             self.assertFalse(any(x.startswith('steam://') for x in args))
         self.assertFalse((self.root / 'forbidden').exists())
-        self.assertIn('Steam bootstrap result=0', result.stdout)
-        self.assertEqual(result.stdout.count('ARM64 Steam process pid='), 2)
+        self.assertIn('Steam client ready', result.stdout)
+        self.assertEqual(result.stdout.count('starting the Steam client'), 2)
         self.assertIn('steam exited rc=42', result.stdout)
         self.assertTrue((self.root / 'home/.bl-proton-extra').exists())
 
@@ -222,44 +195,30 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
         # Isolate the real argument selection; ordinary game-helper lifetimes
         # are unrelated to C8A and are deliberately not started by this test.
         text = SCRIPT.read_text()
-        selection = text.split('    _bl_graphics=', 1)[1].split('    echo "== steam args:', 1)[0]
-        result = subprocess.run(['bash', '-uc', '_bl_graphics=' + selection + '\nprintf "%s\\n" "${_bl_graphics[@]}"'],
+        selection = '    _bl_cef=' + text.split('    _bl_cef=', 1)[1].split('    if [ "${BL_STEAM_UI:-}" != desktop ]; then', 1)[0]
+        result = subprocess.run(['bash', '-uc', selection + '\nprintf "%s\\n" "${_bl_cef[@]}"'],
             env=self.env | {'BL_MALI_STEAM_UI': '0'}, capture_output=True, text=True, timeout=2)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ['-no-cef-sandbox', '-cef-force-gpu',
-            '-cef-ozone-platform=x11', '-cef-use-gl=angle', '-cef-use-angle=vulkan'])
+        self.assertEqual(result.stdout.splitlines(), ['-cef-force-gpu', '-cef-use-gl=angle', '-cef-use-angle=vulkan'])
 
-    def test_experimental_client_restart_is_isolated_and_shared_config_removal_restores_c8a(self):
-        result, calls = self.inner(exits=(42, 0), experimental=True)
+    def test_existing_client_config_cannot_enable_panvk_in_the_software_child(self):
+        config = self.root / 'home/.config/droiddeck/steam-client-panvk.json'
+        config.parent.mkdir(parents=True)
+        config.write_text('this old config must never be read')
+        result, calls = self.inner()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(calls), 2)
-        envs = json.loads((self.root / 'client-envs.json').read_text())
-        for args, env in zip(calls, envs):
-            self.assertIn('-cef-use-vulkan', args)
-            self.assertFalse(any(arg.startswith(('-cef-use-angle', '-cef-use-gl')) for arg in args))
-            self.assertEqual(env['PANVK_ATOM_STRIDE'], '56')
-            self.assertEqual(env['ANGLE_DEFAULT_PLATFORM'], 'vulkan')
-            self.assertIsNone(env['LIBGL_ALWAYS_SOFTWARE'])
-        self.assertFalse((self.root / 'forbidden').exists())
-        self.assertIn('UI acceleration UNPROVEN', result.stdout)
-        self.shared_config.unlink()
-        fallback = self.run_session(env=self.inner_env)
-        self.assertEqual(fallback.returncode, 0, fallback.stdout + fallback.stderr)
-        last = json.loads((self.root / 'client-envs.json').read_text())[-1]
-        self.assertIsNone(last['PANVK_ATOM_STRIDE'])
-        self.assertEqual(last['LIBGL_ALWAYS_SOFTWARE'], '1')
-        self.assertIn('acceleration disabled; C8A', fallback.stdout)
-        self.assertIn('-cef-use-angle=gl', json.loads((self.root / 'calls.json').read_text())[-1])
+        self.assertIn('-cef-use-angle=gl', calls[0])
+        environments = json.loads((self.root / 'client-envs.json').read_text())
+        self.assertEqual(len(environments), 1)
+        self.assertEqual(environments[0]['LIBGL_ALWAYS_SOFTWARE'], '1')
+        self.assertIsNone(environments[0]['VK_DRIVER_FILES'])
+        self.assertIsNone(environments[0]['PANVK_ATOM_STRIDE'])
 
-    def test_experimental_client_uses_existing_clean_stop_without_exporting_panvk_to_the_watcher(self):
-        result, calls = self.inner(graceful=True, experimental=True)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(calls[1], ['-shutdown'])
-        envs = json.loads((self.root / 'client-envs.json').read_text())
-        self.assertEqual(envs[0]['PANVK_ATOM_STRIDE'], '56')
-        self.assertIsNone(envs[1]['PANVK_ATOM_STRIDE'])
-        self.assertEqual(envs[1]['LIBGL_ALWAYS_SOFTWARE'], '1')
-        self.assertIn('the app asked for a clean exit', result.stdout)
+    def test_mali_does_not_silently_start_the_x86_client(self):
+        result = self.run_session(env={'BL_STEAM_CLIENT_ARCH': 'x86_64'})
+        self.assertEqual(result.returncode, 66, result.stdout + result.stderr)
+        self.assertIn('requires the ARM64 Steam client', result.stdout)
+        self.assertNotIn('ARGV=', result.stdout)
 
     def test_real_stop_mailbox_and_second_launch_reuse_existing_client(self):
         result, calls = self.inner(graceful=True)
@@ -271,7 +230,7 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
         second = self.run_session(env=self.inner_env)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(binary.read_bytes(), saved)
-        self.assertIn('ARM64 Steam process pid=', second.stdout)
+        self.assertIn('starting the Steam client', second.stdout)
         self.assertNotIn('PASS', second.stdout)
 
     def test_steam_failure_propagates_no_success_claim(self):
@@ -284,12 +243,9 @@ sys.exit(exits[min(len(calls)-1,len(exits)-1)])
 
     def test_xwm_patch_and_renderer_boundary(self):
         # Apply to the exact existing added source; no download, compiler or project build.
-        before = added_source(ROOT / 'tools/gamescope/patches/0121-mali-normal-wayland-session.patch', 'src/mali_normal.cpp')
-        source = self.root / 'src'
-        source.mkdir()
-        (source / 'mali_normal.cpp').write_text(before)
-        subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i', str(PATCH)], cwd=self.root,
-                       capture_output=True, text=True, check=True)
+        from gamescope_source import source as patched
+        before = (patched('0214-mali-upload-ring-ranges.patch') / 'src/mali_normal.cpp').read_text()
+        source = patched('0215-mali-steam-xwayland-client.patch') / 'src'
         after = (source / 'mali_normal.cpp').read_text()
         self.assertLess(after.index('!StartX11(compositor)'), after.index('server.child = fork()'))
         self.assertIn('"VK_DRIVER_FILES", "VK_ICD_FILENAMES", "BL_VK_DRIVER"', after)

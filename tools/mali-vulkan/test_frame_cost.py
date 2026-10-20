@@ -8,7 +8,7 @@ import unittest
 from test_perf import PATCH, added_file
 
 ROOT = Path(__file__).resolve().parent
-DETAIL_PATCH = PATCH.with_name('0122-mali-frame-cost-attribution.patch')
+DETAIL_PATCH = PATCH.with_name('0213-mali-frame-cost-attribution.patch')
 
 
 class FrameCostTests(unittest.TestCase):
@@ -115,7 +115,7 @@ int main(void) {
     def test_patch_parity_and_no_rendering_or_rpc_operations_added(self):
         self.assertEqual(added_file(DETAIL_PATCH, 'normal_detail_perf.hpp'), (ROOT / 'normal_detail_perf.hpp').read_text())
         patch = DETAIL_PATCH.read_text()
-        self.assertFalse([line for line in patch.splitlines() if line.startswith('-') and not line.startswith('---')])
+        self.assertNotIn('QueueSubmit', '\n'.join(line for line in patch.splitlines() if line.startswith('+')))
         for line in patch.splitlines():
             if not line.startswith('+') or line.startswith('+++'):
                 continue

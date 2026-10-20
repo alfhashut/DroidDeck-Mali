@@ -18,13 +18,22 @@ fi
 
 # Mali is an isolated normal session. The explicit environment was verified by
 # the Android service; failures never fall through to Turnip or Steam setup.
-if [ "$mode" = mali-wayland ]; then
+if [ "$mode" = mali-wayland ] || { [ "$mode" = steam ] && [ "${BL_MALI_STEAM_UI:-0}" = 1 ] && [ -z "${BL_INSIDE:-}" ]; }; then
   [ "${MALI_VULKAN_NORMAL_SESSION:-}" = 1 ] || { echo 'Mali normal session environment missing'; exit 65; }
   [ "${WAYLAND_DISPLAY:-}" = wayland-0 ] || { echo 'Mali outer Wayland socket must be wayland-0'; exit 65; }
   [ -S "${XDG_RUNTIME_DIR:?}/wayland-0" ] || { echo 'Android Wayland compositor socket is not ready'; exit 65; }
   [ -S "${MALI_VULKAN_BROKER_SOCKET:?}" ] || { echo 'Mali broker socket disappeared after readiness handshake'; exit 65; }
   [ -s "${VK_ICD_FILENAMES:?}" ] && [ "${VK_DRIVER_FILES:-}" = "$VK_ICD_FILENAMES" ] || { echo 'Mali proxy manifest missing'; exit 65; }
   [ "${MALI_VULKAN_SHARED_STAGING:-0}" = 0 ] || { echo 'Mali shared staging is disabled'; exit 65; }
+  if [ "$mode" = steam ] && [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
+    [ "${BL_STEAM_CLIENT_ARCH:-arm64}" = arm64 ] || { echo 'Mali software compatibility requires the ARM64 Steam client'; exit 66; }
+    command -v Xwayland >/dev/null 2>&1 || { echo 'Mali Steam compatibility unavailable: Xwayland missing'; exit 66; }
+    [ -r /usr/lib/dri/swrast_dri.so ] || { echo 'Mali Steam compatibility unavailable: Mesa software GL (swrast_dri.so) missing'; exit 66; }
+    step 'Steam session selected; Mali Vulkan/AHB backend; ARM64 software client'
+    export BL_INSIDE=1
+    exec gamescope --backend wayland --mali-wayland-session --mali-xwayland --expose-wayland -f \
+      -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- "$0" steam "$@"
+  fi
   step 'Mali GPU support (experimental): normal nested Wayland session; no Steam'
   exec gamescope --backend wayland --mali-wayland-session --expose-wayland -f \
     -W "${BL_WIDTH:?}" -H "${BL_HEIGHT:?}" -- /usr/local/bin/gamescope --mali-interactive-client
@@ -362,6 +371,12 @@ case $mode in
     steam_x64=0
     [ "${BL_STEAM_CLIENT_ARCH:-}" = x86_64 ] && steam_x64=1
     steam_cef_gpu=1
+    if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
+      [ "$steam_x64" = 0 ] || { echo 'Mali software compatibility requires the ARM64 Steam client'; exit 66; }
+      unset VK_DRIVER_FILES VK_ICD_FILENAMES BL_VK_DRIVER MALI_VULKAN_BROKER_SOCKET
+      unset MALI_VULKAN_NORMAL_SESSION MALI_VULKAN_RENDERER_TEST MALI_VULKAN_AHB_TEST MALI_VULKAN_SHARED_STAGING
+      export LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=swrast GALLIUM_DRIVER=llvmpipe
+    fi
     if [ "$steam_x64" = 1 ]; then
       step "checking the Steam client's arm64 parts (first run downloads them, ~1-2 min)"
       # droiddeck-steam-install removes the repair request: read it first so Repair Steam covers both clients.
@@ -396,7 +411,7 @@ case $mode in
         echo ge >> "$HOME/.bl-proton-extra"
       fi
     fi
-    if [ -s "$HOME/.bl-proton-extra" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -s "$HOME/.bl-proton-extra" ]; then
       _bl_left=$HOME/.bl-proton-extra.left
       : > "$_bl_left"
       _bl_got_proton=0
@@ -416,7 +431,7 @@ case $mode in
         droiddeck-steam-x64 --prepare || true
       fi
     fi
-    if [ -s "$HOME/.bl-steam-urls" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ -s "$HOME/.bl-steam-urls" ]; then
       while read -r _bl_url || [ -n "$_bl_url" ]; do
         case ${_bl_url# } in steam://*) ;; *) continue ;; esac
         step "asking the client for $_bl_url"
@@ -488,8 +503,10 @@ case $mode in
     if [ "$steam_x64" = 0 ]; then
     step "registering the app's game library with Steam"
     droiddeck-steam-library "$steam_root" || true
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ]; then
     step "setting up the ARM64 Proton compatibility tool"
     steam-compatibility "$steam_root" || true
+    fi
     if [ -z "${BL_DESKTOP:-}" ] && [ "${BL_STEAM_UI:-}" != desktop ]; then
       droiddeck-steam-ui-scale "$steam_root" "${BL_WIDTH:-1280}" "${BL_HEIGHT:-720}" || true
     fi
@@ -497,7 +514,7 @@ case $mode in
       step "adding the app's own games to the client's library"
       droiddeck-steam-shortcuts "$steam_root" "$BL_ADDED_GAMES" || true
     fi
-    droiddeck-seed-redists "$steam_root" || true
+    [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || droiddeck-seed-redists "$steam_root" || true
     else
     _bl_x64_tool=$(droiddeck-steam-x64 --default-tool)
     if [ -n "$_bl_x64_tool" ]; then
@@ -513,7 +530,7 @@ case $mode in
     fi
     droiddeck-seed-redists "$steam_root" || true
     fi
-    if [ "$steam_x64" = 0 ] && [ ! -f "$steam_root/steamapps/appmanifest_4427310.acf" ]; then
+    if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ "$steam_x64" = 0 ] && [ ! -f "$steam_root/steamapps/appmanifest_4427310.acf" ]; then
       step "asking the client to fetch the ARM64 Proton"
       set -- "$@" steam://install/4427310
       (
@@ -673,6 +690,7 @@ case $mode in
       fi
     fi
     if [ -s "$HOME/.bl-autolaunch" ]; then
+      if [ "${BL_MALI_STEAM_UI:-0}" != 1 ]; then
       _bl_app=$(cat "$HOME/.bl-autolaunch")
       case $_bl_app in
         steam://*) _bl_url=$_bl_app ;;
@@ -680,6 +698,7 @@ case $mode in
       esac
       echo "== autolaunch $_bl_url"
       set -- "$@" "$_bl_url"
+      fi
     fi
     if command -v dbus-daemon >/dev/null 2>&1 && command -v droiddeck-netmanager >/dev/null 2>&1; then
       mkdir -p /run/dbus /usr/local/share/droiddeck
@@ -783,10 +802,14 @@ BUSCONF
       echo "== steam: devtools port $BL_CDP_PORT, guest processes only"
     fi
     [ -n "${BL_LAUNCH_DIR:-}" ] && mkdir -p "$BL_LAUNCH_DIR/agent" && echo "$BL_CDP_PORT" > "$BL_LAUNCH_DIR/agent/cdp-port"
-    [ "$steam_x64" = 1 ] || "${_bl_compat_env[@]}" droiddeck-steam-compat "$steam_root" 2>&1 &
+    [ "$steam_x64" = 1 ] || [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || "${_bl_compat_env[@]}" droiddeck-steam-compat "$steam_root" 2>&1 &
     _bl_ui=(-gamepadui)
     [ "${BL_STEAM_UI:-}" = desktop ] && _bl_ui=()
     _bl_cef=(-cef-force-gpu -cef-use-gl=angle -cef-use-angle=vulkan)
+    if [ "${BL_MALI_STEAM_UI:-0}" = 1 ]; then
+      _bl_cef=(-cef-force-gpu -cef-use-gl=angle -cef-use-angle=gl)
+      echo '== Mali Steam client graphics: ANGLE/OpenGL on Mesa llvmpipe; Gamescope retains Mali Vulkan/AHB'
+    fi
     [ "${steam_cef_gpu:-1}" = 1 ] || _bl_cef=(-cef-disable-gpu)
     if [ "${BL_DESKTOP:-}" = 1 ] && [ "${BL_STEAM_UI:-}" = desktop ]; then
       _bl_cef=(-cef-disable-gpu)
@@ -795,8 +818,8 @@ BUSCONF
     if [ "${BL_STEAM_UI:-}" != desktop ]; then
       if [ "$steam_x64" = 0 ] || [ "${BL_X64_DECK:-1}" != 0 ]; then
         _bl_ui+=(-steamdeck -steamos3)
-        export STEAM_GAMESCOPE_NIS_SUPPORTED=1
-        export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
+        [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || export STEAM_GAMESCOPE_NIS_SUPPORTED=1
+        [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
         echo "== steam: Deck mode on (-steamdeck -steamos3)"
       fi
     fi
@@ -1055,7 +1078,7 @@ BUSCONF
             _bl_pinned[$_p]=${#_t[@]}
           done
         fi
-        if [ "$beat" -le 720 ] && [ "$((beat % 3))" -eq 0 ] && { [ -z "$library_job" ] || ! kill -0 "$library_job" 2>/dev/null; }; then
+        if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ "$beat" -le 720 ] && [ "$((beat % 3))" -eq 0 ] && { [ -z "$library_job" ] || ! kill -0 "$library_job" 2>/dev/null; }; then
           libraries=("$steam_root/steamapps" /mnt/droiddeck/steamapps /mnt/droiddeck-sd/steamapps /root/Games/*/steamapps)
           seed=; compat=
           seed_due && seed=1
@@ -1093,7 +1116,7 @@ BUSCONF
             "${steam_client[@]}" -shutdown >/dev/null 2>&1 || true
           fi
         fi
-        if [ "$lossless_left" -gt 0 ] && [ "$((beat % 6))" -eq 0 ] && { [ -z "$lossless_job" ] || ! kill -0 "$lossless_job" 2>/dev/null; }; then
+        if [ "${BL_MALI_STEAM_UI:-0}" != 1 ] && [ "$lossless_left" -gt 0 ] && [ "$((beat % 6))" -eq 0 ] && { [ -z "$lossless_job" ] || ! kill -0 "$lossless_job" 2>/dev/null; }; then
           lossless_left=$((lossless_left - 1))
           if [ -e "$lossless_owned" ] || [ -e "$lossless_asked" ]; then
             lossless_left=0
@@ -1237,7 +1260,7 @@ BUSCONF
       fi
       _bl_jobs=$(jobs -p)
       [ -n "$_bl_jobs" ] && kill $_bl_jobs 2>/dev/null
-      reap_orphans
+      [ "${BL_MALI_STEAM_UI:-0}" = 1 ] || reap_orphans
     fi
     if [ -n "${BL_STEAM_EXIT_FILE:-}" ]; then
       printf '%s\n' "$rc" > "$BL_STEAM_EXIT_FILE"

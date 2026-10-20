@@ -72,21 +72,30 @@ The Mali diagnostic patches follow all 0.5 patches in filename order. Their orig
 | `0204-vulkan-memory-ahb-tests.patch` | 0117 | Independent buffer/image/AHB diagnostics |
 | `0205-vulkan-gamescope-renderer-tests.patch` | 0118 | Explicit renderer initialization and first-frame diagnostics |
 | `0206-vulkan-blit-input-proof.patch` | 0119 | Same-image pixel/readback proof |
-
 | `0210-mali-persistent-session.patch` | 0120 | Persistent renderer/output ownership and nested SHM client diagnostics |
 | `0211-mali-normal-wayland-session.patch` | 0121 | Normal single-client nested Wayland session with broker AHB-only output |
+| `0212-mali-optimized-normal-resources.patch` | final 0121 | Persistent staging, completed watermark, upload dependencies, final normal performance controls |
+| `0213-mali-frame-cost-attribution.patch` | 0122 | Exclusive frame/SHM/render costs and wait attribution |
+| `0214-mali-upload-ring-ranges.patch` | 0123 | Modified upload ranges with conservative fallback |
+| `0215-mali-steam-xwayland-client.patch` | 0124 | Dedicated Xwayland child group, SHM surfaces, isolated software Steam client |
+| `0216-mali-steam-x11-presentation-diagnostics.patch` | 0125 | Opt-in X11 surface/presentation evidence |
+| `0217-mali-frame-trace.patch` | 0126 | Bounded opt-in frame journal, explicit identities and dropped-record accounting |
+| `0218-mali-staging-bulk-writes.patch` | 0127 | Coordinated 2 MiB persistent-staging write bound; shader bound unchanged |
 
-All 11 upstream 0.5 patches and diagnostic patches 0200–0206 retain their exact bytes.
-The two new patches are regenerated against their complete result on Gamescope 3.16.29.
+All 20 patches through 0211 retain their exact bytes. Phase 4 adds only 0212–0218,
+regenerated against their complete preceding stack on Gamescope 3.16.29.
 The old 0120 header insertion is omitted because 0204 already supplies the canonical
 `interop_test_api.h`. The normal-session starting point is reference commit `7fd567ad`,
-before later shared-staging, upload/performance, Steam, and frame-journal additions.
-Its touch-down guard is merged into 0.5's existing touch tracking; ordinary cursor,
-touch, and pointer-warp code remains in place. Current canonical normal ABI headers
-are copied verbatim; their unused performance declarations do not enable instrumentation.
+preserved in 0211. Its touch-down guard is merged into 0.5's existing touch tracking;
+ordinary cursor, touch, and pointer-warp code remains in place. Overlay 0212 advances
+that core to the final reference 0121 implementation at `3e1d9255`, retaining the ABI
+headers already installed by Phase 3. Overlays 0213–0218 complete the coordinated
+final implementation. Intermediate protocol headers in 0212 are advanced by 0218;
+the complete stack matches the existing Phase 1 broker/proxy headers byte for byte.
+These seven overlays must ship together.
 
 Filename order is the application order: 0002, 0009, 0019, 0020, 0100, 0101, 0110,
-0111, 0112, 0114, 0115, 0200–0206, 0210, 0211. `test_phase3.py` applies the entire
+0111, 0112, 0114, 0115, 0200–0206, 0210–0218. `test_phase3.py` applies the entire
 stack with zero fuzz, checks that every Mali hunk has zero offset, verifies protocol/header
 parity, and executes the actual output-pool state machine. The normal child receives
 its nested Wayland socket without the compositor's private proxy/broker environment.
@@ -94,10 +103,23 @@ Producer SYNC_FD completion precedes publication; MB_NORMAL_END must acknowledge
 Android releases before output resources are destroyed. Release failure retains
 allocations and fails the session.
 
-`check-diagnostics.sh` checks thirteen command markers and, on the ARM64 builder,
+The native journal uses `DROIDDECK_FRAME_TRACE_DIR`, supplied by the current app's
+private log directory. There is no Download-directory fallback. Its compiled-in root
+override exists only for isolated host tests. No journal worker runs without an arm
+marker at normal-session startup. Android callback identities are immutable snapshots;
+callback threads never look up compositor buffers. Submit wall time is not GPU execution,
+Android latch is not scanout, and any dropped records invalidate exact decomposition.
+
+0215 retains Phase 3's unconditional removal of private proxy/broker variables from
+every nested client. Only Gamescope uses the Mali proxy; Xwayland and ARM64 Steam use
+Mesa software GL/SHM. PanVK, CEF Vulkan acceleration and shared CPU staging remain off.
+
+`check-diagnostics.sh` checks thirteen command markers plus the Xwayland and optimized
+private-API markers, including in same-run artifact overlays. On the ARM64 builder it
 requires independent diagnostics/persistent probes to fail with a missing ICD and
 requires normal-session entry to fail without its isolated launch environment. This
 smoke test does not prove real presentation. The existing cursor-routing test,
 source fingerprint, same-run artifact overlay, and runtime SONAME audit remain.
-No Steam/Xwayland client bridge, PanVK integration, shared CPU staging, or later
-performance/frame-journal patch is included.
+The Phase 4 host runner exercises the actual small staging/registry/transport/journal
+implementations and software launch script. Full Gamescope compilation and real
+Mali/Android presentation remain CI/device checks. See `docs/development/mali-phase4.md`.

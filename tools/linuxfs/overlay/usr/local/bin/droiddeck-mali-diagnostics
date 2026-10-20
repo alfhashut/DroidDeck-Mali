@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+action=${1:?usage: droiddeck-mali-diagnostics perf|cef|x11|journal|analyze-journal|analyze-frames [arguments]}
+shift
+case $action in
+  perf) script=diagnose_steam_perf.py ;;
+  cef) script=diagnose_steam_cef.py ;;
+  x11) script=diagnose_steam_x11.py ;;
+  journal) script=capture_frame_journal.py ;;
+  analyze-journal) script=analyze_frame_journal.py ;;
+  analyze-frames) script=analyze_steam_frames.py ;;
+  *) echo "Unknown Mali diagnostic: $action" >&2; exit 64 ;;
+esac
+unset VK_DRIVER_FILES VK_ICD_FILENAMES BL_VK_DRIVER MALI_VULKAN_BROKER_SOCKET
+unset MALI_VULKAN_NORMAL_SESSION MALI_VULKAN_RENDERER_TEST MALI_VULKAN_AHB_TEST MALI_VULKAN_SHARED_STAGING
+export LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=swrast GALLIUM_DRIVER=llvmpipe
+exec python3 -B "/usr/local/share/droiddeck/mali-vulkan/$script" "$@"

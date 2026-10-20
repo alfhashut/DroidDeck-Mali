@@ -45,6 +45,7 @@ object SessionFiles {
             "libblaudit.so" to "usr/local/lib/libblaudit.so",
             "libssbs.so" to "usr/local/lib/libssbs.so",
             "usr/local/bin/droiddeck-session" to "usr/local/bin/droiddeck-session",
+            "usr/local/bin/droiddeck-mali-diagnostics" to "usr/local/bin/droiddeck-mali-diagnostics",
             "usr/local/bin/droiddeck-fonts" to "usr/local/bin/droiddeck-fonts",
             "usr/local/bin/droiddeck-agent" to "usr/local/bin/droiddeck-agent",
             "usr/local/bin/steam-compatibility" to "usr/local/bin/steam-compatibility",
@@ -137,7 +138,21 @@ object SessionFiles {
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }
-        val all = (if (DesktopCatalog.desktopInstalled(root)) files + DESKTOP_FILES else files) + optional
+        val maliDiagnostics = listOf(
+            "diagnose_steam_perf.py",
+            "diagnose_steam_cef.py",
+            "diagnose_steam_x11.py",
+            "steam_affinity.py",
+            "steam_frame_details.py",
+            "steam_frame_journal.py",
+            "steam_swap_details.py",
+            "steam_client_environment.py",
+            "capture_frame_journal.py",
+            "analyze_frame_journal.py",
+            "analyze_steam_frames.py",
+            "summarize_affinity.py",
+        ).map { "usr/local/share/droiddeck/mali-vulkan/$it" to "usr/local/share/droiddeck/mali-vulkan/$it" }
+        val all = (if (DesktopCatalog.desktopInstalled(root)) files + DESKTOP_FILES else files) + optional + maliDiagnostics
         for ((asset, relative) in all) {
             val target = File(root, relative)
             val staged = File(target.parentFile, target.name + ".staged")
