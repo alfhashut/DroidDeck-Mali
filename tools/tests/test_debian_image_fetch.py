@@ -24,14 +24,18 @@ class DebianImageFetchTest(unittest.TestCase):
             root = Path(directory)
             fake = root / 'fake'
             fake.write_text('''#!/usr/bin/env python3
-import json,os,sys
+import fcntl,json,os,sys
 from pathlib import Path
 name=Path(sys.argv[0]).name
 args=sys.argv[1:]
 log=Path(os.environ['FETCH_LOG'])
-calls=json.loads(log.read_text()) if log.exists() else []
-calls.append([name]+args)
-log.write_text(json.dumps(calls))
+# zstd and docker load log concurrently in the hosted-image pipeline.
+with log.open('a+') as stream:
+    fcntl.flock(stream,fcntl.LOCK_EX)
+    stream.seek(0)
+    calls=[json.loads(line) for line in stream if line.strip()]
+    calls.append([name]+args)
+    stream.write(json.dumps([name]+args)+'\\n')
 if name == 'gh':
     if os.environ['HOSTED'] != '1': sys.exit(1)
     Path(args[args.index('-O')+1]).write_bytes(b'hosted image')
@@ -52,7 +56,7 @@ elif name == 'docker':
             fake.chmod(0o755)
             for name in ('gh', 'sha256sum', 'zstd', 'docker', 'sleep'):
                 (root / name).symlink_to(fake)
-            log = root / 'calls.json'
+            log = root / 'calls.jsonl'
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        GITHUB_REPOSITORY='test/repo', FETCH_LOG=str(log), HOSTED=str(int(hosted)),
                        CHECKSUM=str(int(checksum)), PULL_FAILURES=json.dumps(failures or {}),
@@ -60,7 +64,7 @@ elif name == 'docker':
             script = script.replace('/tmp/debian-image.tar.zst', str(root / 'image.tar.zst'))
             result = subprocess.run(['bash', '-c', script], cwd=ROOT, env=env,
                                     capture_output=True, text=True, timeout=5)
-            return result, json.loads(log.read_text())
+            return result, [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
     def test_hosted_asset_and_checksum_remain_first_choice(self):
         result, calls = self.fetch(hosted=True)
@@ -111,6 +115,19 @@ elif name == 'docker':
                 result, calls = self.fetch(**options)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn(['docker', 'image', 'ls', ECR], calls)
+
+    def test_concurrent_pipeline_records_are_complete_for_success_and_failure(self):
+        for load_failure in (False, True):
+            for repeat in range(3):
+                with self.subTest(load_failure=load_failure, repeat=repeat):
+                    result, calls = self.fetch(hosted=True, load_failure=load_failure)
+                    self.assertEqual(result.returncode, 1 if load_failure else 0, result.stderr)
+                    self.assertEqual(calls[0][:3], ['gh', 'release', 'download'])
+                    self.assertEqual(calls[1], ['sha256sum', '-c', '-'])
+                    self.assertCountEqual([row[0] for row in calls[2:4]], ['zstd', 'docker'])
+                    self.assertEqual(calls.count(['docker', 'load']), 1)
+                    self.assertEqual(len(calls), 4 if load_failure else 5)
+                    self.assertFalse(any(row[:2] == ['docker', 'pull'] for row in calls))
 
 
 if __name__ == '__main__':
