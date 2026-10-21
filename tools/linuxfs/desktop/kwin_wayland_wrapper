@@ -1,9 +1,103 @@
 #!/bin/bash
+if [ "${BL_MALI_DESKTOP:-0}" = 1 ] && [ "${0##*/}" = kwin_wayland ]; then
+  exec python3 -c '
+import ctypes
+import datetime
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+
+argv = ["/usr/bin/kwin_wayland", *sys.argv[1:]]
+directory = os.environ.get("BL_DEBUG_DIR")
+log = open(Path(directory) / "kwin-wayland.log", "a", buffering=1) if directory else sys.stderr
+def record(event, **fields):
+    print(json.dumps(dict(time=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                          event=event, **fields), sort_keys=True), file=log, flush=True)
+def option(name, default=None):
+    return argv[argv.index(name) + 1] if name in argv else default
+runtime = os.environ["XDG_RUNTIME_DIR"]
+parent_name = option("--wayland-display", os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+parent = Path(runtime) / parent_name
+own = option("--socket")
+keys = ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP", "DESKTOP_SESSION", "QT_QPA_PLATFORM", "QT_QUICK_BACKEND", "QT_LOGGING_RULES",
+        "KWIN_COMPOSE", "KWIN_RESTART_COUNT", "DROIDDECK_NESTED_SCALE", "LIBGL_ALWAYS_SOFTWARE",
+        "GALLIUM_DRIVER", "MESA_LOADER_DRIVER_OVERRIDE", "VK_DRIVER_FILES", "VK_ICD_FILENAMES",
+        "VK_LOADER_LAYERS_DISABLE", "MALI_VULKAN_BROKER_SOCKET", "MALI_VULKAN_SHARED_STAGING",
+        "KWIN_DRM_DEVICES", "KWIN_FORCE_SW_CURSOR", "KWIN_WAYLAND_NO_XAUTHORITY",
+        "DBUS_SESSION_BUS_ADDRESS", "KDE_APPLICATIONS_AS_SCOPE", "KDE_FULL_SESSION", "KDE_SESSION_VERSION",
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "PATH")
+record("kwin-launch", supervisor_pid=os.getpid(), parent_pid=os.getppid(), argv=argv,
+       parent_socket=str(parent), parent_target=os.readlink(parent) if parent.is_symlink() else None,
+       own_socket=str(Path(runtime) / own) if own else None,
+       environment={key: os.environ.get(key) for key in keys})
+try:
+    parent_valid = parent.is_symlink() and stat.S_ISSOCK(parent.stat().st_mode)
+except OSError:
+    parent_valid = False
+if not parent_valid:
+    record("kwin-parent-lost", parent_socket=str(parent))
+    raise SystemExit(65)
+pending = []
+child = None
+def forward(number, frame):
+    if child is None:
+        pending.append(number)
+    else:
+        try:
+            child.send_signal(number)
+        except ProcessLookupError:
+            pass
+for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(number, forward)
+prctl = ctypes.CDLL(None).prctl
+prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+PR_SET_PDEATHSIG = 1
+supervisor = os.getpid()
+def child_lifetime():
+    # A hard kill of the logging shim must not orphan the actual KWin child.
+    if prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != supervisor:
+        os.write(2, b"KWin logging supervisor lifetime setup failed\n")
+        os._exit(127)
+# The native wrapper passes its Wayland/Xwayland listening descriptors through exec.
+try:
+    child = subprocess.Popen(argv, stdout=log, stderr=log, close_fds=False, preexec_fn=child_lifetime)
+except OSError as error:
+    record("kwin-start-failed", error=str(error), errno=error.errno)
+    raise SystemExit(127)
+record("kwin-started", pid=child.pid, argv=argv)
+for number in pending:
+    forward(number, None)
+status = child.wait()
+record("kwin-exited", pid=child.pid, exit_status=status if status >= 0 else None,
+       signal=-status if status < 0 else None)
+if status < 0:
+    if -status not in (signal.SIGKILL, signal.SIGSTOP):
+        signal.signal(-status, signal.SIG_DFL)
+    os.kill(os.getpid(), -status)
+raise SystemExit(status)
+' "$@"
+fi
 if [ "${BL_DESKTOP:-}" = 1 ]; then
   if [ "${BL_MALI_DESKTOP:-0}" = 1 ]; then
     parent=${XDG_RUNTIME_DIR:?}/wayland-0
     [ -L "$parent" ] && [ -S "$parent" ] || { echo "== Mali KWin parent unavailable: $parent"; exit 65; }
-    echo "== Mali KWin parent: $parent -> $(readlink -- "$parent") (socket present)"
+    # KWin auto-allocates its socket before reading --socket; protect the parent alias.
+    exec {mali_parent_lock}<>"$parent.lock" || exit 73
+    flock --exclusive --nonblock "$mali_parent_lock" || { echo "== Mali KWin parent lock is already owned: $parent.lock"; exit 65; }
+    bin=${XDG_RUNTIME_DIR:?}/kwin-bin
+    mkdir -p "$bin" && ln -sfn /usr/local/bin/kwin_wayland_wrapper "$bin/kwin_wayland" || exit 73
+    export PATH="$bin:$PATH"
+    echo "== Mali KWin parent: $parent -> $(readlink -- "$parent") (socket present, lock held)"
+    if [ -n "${BL_DEBUG_DIR:-}" ]; then
+      mkdir -p "$BL_DEBUG_DIR" || exit 73
+      exec >>"$BL_DEBUG_DIR/kwin-wayland.log" 2>&1
+    fi
+    echo "== Mali KWin wrapper pid=$$ parent-lock-fd=$mali_parent_lock runtime=$XDG_RUNTIME_DIR"
   fi
   set -- --wayland-display wayland-0 --socket wayland-1 --width "${BL_WIDTH:-1280}" --height "${BL_HEIGHT:-720}" --no-lockscreen "$@"
 fi

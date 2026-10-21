@@ -96,7 +96,7 @@ the complete stack matches the existing Phase 1 broker/proxy headers byte for by
 These seven overlays must ship together.
 
 Filename order is the application order: 0002, 0009, 0019, 0020, 0100, 0101, 0110,
-0111, 0112, 0114, 0115, 0200–0206, 0210–0220. `test_phase3.py` applies the entire
+0111, 0112, 0114, 0115, 0200–0206, 0210–0221. `test_phase3.py` applies the entire
 stack with zero fuzz, checks that every Mali hunk has zero offset, verifies protocol/header
 parity, and executes the actual output-pool state machine. The normal child receives
 its nested Wayland socket without the compositor's private proxy/broker environment.
@@ -180,3 +180,23 @@ discard/unmap/disconnect and invalid pre-configure buffer rejection. They alloca
 a dynamic socket with wayland-0 occupied. They model Android presentation events;
 they do not prove a real KDE frame or device rendering. See
 `docs/development/mali-phase3.md` for device evidence and remaining checks.
+
+## KWin native-wrapper ownership and handshake follow-up
+
+`0221-mali-kde-handshake-trace.patch` follows 0220. All 29 earlier patch files
+remain byte-identical. It adds desktop-only Wayland protocol/client/resource
+observation, actual KWin PID identification, configure/commit/callback/presentation
+counters and a bounded failure summary. It does not change output enable/mode,
+renderer, scheduling, input, Vulkan, AHB or watchdog behavior. The builder also
+runs `mali_desktop_bad_ack` to verify invalid configure serial rejection/reporting.
+
+The behavioral fix is in the managed KDE shell wrapper: hold the private parent
+alias's Wayland flock before executing the native KWin wrapper. Normal Android
+already owns its parent's lock; the private alias lacked it. KWin's native socket
+allocator could unlink the alias and make the backend connect to its own server,
+explaining zero requests/commits despite a complete registry. The managed wrapper
+also logs the actual KWin child while preserving the native wrapper, listening
+FDs, restart behavior and signal status. Normal Desktop/Steam/interactive routes
+are unchanged. See `docs/development/mali-kde-host-comparison.md` for the full
+behavior matrix, verified source and real KWin host reproduction; a KDE frame on
+the phone still requires validation.

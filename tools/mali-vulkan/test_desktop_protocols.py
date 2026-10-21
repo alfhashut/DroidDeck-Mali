@@ -122,10 +122,33 @@ class DesktopProtocolExecution(unittest.TestCase):
         for name in ('wl_compositor', 'wl_subcompositor', 'xdg_wm_base', 'wp_single_pixel_buffer_manager_v1',
                      'wp_viewporter', 'wl_seat', 'zwp_pointer_constraints_v1', 'wp_presentation'):
             self.assertIn('nested registry: ' + name + ' version=', output)
+        self.assertIn('comm=wayland-info', output)
+        self.assertIn('comm=kwin_wayland', output)
+        summary = next(line for line in output.splitlines() if line.startswith('KWin handshake: client='))
+        for field in ('globals=8/8', 'configure-sent=2', 'configure-acked=2', 'shm-pools=2', 'buffers=2',
+                      'frame-requests=2', 'frame-fired=2', 'feedback=4', 'presented=2', 'discarded=1',
+                      'protocol-error=none-observed', 'lost-state=0'):
+            self.assertIn(field, summary)
+        self.assertIn('dropped-records=0', output)
+        self.assertIn('bound xdg_wm_base@', output)
+        self.assertIn('format=1', output)
+        self.assertIn('format=0', output)
+        self.assertIn('surface-frame=no', output)
+        self.assertIn('surface-frame=yes', output)
+        self.assertEqual(len({line for line in output.splitlines() if line.startswith('KWin handshake: client=')}), 1)
 
     def test_unconfigured_xdg_buffer_is_a_real_protocol_error(self):
         output = self.run_fixture('unconfigured')
         self.assertIn('xdg_surface has never been configured', output)
+        self.assertIn('accepted-commits=0 buffer-commits=0', output)
+        self.assertIn('connected=no', output)
+        self.assertIn('protocol-error=code=3', output)
+
+    def test_wrong_configure_serial_is_reported_without_counting_an_ack(self):
+        output = self.run_fixture('bad-ack')
+        self.assertIn('wrong configure serial:', output)
+        self.assertIn('configure-sent=1 configure-acked=0', output)
+        self.assertIn('protocol-error=code=4', output)
 
 
 if __name__ == '__main__':

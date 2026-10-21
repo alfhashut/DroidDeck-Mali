@@ -1,0 +1,540 @@
+diff --git a/src/mali_desktop_trace.inc b/src/mali_desktop_trace.inc
+new file mode 100644
+--- /dev/null
++++ b/src/mali_desktop_trace.inc
+@@ -0,0 +1,298 @@
++#include <ctype.h>
++#include <dirent.h>
++#include <errno.h>
++#include <signal.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++#define TRACE_CLIENTS 32
++#define TRACE_SURFACES 64
++#define TRACE_CALLBACKS 128
++#define TRACE_SERIALS 64
++#define TRACE_RECORDS 4096
++struct trace_surface {
++    uint32_t id, xdg;
++    bool buffer, pending_buffer, attached, subsurface, committed;
++};
++struct trace_client {
++    struct mali_desktop_trace *trace;
++    struct wl_client *client;
++    struct wl_listener destroyed, resource_created;
++    pid_t pid;
++    uid_t uid;
++    gid_t gid;
++    uint64_t started;
++    unsigned id, globals, registry, surfaces, xdg, tops, commits, initial, pools, buffers;
++    unsigned attachments, damage, sub_created, sub_commits, frame_requests, frame_done, feedback, presented, discarded;
++    unsigned configured, acked, serial_at, lost, accepted, accepted_buffers;
++    struct trace_surface surface[TRACE_SURFACES];
++    uint32_t callbacks[TRACE_CALLBACKS];
++    struct { uint32_t xdg, serial; } serials[TRACE_SERIALS];
++    char comm[64], error[192];
++    bool kwin;
++};
++struct mali_desktop_trace {
++    struct wl_protocol_logger *logger;
++    struct wl_listener created;
++    struct trace_client *clients[TRACE_CLIENTS];
++    unsigned count, records, dropped, untracked;
++    FILE *file;
++};
++struct trace_process { pid_t parent; uint64_t started; char state; char comm[64]; };
++static bool trace_process(pid_t pid, struct trace_process *process) {
++    char path[64], line[1024];
++    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
++    FILE *file = fopen(path, "r");
++    if (!file) return false;
++    bool ok = fgets(line, sizeof(line), file) != NULL; fclose(file);
++    char *begin = ok ? strchr(line, '(') : NULL, *end = ok ? strrchr(line, ')') : NULL;
++    if (!begin || !end || end <= begin) return false;
++    *end = 0; snprintf(process->comm, sizeof(process->comm), "%.63s", begin + 1);
++    char *save = NULL, *token = strtok_r(end + 2, " ", &save);
++    for (int field = 3; token && field <= 22; ++field, token = strtok_r(NULL, " ", &save)) {
++        if (field == 3) process->state = *token;
++        if (field == 4) process->parent = (pid_t)strtol(token, NULL, 10);
++        if (field == 22) { process->started = strtoull(token, NULL, 10); return true; }
++    }
++    return false;
++}
++static void trace_write(struct mali_desktop_trace *trace, bool summary, const char *format, ...) {
++    if (!summary && trace->records++ >= TRACE_RECORDS) { ++trace->dropped; return; }
++    char line[1600]; va_list args; va_start(args, format); vsnprintf(line, sizeof(line), format, args); va_end(args);
++    if (trace->file) { fprintf(trace->file, "%s\n", line); fflush(trace->file); }
++    if (summary || !trace->file) fprintf(stderr, "%s\n", line);
++}
++static void trace_argv(struct mali_desktop_trace *trace, pid_t pid) {
++    char path[64], argv[768]; snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
++    FILE *file = fopen(path, "r"); if (!file) return;
++    size_t length = fread(argv, 1, sizeof(argv) - 1, file); fclose(file);
++    for (size_t i = 0; i < length; ++i) if (!isprint((unsigned char)argv[i])) argv[i] = ' ';
++    argv[length] = 0; trace_write(trace, true, "KWin process pid=%d argv=%s", (int)pid, argv);
++}
++static const char *trace_required[] = {"wl_compositor", "wl_subcompositor", "xdg_wm_base",
++    "wp_single_pixel_buffer_manager_v1", "wp_viewporter", "wl_seat", "zwp_pointer_constraints_v1", "wp_presentation"};
++static void trace_resource_created(struct wl_listener *listener, void *data) {
++    struct trace_client *client = wl_container_of(listener, client, resource_created);
++    struct wl_resource *resource = data;
++    const char *name = wl_resource_get_class(resource);
++    for (unsigned i = 0; i < sizeof(trace_required) / sizeof(trace_required[0]); ++i) if (!strcmp(name, trace_required[i])) {
++        client->globals |= 1u << i;
++        trace_write(client->trace, false, "Mali handshake client=%u pid=%d bound %s@%u version=%d",
++            client->id, (int)client->pid, name, wl_resource_get_id(resource), wl_resource_get_version(resource));
++    }
++}
++static void trace_disconnected(struct wl_listener *listener, void *data) {
++    (void)data;
++    struct trace_client *client = wl_container_of(listener, client, destroyed);
++    trace_write(client->trace, client->kwin, "Mali handshake client=%u pid=%d comm=%s disconnect error=%s",
++        client->id, (int)client->pid, client->comm, *client->error ? client->error : "none-observed");
++    wl_list_remove(&client->destroyed.link); wl_list_init(&client->destroyed.link);
++    wl_list_remove(&client->resource_created.link); wl_list_init(&client->resource_created.link); client->client = NULL;
++}
++static void trace_created(struct wl_listener *listener, void *data) {
++    struct mali_desktop_trace *trace = wl_container_of(listener, trace, created);
++    if (trace->count >= TRACE_CLIENTS) { ++trace->untracked; return; }
++    struct trace_client *client = calloc(1, sizeof(*client));
++    if (!client) { ++trace->untracked; return; }
++    client->trace = trace; client->client = data; client->id = ++trace->count;
++    trace->clients[client->id - 1] = client;
++    wl_client_get_credentials(data, &client->pid, &client->uid, &client->gid);
++    struct trace_process process = {0};
++    if (trace_process(client->pid, &process)) {
++        client->started = process.started; snprintf(client->comm, sizeof(client->comm), "%s", process.comm);
++        client->kwin = !strcmp(process.comm, "kwin_wayland");
++    } else snprintf(client->comm, sizeof(client->comm), "unknown");
++    client->destroyed.notify = trace_disconnected; wl_client_add_destroy_listener(data, &client->destroyed);
++    client->resource_created.notify = trace_resource_created; wl_client_add_resource_created_listener(data, &client->resource_created);
++    trace_write(trace, client->kwin, "Mali handshake client=%u pid=%d uid=%u gid=%u comm=%s connected",
++        client->id, (int)client->pid, (unsigned)client->uid, (unsigned)client->gid, client->comm);
++    if (client->kwin) trace_argv(trace, client->pid);
++}
++static struct trace_surface *trace_surface(struct trace_client *client, uint32_t id) {
++    for (unsigned i = 0; i < TRACE_SURFACES; ++i) if (client->surface[i].id == id) return &client->surface[i];
++    return NULL;
++}
++static struct trace_surface *trace_add_surface(struct trace_client *client, uint32_t id) {
++    for (unsigned i = 0; i < TRACE_SURFACES; ++i) if (!client->surface[i].id) {
++        client->surface[i] = (struct trace_surface){.id = id}; return &client->surface[i];
++    }
++    ++client->lost; return NULL;
++}
++static uint32_t trace_object(union wl_argument argument) {
++    return argument.o ? wl_resource_get_id((struct wl_resource *)argument.o) : 0;
++}
++static void trace_message(void *data, enum wl_protocol_logger_type direction, const struct wl_protocol_logger_message *message) {
++    struct mali_desktop_trace *trace = data;
++    struct wl_client *owner = wl_resource_get_client(message->resource);
++    struct trace_client *client = NULL;
++    for (unsigned i = 0; i < trace->count; ++i) if (trace->clients[i]->client == owner) { client = trace->clients[i]; break; }
++    if (!client) return;
++    const char *interface = wl_resource_get_class(message->resource), *method = message->message->name;
++    const union wl_argument *args = message->arguments;
++    uint32_t id = wl_resource_get_id(message->resource);
++    bool request = direction == WL_PROTOCOL_LOGGER_REQUEST;
++    char detail[384] = "";
++    if (request && !strcmp(interface, "wl_display") && !strcmp(method, "get_registry")) ++client->registry;
++    if (request && !strcmp(interface, "wl_registry") && !strcmp(method, "bind")) {
++        snprintf(detail, sizeof(detail), " interface=%.128s version=%u new=%u", args[1].s, args[2].u, args[3].n);
++    }
++    if (request && !strcmp(interface, "wl_compositor") && !strcmp(method, "create_surface")) {
++        ++client->surfaces; trace_add_surface(client, args[0].n);
++        snprintf(detail, sizeof(detail), " new=%u", args[0].n);
++    }
++    if (request && !strcmp(interface, "xdg_wm_base") && !strcmp(method, "get_xdg_surface")) {
++        ++client->xdg; struct trace_surface *surface = trace_surface(client, trace_object(args[1]));
++        if (surface) surface->xdg = args[0].n;
++    }
++    if (request && !strcmp(interface, "xdg_surface") && !strcmp(method, "get_toplevel")) ++client->tops;
++    if (!strcmp(interface, "xdg_surface") && !strcmp(method, request ? "ack_configure" : "configure")) {
++        if (!request) {
++            ++client->configured; unsigned at = client->serial_at++ % TRACE_SERIALS;
++            if (client->serials[at].xdg) ++client->lost;
++            client->serials[at].xdg = id; client->serials[at].serial = args[0].u;
++        } else {
++            bool found = false;
++            for (unsigned i = 0; i < TRACE_SERIALS; ++i) if (client->serials[i].xdg == id && client->serials[i].serial == args[0].u) {
++                found = true; client->serials[i].xdg = 0;
++            }
++            if (found) ++client->acked;
++            snprintf(detail, sizeof(detail), " serial=%u sent=%s", args[0].u, found ? "yes" : "no-or-history-lost");
++        }
++        if (!request) snprintf(detail, sizeof(detail), " serial=%u", args[0].u);
++    }
++    if (request && !strcmp(interface, "wl_shm") && !strcmp(method, "create_pool")) ++client->pools;
++    if (request && !strcmp(interface, "wl_shm_pool") && !strcmp(method, "create_buffer")) {
++        ++client->buffers;
++        snprintf(detail, sizeof(detail), " new=%u width=%d height=%d stride=%d format=%u", args[0].n, args[2].i, args[3].i, args[4].i, args[5].u);
++    }
++    if (request && !strcmp(interface, "wl_subcompositor") && !strcmp(method, "get_subsurface")) {
++        ++client->sub_created; struct trace_surface *surface = trace_surface(client, trace_object(args[1]));
++        if (surface) surface->subsurface = true;
++    }
++    if (request && !strcmp(interface, "wl_surface")) {
++        struct trace_surface *surface = trace_surface(client, id);
++        if (!strcmp(method, "attach")) {
++            ++client->attachments;
++            if (surface) { surface->attached = true; surface->pending_buffer = args[0].o != NULL; }
++            snprintf(detail, sizeof(detail), " buffer=%u", trace_object(args[0]));
++        } else if (!strcmp(method, "damage") || !strcmp(method, "damage_buffer")) ++client->damage;
++        else if (!strcmp(method, "commit")) {
++            if (surface) {
++                if (surface->attached) { surface->buffer = surface->pending_buffer; surface->attached = false; }
++                if (surface->buffer) ++client->commits;
++                if (!surface->committed && !surface->buffer) ++client->initial;
++                surface->committed = true;
++                if (surface->subsurface) ++client->sub_commits;
++            }
++            snprintf(detail, sizeof(detail), " has-buffer=%s subsurface=%s", surface && surface->buffer ? "yes" : "no",
++                surface && surface->subsurface ? "yes" : "no");
++        } else if (!strcmp(method, "frame")) {
++            ++client->frame_requests; bool found = false;
++            for (unsigned i = 0; i < TRACE_CALLBACKS; ++i) if (!client->callbacks[i]) { client->callbacks[i] = args[0].n; found = true; break; }
++            if (!found) ++client->lost;
++        } else if (!strcmp(method, "destroy") && surface) memset(surface, 0, sizeof(*surface));
++    }
++    if (!request && !strcmp(interface, "wl_callback") && !strcmp(method, "done")) {
++        bool frame = false;
++        for (unsigned i = 0; i < TRACE_CALLBACKS; ++i) if (client->callbacks[i] == id) { ++client->frame_done; client->callbacks[i] = 0; frame = true; }
++        snprintf(detail, sizeof(detail), " surface-frame=%s", frame ? "yes" : "no");
++    }
++    if (request && !strcmp(interface, "wp_presentation") && !strcmp(method, "feedback")) ++client->feedback;
++    if (!request && !strcmp(interface, "wp_presentation_feedback")) {
++        if (!strcmp(method, "presented")) ++client->presented;
++        if (!strcmp(method, "discarded")) ++client->discarded;
++    }
++    bool error = !request && !strcmp(interface, "wl_display") && !strcmp(method, "error");
++    if (error) {
++        snprintf(client->error, sizeof(client->error), "code=%u %.160s", args[1].u, args[2].s);
++        for (char *c = client->error; *c; ++c) if (!isprint((unsigned char)*c)) *c = ' ';
++        snprintf(detail, sizeof(detail), " %s", client->error);
++    }
++    trace_write(trace, error, "Mali handshake client=%u pid=%d comm=%s %s %s@%u.%s%s",
++        client->id, (int)client->pid, client->comm, request ? "request" : "event", interface, id, method, detail);
++}
++static struct mali_desktop_trace *mali_desktop_trace_create(struct wl_display *display) {
++    struct mali_desktop_trace *trace = calloc(1, sizeof(*trace)); if (!trace) return NULL;
++    const char *directory = getenv("BL_DEBUG_DIR");
++    if (directory && *directory) {
++        char path[4096]; int length = snprintf(path, sizeof(path), "%s/mali-desktop-handshake.log", directory);
++        if (length > 0 && (size_t)length < sizeof(path)) trace->file = fopen(path, "a");
++        if (trace->file) { setvbuf(trace->file, NULL, _IOLBF, 0); fcntl(fileno(trace->file), F_SETFD, FD_CLOEXEC); }
++    }
++    trace->created.notify = trace_created; wl_display_add_client_created_listener(display, &trace->created);
++    trace->logger = wl_display_add_protocol_logger(display, trace_message, trace);
++    trace_write(trace, true, "Mali desktop handshake tracing: protocol-logger=%s credentials=/proc PID; text-limit=%u; summaries/counters remain active", trace->logger ? "available" : "unavailable", TRACE_RECORDS);
++    return trace;
++}
++static void mali_desktop_trace_commit(struct mali_desktop_trace *trace, struct wlr_surface *surface) {
++    if (!trace) return;
++    struct wl_client *owner = wl_resource_get_client(surface->resource);
++    for (unsigned i = 0; i < trace->count; ++i) {
++        struct trace_client *client = trace->clients[i];
++        if (client->client != owner) continue;
++        ++client->accepted; if (wlr_surface_has_buffer(surface)) ++client->accepted_buffers;
++        trace_write(trace, false, "Mali handshake client=%u pid=%d accepted wl_surface@%u.commit buffer=%s",
++            client->id, (int)client->pid, wl_resource_get_id(surface->resource), wlr_surface_has_buffer(surface) ? "yes" : "no");
++        break;
++    }
++}
++static bool trace_descendant(pid_t pid, pid_t root) {
++    for (unsigned i = 0; i < 64 && pid > 1; ++i) {
++        if (pid == root) return true;
++        struct trace_process process = {0}; if (!trace_process(pid, &process)) return false;
++        pid = process.parent;
++    }
++    return false;
++}
++static void mali_desktop_trace_report(struct mali_desktop_trace *trace, pid_t child, const char *reason) {
++    if (!trace) return;
++    unsigned known = 0, unidentified = 0;
++    trace_write(trace, true, "KWin handshake summary: reason=%s desktop-child=%d dropped-records=%u untracked-clients=%u",
++        reason, (int)child, trace->dropped, trace->untracked);
++    for (unsigned i = 0; i < trace->count; ++i) {
++        struct trace_client *client = trace->clients[i];
++        if (!strcmp(client->comm, "unknown")) ++unidentified;
++        if (!client->kwin) continue;
++        ++known; struct trace_process process = {0};
++        bool readable = trace_process(client->pid, &process);
++        const char *alive = readable && client->started ?
++            (process.started == client->started && process.state != 'Z' ? "yes" : "no") :
++            (kill(client->pid, 0) < 0 && errno == ESRCH ? "no" : "unknown");
++        trace_write(trace, true, "KWin handshake: client=%u pid=%d alive=%s connected=%s registry=%u globals=%u/8 surfaces=%u xdg-surfaces=%u toplevels=%u initial-commits=%u configure-sent=%u configure-acked=%u shm-pools=%u buffers=%u attach=%u damage=%u buffer-commit-requests=%u accepted-commits=%u buffer-commits=%u subsurfaces=%u subsurface-commits=%u frame-requests=%u frame-fired=%u feedback=%u presented=%u discarded=%u protocol-error=%s lost-state=%u",
++            client->id, (int)client->pid, alive, client->client ? "yes" : "no", client->registry,
++            (unsigned)__builtin_popcount(client->globals), client->surfaces, client->xdg, client->tops, client->initial,
++            client->configured, client->acked, client->pools, client->buffers, client->attachments, client->damage,
++            client->commits, client->accepted, client->accepted_buffers, client->sub_created, client->sub_commits, client->frame_requests, client->frame_done,
++            client->feedback, client->presented, client->discarded, *client->error ? client->error : "none-observed", client->lost);
++    }
++    if (!known) trace_write(trace, true, "KWin handshake: connected=%s KWin-clients=0 unidentified=%u (wayland-info/other clients excluded)", unidentified ? "unknown" : "no", unidentified);
++    DIR *proc = child > 1 ? opendir("/proc") : NULL;
++    if (proc) {
++        struct dirent *entry; unsigned inspected = 0, live = 0, unreadable = 0;
++        while ((entry = readdir(proc)) && inspected++ < 32768) {
++            char *end = NULL; long number = strtol(entry->d_name, &end, 10);
++            if (*end || number <= 1 || number > INT32_MAX) continue;
++            struct trace_process process = {0};
++            if (!trace_process((pid_t)number, &process)) { ++unreadable; continue; }
++            if (!strcmp(process.comm, "kwin_wayland") && trace_descendant((pid_t)number, child)) {
++                trace_write(trace, true, "KWin process at %s: pid=%ld state=%c alive=%s parent=%d", reason, number,
++                    process.state, process.state == 'Z' ? "no" : "yes", (int)process.parent);
++                trace_argv(trace, (pid_t)number); if (process.state != 'Z') ++live;
++            }
++        }
++        closedir(proc); trace_write(trace, true, "KWin process scan: live-descendants=%u enumeration-complete=%s unreadable=%u", live, inspected < 32768 ? "yes" : "no", unreadable);
++    }
++}
++static void mali_desktop_trace_destroy(struct mali_desktop_trace *trace) {
++    if (!trace) return;
++    if (trace->logger) wl_protocol_logger_destroy(trace->logger);
++    wl_list_remove(&trace->created.link);
++    for (unsigned i = 0; i < trace->count; ++i) {
++        wl_list_remove(&trace->clients[i]->destroyed.link);
++        wl_list_remove(&trace->clients[i]->resource_created.link); free(trace->clients[i]);
++    }
++    if (trace->file) fclose(trace->file);
++    free(trace);
++}
+diff --git a/src/mali_desktop.c b/src/mali_desktop.c
+--- a/src/mali_desktop.c
++++ b/src/mali_desktop.c
+@@ -2,6 +2,7 @@
+ #include <assert.h>
+ #include <drm_fourcc.h>
+ #include <stdlib.h>
++#include <fcntl.h>
+ #include <wayland-client.h>
+ #include <presentation-time-client-protocol.h>
+ #include <wlr/backend/headless.h>
+@@ -22,7 +23,10 @@
+ #include <wlr/types/wlr_xdg_shell.h>
+ #include <wlr/util/transform.h>
+ 
++#include "mali_desktop_trace.inc"
++
+ struct mali_desktop {
++    struct mali_desktop_trace *trace;
+     struct wlr_renderer *renderer;
+     struct wlr_seat *seat;
+     struct wlr_backend *backend;
+@@ -66,6 +70,7 @@
+     (void)data;
+     struct surface_watch *watch = wl_container_of(listener, watch, commit);
+     struct mali_desktop *desktop = watch->desktop;
++    mali_desktop_trace_commit(desktop->trace, watch->surface);
+     if (desktop->toplevel && watch->surface == desktop->toplevel->base->surface) {
+         if (desktop->toplevel->base->initial_commit) configure(desktop);
+         if (watch->surface->mapped) {
+@@ -143,6 +148,7 @@
+         void (*notify)(void *, struct wlr_surface *), void *data) {
+     struct mali_desktop *desktop = calloc(1, sizeof(*desktop));
+     if (!desktop) return NULL;
++    desktop->trace = mali_desktop_trace_create(display);
+     desktop->renderer = renderer; desktop->seat = seat;
+     desktop->width = width; desktop->height = height; desktop->dirty = notify; desktop->data = data;
+     wl_list_init(&desktop->surfaces); wl_list_init(&desktop->presentations);
+@@ -287,6 +293,9 @@
+     wlr_scene_node_for_each_buffer(&desktop->scene->tree.node, sample, presentation);
+     return true;
+ }
++void mali_desktop_report(struct mali_desktop *desktop, pid_t child, const char *reason) {
++    if (desktop) mali_desktop_trace_report(desktop->trace, child, reason);
++}
+ void mali_desktop_destroy(struct mali_desktop *desktop) {
+     if (!desktop) return;
+     struct presentation *presentation, *tmp;
+@@ -295,6 +304,7 @@
+     wl_list_for_each_safe(watch, next, &desktop->surfaces, link) surface_destroy(&watch->destroy, NULL);
+     wl_list_remove(&desktop->new_surface.link); wl_list_remove(&desktop->new_toplevel.link);
+     wl_list_remove(&desktop->new_popup.link); wl_list_remove(&desktop->top_destroy.link); wl_list_remove(&desktop->set_cursor.link);
++    mali_desktop_trace_destroy(desktop->trace);
+     if (desktop->scene) wlr_scene_node_destroy(&desktop->scene->tree.node);
+     if (desktop->buffer) wlr_buffer_drop(desktop->buffer);
+     if (desktop->allocator) wlr_allocator_destroy(desktop->allocator);
+diff --git a/src/mali_desktop.h b/src/mali_desktop.h
+--- a/src/mali_desktop.h
++++ b/src/mali_desktop.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include <stdbool.h>
+ #include <time.h>
++#include <sys/types.h>
+ struct wl_display;
+ struct wl_surface;
+ struct wp_presentation;
+@@ -17,6 +18,7 @@
+     struct wlr_compositor *, struct wlr_seat *, int width, int height,
+     void (*dirty)(void *, struct wlr_surface *), void *data);
+ void mali_desktop_destroy(struct mali_desktop *);
++void mali_desktop_report(struct mali_desktop *, pid_t child, const char *reason);
+ struct wlr_surface *mali_desktop_surface(struct mali_desktop *);
+ struct wlr_surface *mali_desktop_pointer(struct mali_desktop *, double x, double y, double *sx, double *sy);
+ struct wlr_buffer *mali_desktop_render(struct mali_desktop *);
+diff --git a/src/mali_normal.cpp b/src/mali_normal.cpp
+--- a/src/mali_normal.cpp
++++ b/src/mali_normal.cpp
+@@ -248,6 +248,7 @@
+         if (server.childGroup > 1) kill(-server.childGroup, SIGKILL);
+         StopX11();
+     }
++    if (server.desktopServer) mali_desktop_report(server.desktopServer, server.child, "stop-before-disconnect");
+     if (server.display) {
+         wl_display_destroy_clients(server.display);
+         if (server.created.link.next) wl_list_remove(&server.created.link);
+@@ -424,6 +425,7 @@
+         // Steam's bootstrap can download for minutes; an idle UI also needs no redraw.
+         // Child exit, Xwayland and outer socket failures remain fatal.
+         if (!server.x11 && watchdog.expired(now)) {
++            if (server.desktopServer) mali_desktop_report(server.desktopServer, server.child, "watchdog-timeout");
+             mali_normal_failure(watchdog.awaiting_desktop_frame() ? "KDE desktop produced no first frame for 90 seconds" : "normal session made no frame progress for 15 seconds");
+             break;
+         }
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -248,4 +248,5 @@
+     c_args: ['-DWLR_USE_UNSTABLE', '-UNDEBUG'])
+   test('mali_desktop_protocols', malidesktop_test, timeout: 30)
+   test('mali_desktop_unconfigured', malidesktop_test, args: ['unconfigured'], timeout: 30)
+-endif
++  test('mali_desktop_bad_ack', malidesktop_test, args: ['bad-ack'], timeout: 30)
++endif
+diff --git a/tests/mali_desktop_protocols.c b/tests/mali_desktop_protocols.c
+--- a/tests/mali_desktop_protocols.c
++++ b/tests/mali_desktop_protocols.c
+@@ -10,6 +10,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <sys/prctl.h>
+ #include <sys/socket.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+@@ -37,6 +38,7 @@
+ static struct wp_presentation *presentation;
+ static unsigned globals, configured, popup_configured, frame_callbacks, presented_count, discarded_count, clock_id;
+ static int control;
++static bool invalid_ack;
+ static void command(char c) { assert(write(control, &c, 1) == 1); char reply = 0; assert(read(control, &reply, 1) == 1 && reply == c); }
+ static void global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
+     (void)data;
+@@ -46,8 +48,8 @@
+     BIND(wl_compositor, compositor, 0, 4)
+     BIND(wl_subcompositor, subcompositor, 1, 1)
+     BIND(wl_shm, shm, 2, 1)
+-    BIND(wl_seat, seat, 3, 1)
+-    BIND(xdg_wm_base, shell, 4, 3)
++    BIND(wl_seat, seat, 3, 5)
++    BIND(xdg_wm_base, shell, 4, 1)
+     BIND(wp_viewporter, viewporter, 5, 1)
+     BIND(wp_single_pixel_buffer_manager_v1, pixels, 6, 1)
+     BIND(zwp_pointer_constraints_v1, constraints, 7, 1)
+@@ -58,7 +60,7 @@
+ static const struct wl_registry_listener registry_listener = {global, removed};
+ static void ping(void *data, struct xdg_wm_base *base, uint32_t serial) { (void)data; xdg_wm_base_pong(base, serial); }
+ static const struct xdg_wm_base_listener shell_listener = {ping};
+-static void configure(void *data, struct xdg_surface *surface, uint32_t serial) { (void)data; ++configured; xdg_surface_ack_configure(surface, serial); }
++static void configure(void *data, struct xdg_surface *surface, uint32_t serial) { (void)data; ++configured; xdg_surface_ack_configure(surface, invalid_ack ? serial + 1000 : serial); }
+ static const struct xdg_surface_listener surface_listener = {configure};
+ static void popup_configure(void *data, struct xdg_popup *popup, int32_t x, int32_t y, int32_t width, int32_t height) {
+     (void)data; (void)popup; (void)x; (void)y; assert(width == 2 && height == 2); ++popup_configured;
+@@ -84,12 +86,12 @@
+ }
+ static void feedback_discarded(void *data, struct wp_presentation_feedback *f) { (void)data; ++discarded_count; wp_presentation_feedback_destroy(f); }
+ static const struct wp_presentation_feedback_listener feedback_listener = {feedback_output, feedback_presented, feedback_discarded};
+-static struct wl_buffer *shm_buffer(uint32_t color) {
++static struct wl_buffer *shm_buffer(uint32_t color, uint32_t format) {
+     int fd = memfd_create("mali-desktop-test", MFD_CLOEXEC); assert(fd >= 0 && ftruncate(fd, 16) == 0);
+     uint32_t *map = mmap(NULL, 16, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); assert(map != MAP_FAILED);
+     for (int i = 0; i < 4; ++i) map[i] = color;
+     struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, 16);
+-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, 2, 2, 8, WL_SHM_FORMAT_ARGB8888);
++    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, 2, 2, 8, format);
+     wl_shm_pool_destroy(pool); munmap(map, 16); close(fd); return buffer;
+ }
+ static void feedback_request(struct wl_surface *surface) {
+@@ -119,6 +121,12 @@
+     }
+     wl_surface_commit(root);
+     while (!configured) assert(wl_display_roundtrip(display) >= 0);
++    if (invalid_ack) {
++        assert(wl_display_roundtrip(display) < 0);
++        uint32_t id; const struct wl_interface *interface;
++        assert(wl_display_get_protocol_error(display, &interface, &id) == XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE);
++        assert(interface == &xdg_wm_base_interface); wl_display_disconnect(display); return;
++    }
+     assert(clock_id == CLOCK_MONOTONIC);
+     wl_surface_attach(root, black, 0, 0); wl_surface_damage_buffer(root, 0, 0, 8, 6); wl_surface_commit(root);
+     assert(wl_display_roundtrip(display) >= 0); command('B');
+@@ -136,12 +144,12 @@
+     struct wl_subsurface *sub = wl_subcompositor_get_subsurface(subcompositor, child, root);
+     struct wp_viewport *child_viewport = wp_viewporter_get_viewport(viewporter, child);
+     wp_viewport_set_destination(child_viewport, 4, 4); wl_subsurface_set_position(sub, 2, 1);
+-    struct wl_buffer *red = shm_buffer(0xffff0000);
++    struct wl_buffer *red = shm_buffer(0xffff0000, WL_SHM_FORMAT_XRGB8888);
+     wl_surface_attach(child, red, 0, 0); wl_surface_commit(child);
+     assert(wl_display_roundtrip(display) >= 0); command('B');
+     wl_surface_commit(root); assert(wl_display_roundtrip(display) >= 0); command('R');
+     wl_subsurface_set_desync(sub);
+-    struct wl_buffer *blue = shm_buffer(0xff0000ff);
++    struct wl_buffer *blue = shm_buffer(0xff0000ff, WL_SHM_FORMAT_ARGB8888);
+     wl_surface_attach(child, blue, 0, 0); wl_surface_commit(child);
+     assert(wl_display_roundtrip(display) >= 0); command('U');
+     wp_viewport_set_source(child_viewport, wl_fixed_from_int(1), 0, wl_fixed_from_int(1), wl_fixed_from_int(2));
+@@ -242,8 +250,10 @@
+     wlr_buffer_end_data_ptr_access(buffer);
+ }
+ int main(int argc, char **argv) {
+-    (void)argv; bool invalid = argc > 1;
++    bool invalid = argc > 1 && !strcmp(argv[1], "unconfigured");
++    invalid_ack = argc > 1 && !strcmp(argv[1], "bad-ack");
+     char runtime[] = "/tmp/mali-protocols-XXXXXX"; assert(mkdtemp(runtime)); assert(setenv("XDG_RUNTIME_DIR", runtime, 1) == 0);
++    assert(setenv("BL_DEBUG_DIR", runtime, 1) == 0);
+     struct wl_display *display = wl_display_create(); assert(display);
+     assert(wl_display_add_socket(display, "wayland-0") == 0);
+     const char *socket = wl_display_add_socket_auto(display); assert(socket && strcmp(socket, "wayland-0"));
+@@ -253,8 +263,18 @@
+     wlr_seat_set_capabilities(seat_server, WL_SEAT_CAPABILITY_POINTER);
+     struct mali_desktop *desktop = mali_desktop_create(display, renderer, compositor_server, seat_server, 8, 6, NULL, NULL); assert(desktop);
+     int channel[2]; assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, channel) == 0);
++    pid_t observer = fork(); assert(observer >= 0);
++    if (!observer) {
++        assert(prctl(PR_SET_NAME, "wayland-info", 0, 0, 0) == 0);
++        struct wl_display *connection = wl_display_connect(socket); assert(connection);
++        struct wl_registry *registry = wl_display_get_registry(connection);
++        wl_registry_add_listener(registry, &registry_listener, NULL);
++        assert(wl_display_roundtrip(connection) >= 0 && wl_display_roundtrip(connection) >= 0);
++        wl_display_disconnect(connection); _Exit(0);
++    }
+     pid_t child = fork(); assert(child >= 0);
+     if (!child) {
++        assert(prctl(PR_SET_NAME, "kwin_wayland", 0, 0, 0) == 0);
+         close(channel[0]);
+         struct wl_display *connection = wl_display_connect(socket); assert(connection);
+         int fd = dup(wl_display_get_fd(connection)); wl_display_disconnect(connection); assert(fd >= 0);
+@@ -285,9 +305,17 @@
+         wl_display_flush_clients(display); assert(write(channel[0], &command, 1) == 1);
+     }
+     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+-    wl_display_destroy_clients(display); mali_desktop_destroy(desktop); wlr_seat_destroy(seat_server);
++    while (waitpid(observer, &status, WNOHANG) == 0) {
++        assert(wl_event_loop_dispatch(wl_display_get_event_loop(display), 1) >= 0); wl_display_flush_clients(display);
++    }
++    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++    wl_display_destroy_clients(display); mali_desktop_report(desktop, child, "host-test-after-disconnect");
++    mali_desktop_destroy(desktop); wlr_seat_destroy(seat_server);
+     wl_display_destroy(display); wlr_renderer_destroy(renderer);
+     wl_surface_destroy(outer_surface); wl_display_disconnect(outer_display);
+-    kill(outer, SIGTERM); assert(waitpid(outer, &status, 0) == outer); close(channel[0]); assert(rmdir(runtime) == 0);
++    kill(outer, SIGTERM); assert(waitpid(outer, &status, 0) == outer); close(channel[0]); char artifact[256]; snprintf(artifact, sizeof(artifact), "%s/mali-desktop-handshake.log", runtime);
++    FILE *file = fopen(artifact, "r"); assert(file); char line[2048];
++    puts("BEGIN HOST-MODEL HANDSHAKE ARTIFACT"); while (fgets(line, sizeof(line), file)) fputs(line, stdout);
++    fclose(file); assert(unlink(artifact) == 0 && rmdir(runtime) == 0);
+     puts("KWin host protocol bind/use and lifecycle: PASS"); return 0;
+ }

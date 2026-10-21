@@ -152,20 +152,31 @@ os.execvp('kwin_wayland_wrapper',['kwin_wayland_wrapper'])
         target.chmod(0o755)
         wrapper = (ROOT / 'tools/linuxfs/desktop/kwin_wayland_wrapper').read_text()
         target = self.bin / 'kwin_wayland_wrapper'
-        target.write_text(wrapper.replace('/usr/bin/kwin_wayland_wrapper', str(self.bin / 'kwin-native')))
+        target.write_text(wrapper.replace('/usr/bin/kwin_wayland_wrapper', str(self.bin / 'kwin-native')).replace(
+            '/usr/local/bin/kwin_wayland_wrapper', str(target)))
         target.chmod(0o755)
-        self.stub('kwin-native', '''import json,os,socket,sys
+        self.stub('kwin-native', '''import ctypes,json,os,socket,sys
 from pathlib import Path
 runtime=Path(os.environ['XDG_RUNTIME_DIR'])
 parent=runtime/sys.argv[sys.argv.index('--wayland-display')+1]
-with socket.socket(socket.AF_UNIX) as native, socket.socket(socket.AF_UNIX) as own:
+library=ctypes.CDLL('libwayland-server.so.0')
+library.wl_display_create.restype=ctypes.c_void_p
+library.wl_display_add_socket_auto.argtypes=[ctypes.c_void_p]
+library.wl_display_add_socket_auto.restype=ctypes.c_char_p
+library.wl_display_destroy.argtypes=[ctypes.c_void_p]
+display=library.wl_display_create()
+own_name=library.wl_display_add_socket_auto(display).decode()
+assert own_name == sys.argv[sys.argv.index('--socket')+1], own_name
+assert parent.is_symlink()
+with socket.socket(socket.AF_UNIX) as native:
     native.connect(str(parent))
     native.sendall(b'kwin-parent-alias')
     assert native.recv(16) == b'gamescope'
-    own.bind(str(runtime/sys.argv[sys.argv.index('--socket')+1]))
+    assert (runtime/own_name).is_socket()
     print('KWIN='+json.dumps(dict(runtime=runtime.name,parent=str(parent.readlink()),
         parent_socket=parent.is_socket(),outer_socket=(runtime.parent/'wayland-0').is_socket(),
         broker=(runtime.parent/'broker').is_socket())))
+library.wl_display_destroy(display)
 ''')
 
     def gamescope(self, name, absolute=False):
@@ -206,9 +217,11 @@ raise SystemExit(code)
                 self.gamescope(name, absolute)
                 report = self.root / 'debug/desktop.log'
                 if report.exists(): report.unlink()
+                kwin_log = self.root / 'debug/kwin-wayland.log'
+                if kwin_log.exists(): kwin_log.unlink()
                 result = self.run_session('mali-wayland')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr + report.read_text())
-                output = report.read_text()
+                output = report.read_text() + (self.root / 'debug/kwin-wayland.log').read_text()
                 for stage in ('Mali desktop parent (after-cleanup)', 'Mali desktop parent (before-Plasma)', 'Mali KWin parent:'):
                     self.assertIn(stage, output)
                 actual = json.loads(next(line[5:] for line in output.splitlines() if line.startswith('KWIN=')))
@@ -254,6 +267,33 @@ raise SystemExit(code)
         self.assertEqual(json.loads(result.stdout), ['--wayland-display', 'wayland-0', '--socket', 'wayland-1',
             '--width', '1280', '--height', '720', '--no-lockscreen'])
         self.assertFalse((self.root / 'wayland-0').is_symlink())
+
+    def test_native_auto_allocator_replaces_an_unlocked_alias(self):
+        import socket
+        with socket.socket(socket.AF_UNIX) as parent:
+            target = self.root / 'generated-wayland-8'
+            parent.bind(str(target))
+            private = self.root / 'unlocked'
+            private.mkdir(mode=0o700)
+            alias = private / 'wayland-0'
+            alias.symlink_to(target)
+            self.stub('allocate', '''import ctypes,os
+from pathlib import Path
+library=ctypes.CDLL('libwayland-server.so.0')
+library.wl_display_create.restype=ctypes.c_void_p
+library.wl_display_add_socket_auto.argtypes=[ctypes.c_void_p]
+library.wl_display_add_socket_auto.restype=ctypes.c_char_p
+library.wl_display_destroy.argtypes=[ctypes.c_void_p]
+display=library.wl_display_create()
+name=library.wl_display_add_socket_auto(display).decode()
+assert name == 'wayland-0'
+assert not (Path(os.environ['XDG_RUNTIME_DIR'])/name).is_symlink()
+library.wl_display_destroy(display)
+''')
+            result = subprocess.run([str(self.bin / 'allocate')], env=dict(self.env, XDG_RUNTIME_DIR=str(private)),
+                                    capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(target.is_socket())
 
 
 if __name__ == '__main__':

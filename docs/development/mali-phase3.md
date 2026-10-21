@@ -1,5 +1,14 @@
 # DroidDeck-Mali 0.5 port: Phase 3 normal presentation
 
+Latest follow-up: [KDE host comparison and private socket ownership (0221)](mali-kde-host-comparison.md).
+Real-device 0220 validation confirms the complete required registry, alias at
+shell wrapper entry and 90-second grace, but still no commits or Android frame.
+The source audit found that the native KWin wrapper can replace the unlocked
+private alias after that shell check. A held private parent lock fixes this in
+real KWin 6.7.5 host tests; phone presentation remains **FAIL/PENDING**. The
+follow-up retains the existing output/rendering implementation and adds actual
+KWin stdout/stderr/status plus PID-specific handshake/failure evidence.
+
 Base: Phase 2 commit `cc58bcd5` on `mali-0.5-port`.
 Reference: `mali-gpu-experiment` (`3e1d9255`), with the normal Gamescope core
 from its pre-performance/pre-Steam checkpoint `7fd567ad`.
@@ -70,14 +79,16 @@ warning for outer wayland-0 is followed by successful allocation of wayland-1;
 it is not evidence that the private alias points to Android. Only the private directory
 is cleaned, with `wayland-0*` excluded. New Mali-only checks/logs verify the alias
 at handoff, after desktop cleanup, before Plasma and immediately before executing
-KWin. A missing/non-socket alias fails cleanly instead of falling back to Android.
+the native KWin wrapper. Those 0220 checks did not cover its subsequent socket
+allocation; 0221 protects the alias with its own held lock and checks again in
+the actual KWin logging shim. A missing alias fails instead of falling back to Android.
 The logs prove path existence at those stages; they do not prove KWin submitted a
 frame. The latest device logs now prove alias survival at all three checkpoints.
 
 A host socket test now runs the actual session, desktop and KWin wrapper scripts
 with filesystem paths redirected and mocked KDE binaries. It completes a socket
 handshake from the wrapper's parent alias to the mock Gamescope server after
-cleanup and Plasma entry. It repeats with generated names wayland-7 and absolute
+cleanup, Plasma entry and real Wayland automatic socket allocation. It repeats with generated names wayland-7 and absolute
 wayland-11, preserves Android/broker socket inodes, creates KWin's separate socket,
 and proves alias loss fails before Plasma. These are host proofs, not real KWin
 protocol or phone rendering tests.
