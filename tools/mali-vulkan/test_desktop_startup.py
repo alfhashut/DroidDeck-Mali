@@ -104,8 +104,7 @@ int main(int argc, char **argv) {
         self.assertEqual(current.count('watchdog.presented(now)'), 1)
         success = current.split('if (result == 0) {', 1)[1].split('} else if (result != EAGAIN)', 1)[0]
         self.assertIn('watchdog.presented(now)', success)
-        for start, end in [('static bool StartServer(', 'static void StopServer('),
-                           ('vulkan_mali_normal_frame_begin();', 'if (result == 0) {'),
+        for start, end in [('MaliCpuScope sceneScope(', 'if (result == 0) {'),
                            ('    ok &= !failed;', '    return ok ? 0 : 1;')]:
             self.assertEqual(previous.split(start, 1)[1].split(end, 1)[0],
                              current.split(start, 1)[1].split(end, 1)[0])
@@ -217,7 +216,10 @@ raise SystemExit(code)
                     parent_socket=True, outer_socket=True, broker=True))
                 self.assertEqual((self.root / 'wayland-0').stat().st_ino, outer)
                 self.assertEqual((self.root / 'broker').stat().st_ino, broker)
-                self.assertIn('mock parent globals', (self.root / 'debug/mali-desktop-wayland.txt').read_text())
+                registry = (self.root / 'debug/mali-desktop-wayland.txt').read_text()
+                self.assertIn('mock parent globals', registry)
+                self.assertIn('full parent registry: runtime=' + str(self.root / 'mali-desktop') + ' display=wayland-0', registry)
+                self.assertIn('wayland-info exit=0', registry)
 
     def test_parent_loss_before_plasma_fails_without_using_android_display(self):
         self.prepare_desktop()

@@ -86,7 +86,13 @@ fi
 echo "== droiddeck-desktop: Plasma on $WAYLAND_DISPLAY"
 mali_desktop_parent before-Plasma || exit $?
 if [ "${BL_MALI_DESKTOP:-0}" = 1 ] && [ -n "${BL_DEBUG_DIR:-}" ]; then
-  wayland-info >"$BL_DEBUG_DIR/mali-desktop-wayland.txt" 2>&1 || echo '== Mali desktop parent globals query failed'
+  (
+    echo "== Mali desktop full parent registry: runtime=$XDG_RUNTIME_DIR display=$WAYLAND_DISPLAY"
+    wayland-info
+    status=$?
+    echo "== wayland-info exit=$status"
+    exit "$status"
+  ) >"$BL_DEBUG_DIR/mali-desktop-wayland.txt" 2>&1 || echo '== Mali desktop parent globals query failed'
 fi
 dbus-run-session -- startplasma-wayland
 rc=$?

@@ -46,7 +46,7 @@ User-reported real Mali-G52 validation proves the interactive Mali client at
 approximately 60 FPS, clean Stop without stale Gamescope/proot/session processes,
 and successful relaunch. Shared staging and PanVK were OFF. The subsequent KDE
 device run establishes: **renderer initialization PASS; KDE routing PASS; KDE
-launcher reached PASS; first KDE frame FAIL/PENDING; cause under investigation.**
+launcher reached PASS; first KDE frame FAIL/PENDING; required host protocols missing.**
 KDE reaches startplasma-wayland, KWin, kcminit and desktop portals, but Gamescope
 reports commits=0, frames=0 and presented=0 before a clean watchdog teardown. No
 Android crash was reported. This is not successful KDE device validation.
@@ -72,7 +72,7 @@ is cleaned, with `wayland-0*` excluded. New Mali-only checks/logs verify the ali
 at handoff, after desktop cleanup, before Plasma and immediately before executing
 KWin. A missing/non-socket alias fails cleanly instead of falling back to Android.
 The logs prove path existence at those stages; they do not prove KWin submitted a
-frame. Actual device alias survival through KWin still requires those new logs.
+frame. The latest device logs now prove alias survival at all three checkpoints.
 
 A host socket test now runs the actual session, desktop and KWin wrapper scripts
 with filesystem paths redirected and mocked KDE binaries. It completes a socket
@@ -86,8 +86,8 @@ The old watchdog starts after StartServer forks the child, before the child's
 locale/font/desktop/Plasma preparation, and resets only on successful Present.
 The reported child start at 00:57:39 and watchdog failure at 00:57:54 match that
 15-second limit, leaving about 13 seconds after the desktop step at 00:57:41.
-The 15-second pre-frame cutoff is established; whether cold-start delay alone explains the
-zero-frame result is not established.
+The later 90-second device run still produced zero commits and frames. Startup
+delay alone therefore does not explain this result.
 
 New patch `0219-mali-desktop-first-frame-grace.patch` gives only the explicit
 `BL_MALI_DESKTOP=1` plus `droiddeck-session lxqt` non-Xwayland child up to 90 seconds
@@ -98,30 +98,103 @@ seconds if no frame arrives. Interactive diagnostics retain their original
 15-second startup/progress behavior, even if the desktop flag is inherited with a
 different child command. Steam's existing Xwayland behavior is unchanged. Child
 exit, outer-display failure and Stop are still handled independently of the timer.
-All 27 earlier patches are unchanged; order is now 0210–0219 after 0200–0206.
+At that checkpoint all 27 earlier patches were unchanged; 0219 followed 0218.
 
-**Separate Wayland compatibility gap**
+**Confirmed Wayland compatibility gap and 0220 implementation**
 
-Source inspection also shows that `StartServer` creates the basic compositor,
-seat and renderer globals but no xdg-shell. The desktop build pins KWin 6.7.5 in `tools/desktop-kde/build-kwin.sh`; its
+The device registry contained only `wl_shm`, `wl_compositor` and `wl_seat`.
+The custom `StartServer` bypasses normal Gamescope's `wlserver_init()`, which
+initializes additional protocol handlers. Its raw-surface listener also rejects
+a second surface, whereas KWin uses a single-pixel background, SHM content
+subsurfaces and cursor surfaces. The desktop build pins KWin 6.7.5 in `tools/desktop-kde/build-kwin.sh`; its
 local nested-scale patch leaves backend initialization requirements unchanged. Upstream [KWin 6.7.5 WaylandDisplay::initialize](https://github.com/KDE/kwin/blob/v6.7.5/src/backends/wayland/wayland_display.cpp)
-rejects a parent missing xdg-shell. It also checks subcompositor, single-pixel-buffer,
-viewporter, seat, pointer constraints and presentation-time availability. This is
-a concrete source compatibility gap, independently of the socket alias and timer.
-The installed phone's exact KWin package and backend errors still need verification;
-the abbreviated desktop log does not prove which requirement stopped that run.
-Extending startup alone cannot supply missing Wayland protocols.
-
-For the next device run, the Mali desktop captures the parent globals in
-`$BL_DEBUG_DIR/mali-desktop-wayland.txt` immediately before Plasma. Inspect that
-file, all alias checkpoints and the full KWin backend stderr in desktop.log;
-record the installed `pacman -Q kwin` version. Confirm whether xdg_wm_base and the
-other required globals are absent and whether KWin explicitly rejects them.
-A scoped implementation of the missing desktop protocols, with real configure,
-ACK, surface-role and presentation semantics and focused client tests, remains
-necessary if this backend is used. This change does not fabricate protocol support
-or expand the experimental single-client compositor into a complete desktop shell.
+requires compositor, subcompositor, xdg-shell, single-pixel-buffer, viewporter,
+seat, pointer constraints and presentation-time. Six required globals were absent:
+`wl_subcompositor`, `xdg_wm_base`, `wp_single_pixel_buffer_manager_v1`,
+`wp_viewporter`, `zwp_pointer_constraints_v1` and `wp_presentation`. This is a
+confirmed initialization blocker. It does not prove there are no later blockers.
 The proot/systemd/priority/FUSE/portal warnings are not assigned as root cause.
+
+New overlay `0220-mali-kwin-host-protocols.patch` supplies these six globals using
+the exact Gamescope submodule's wlroots 0.20.2 APIs (commit
+`d783533489e1f75d6886c2ab5c5960090ef268f8`). Normal Gamescope already reuses
+wlroots' xdg-shell and pointer-constraint handlers; the other handlers are also
+available in this wlroots. No protocol servers are invented for the nested
+registry. wlroots handles roles, configure/ack, viewport validation, synchronized
+subsurfaces and object cleanup. Constraints may be requested and destroyed but
+remain inactive by compositor policy. A single nested KDE output is configured
+to the existing Gamescope output size.
+
+Only the explicit KDE child uses wlroots' scene graph and Pixman renderer to
+compose its surface tree, including the single-pixel background and cursor,
+into one SHM frame. Existing Gamescope Vulkan upload/composite and Android AHB
+presentation consume that frame. No new GPU driver or rendering backend is
+selected. This adds CPU composition overhead that requires device measurement.
+The interactive raw-surface renderer and Steam/Xwayland path remain unchanged.
+
+wp_presentation feedback is sampled for the composed surfaces and forwarded
+from actual outer Android presentation events. The metadata-only wl_output has
+no synthetic presentation timer; ZERO_COPY is cleared. Discard and shutdown
+destroy outstanding feedback, with at most 64 pending outer requests. Frame
+callbacks follow successful existing Mali Present operations. No AHB reuse or
+release acknowledgment depends on these new feedback objects.
+
+The desktop captures the complete, unfiltered parent registry in
+`$BL_DEBUG_DIR/mali-desktop-wayland.txt`, now including runtime/display context
+and the wayland-info exit status. Socket names remain generated dynamically;
+the private alias, cleanup exclusions and KWin wrapper arguments are unchanged.
+0219's explicit 90-second first-frame grace, subsequent 15-second watchdog,
+interactive timeout and Steam exemption are unchanged. All prior patch contents
+remain byte-identical; the stack now ends with 0218, 0219, 0220.
+
+Latest real-device evidence before 0220:
+
+- Renderer initialization, KDE routing and launcher reached: PASS.
+- Socket alias through cleanup, before Plasma and KWin wrapper entry: PASS.
+- Explicit 90-second allowance: PASS; zero commits/frames throughout.
+- Captured registry: insufficient for KWin 6.7.5.
+- First KDE frame: FAIL/PENDING.
+- Protocol compatibility implementation: pending CI/device validation.
+
+CI must compile/link the complete ARM64 Gamescope stack and run the new real
+wlroots bind/use tests alongside cursor routing, SONAME, fingerprint and APK
+checks. The host protocol fixture checks configure/ack and popup lifecycle,
+SHM/single-pixel subsurface pixels, sync/desync, viewport cropping, pointer
+constraint requests, frame callbacks, presentation timestamp/sequence/flag
+forwarding, discard, unmap/disconnect and invalid-buffer protocol rejection.
+It uses a mock outer presentation server, not Android or real KWin. Existing
+launcher tests check dynamic names wayland-7/11, protected outer socket inodes,
+alias survival and failure on alias loss; watchdog and Steam regressions remain.
+
+On the phone, record `pacman -Q kwin`, the full parent registry and KWin backend
+stderr. Verify all required globals, xdg configure/ack, first SHM/subsurface
+commits, a visible first KDE frame, input/cursor, sustained rendering and actual
+outer presentation/release counts. Exercise Stop and relaunch with no stale
+processes/sockets and balanced release accounting. Keep shared staging and PanVK
+OFF. A successful host fixture is not successful KDE device validation.
+
+0220 follow-up files:
+
+| File | Purpose |
+| --- | --- |
+| `tools/gamescope/patches/0220-mali-kwin-host-protocols.patch` | Add the desktop-only wlroots protocol/scene adapter, outer presentation feedback wiring and small C client/server tests. |
+| `tools/gamescope/build-in-arch.sh` | Run both new protocol tests alongside cursor routing after the CI build. |
+| `tools/linuxfs/desktop/droiddeck-desktop` | Record registry context and query status around the existing full wayland-info capture. |
+| `tools/mali-vulkan/test_desktop_protocols.py` | Run real protocol fixtures when public wlroots headers/library are supplied; enforce overlay scope, unchanged older patches and legacy paths. |
+| `tools/mali-vulkan/run_phase3_tests.py` | Include the protocol suite in Phase 3 host checks. |
+| `tools/mali-vulkan/test_desktop_startup.py` | Retain deadline/alias tests, check the expanded registry artifact and allow the new desktop import adapter while freezing existing GPU presentation code. |
+| `tools/mali-vulkan/test_normal_session.py` | Link the new C adapter in the existing optional full normal-session host fixture; this heavier fixture was not run locally. |
+| `tools/mali-vulkan/test_phase3.py` | Require 0220 last and check full-stack application without fuzz/offsets. |
+| `tools/gamescope/PATCHES.md` | Document the protocol implementation, composition, timing and new patch order. |
+| `docs/development/mali-phase3.md` | Record the confirmed device blocker and separate host results from pending KDE validation. |
+
+Lightweight verification: 65 tests passed across `test_desktop_protocols`,
+`test_desktop_startup`, `test_steam_launch`, `test_normal_launch`, `test_phase3`,
+`test_phase5` and `test_phase6`. The two protocol executions compiled only the
+new C adapter and fixture against a public prebuilt wlroots 0.20.2 library; no
+Gamescope executable, Android code or driver was built. Final patch scope/order
+contracts passed again after preserving Meson's existing enable_tests switch.
+Python and shell syntax checks and tracked/new-file `git diff --check` passed.
 
 No broker/proxy opcode, Vulkan synchronization, AHB/release ownership, PanVK,
 shared-staging gate or Steam client behavior changes. Shared staging and PanVK

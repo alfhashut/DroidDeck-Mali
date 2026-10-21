@@ -96,7 +96,7 @@ the complete stack matches the existing Phase 1 broker/proxy headers byte for by
 These seven overlays must ship together.
 
 Filename order is the application order: 0002, 0009, 0019, 0020, 0100, 0101, 0110,
-0111, 0112, 0114, 0115, 0200–0206, 0210–0219. `test_phase3.py` applies the entire
+0111, 0112, 0114, 0115, 0200–0206, 0210–0220. `test_phase3.py` applies the entire
 stack with zero fuzz, checks that every Mali hunk has zero offset, verifies protocol/header
 parity, and executes the actual output-pool state machine. The normal child receives
 its nested Wayland socket without the compositor's private proxy/broker environment.
@@ -141,8 +141,42 @@ that timer. Interactive diagnostics retain 15 seconds from child startup; Steam'
 existing Xwayland watchdog exemption is unchanged. Fatal child/display errors and
 normal Stop remain immediate independent of this timer.
 
-This does not add desktop Wayland protocols. The existing normal server does not
-create an xdg-shell global; the desktop's recorded KWin 6.7.5 requires one (and
-other globals) in its nested backend. Startup grace is therefore not proof that
-KDE can render on this server. See `docs/development/mali-phase3.md` for the
-source-backed compatibility gap, actual device status and required next evidence.
+0219 did not supply desktop protocols. Device logs subsequently proved alias
+survival and the full 90-second allowance, with no commits or frames. The captured
+parent registry contained only wl_shm, wl_compositor and wl_seat.
+
+## KWin 6.7.5 host compatibility
+
+`0220-mali-kwin-host-protocols.patch` follows 0219; all 28 previous patch files
+remain byte-identical. Only the explicitly selected KDE child uses this server
+extension. Normal Gamescope's wlserver uses wlroots' xdg-shell and pointer-constraint
+handlers but is bypassed by the custom Mali entry point. 0220 reuses wlroots 0.20.2
+handlers for subcompositor, xdg-shell (v3), single-pixel-buffer, viewporter, pointer
+constraints and presentation-time. wlroots performs role, configure/ack, viewport,
+subsurface synchronization and resource-lifetime validation. Pointer constraints
+remain inactive by compositor policy; no locked/confined event is fabricated.
+
+KWin submits its software-rendered desktop as subsurfaces above a single-pixel
+background. wlroots' xdg/subsurface scene helpers maintain those trees and cursor
+surfaces; its Pixman renderer composes them into a persistent SHM frame. That
+frame enters the existing Mali Vulkan texture upload and presentation path. The
+CPU composition step is desktop-only and needs device performance validation.
+Pixman and the SHM allocator are compiled unconditionally by the pinned wlroots;
+the existing renderers=[]/allocators=[] build options are preserved.
+
+The headless output provides wl_output metadata only: it is never committed or
+used to invent presentation timing. Sampled client feedback is forwarded from
+the real outer Android wp_presentation feedback, preserving clock, timestamps,
+sequence and flags except ZERO_COPY, which is cleared for CPU composition.
+Discard and shutdown discard pending feedback; outstanding feedback is bounded.
+No broker protocol, Vulkan synchronization or AHB/release ordering changes.
+
+The builder runs `mali_desktop_protocols` and `mali_desktop_unconfigured` alongside
+`cursor_routing`. These small Wayland client/server tests exercise the actual
+wlroots handlers, configure/ack and popup lifecycle, single-pixel buffers, SHM
+subsurface composition, synchronized/desynchronized commits, viewport cropping,
+pointer-constraint object requests, frame callbacks, actual outer-event forwarding,
+discard/unmap/disconnect and invalid pre-configure buffer rejection. They allocate
+a dynamic socket with wayland-0 occupied. They model Android presentation events;
+they do not prove a real KDE frame or device rendering. See
+`docs/development/mali-phase3.md` for device evidence and remaining checks.

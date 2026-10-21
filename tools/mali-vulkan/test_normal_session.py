@@ -28,6 +28,9 @@ class NormalSessionTests(test_renderer.GamescopeRendererFixture):
         includes=[build,Path(os.environ.get('VULKAN_HEADERS','/usr/include')),Path(os.environ['WLR_HEADERS']),wlr/'protocol',wlr/'include',Path(os.environ.get('WAYLAND_PROTOCOLS_HEADERS','/usr/include')),cls.source/'src',Path('/usr/include/pixman-1'),Path('/usr/include/libdrm'),Path('/usr/include/libdecor-0')]
         flags=['-std=c++20','-O0','-fno-exceptions','-ffunction-sections','-fdata-sections','-DWLR_USE_UNSTABLE','-DHAVE_DRM=1']+['-I'+str(p) for p in includes]
         objects=[str(build/'rendervulkan.o')]
+        desktop_object=build/'mali_desktop.o'; objects.append(str(desktop_object))
+        subprocess.run(cc+['-std=gnu11','-O0','-DWLR_USE_UNSTABLE']+['-I'+str(p) for p in includes]+
+                       ['-c',str(cls.source/'src/mali_desktop.c'),'-o',str(desktop_object)],check=True)
         for src in [cls.source/'src'/name for name in ('backend.cpp','Backends/WaylandBackend.cpp','mali_normal.cpp','mali_interactive.cpp')]+[ROOT/'tests/normal_host.cpp']:
             obj=build/(src.stem+'.o');objects.append(str(obj));subprocess.run(cxx+flags+['-c',str(src),'-o',str(obj)],check=True)
         cls.binary=build/'normal-session-test'

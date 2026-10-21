@@ -39,7 +39,7 @@ else
 fi
 PREP
 makepkg -A -s --noconfirm --skipchecksums --skippgpcheck
-meson test -C src/build --no-rebuild --print-errorlogs cursor_routing
+meson test -C src/build --no-rebuild --print-errorlogs cursor_routing mali_desktop_protocols mali_desktop_unconfigured
 ls -l *.pkg.tar.*
 "
 cd "$WORK"

@@ -120,7 +120,7 @@ class PatchContractTests(unittest.TestCase):
         self.assertEqual(len(prefixes), len(set(prefixes)))
         self.assertEqual([p for p in prefixes if p.startswith('02')],
                          ['0200', '0201', '0202', '0203', '0204', '0205', '0206', '0210', '0211',
-                          '0212', '0213', '0214', '0215', '0216', '0217', '0218', '0219'])
+                          '0212', '0213', '0214', '0215', '0216', '0217', '0218', '0219', '0220'])
         self.assertNotIn('offset', self.output)
         self.assertNotIn('fuzz', self.output)
 

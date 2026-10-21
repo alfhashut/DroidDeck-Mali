@@ -1,0 +1,860 @@
+diff --git a/src/mali_desktop.c b/src/mali_desktop.c
+new file mode 100644
+--- /dev/null
++++ b/src/mali_desktop.c
+@@ -0,0 +1,303 @@
++#include "mali_desktop.h"
++#include <assert.h>
++#include <drm_fourcc.h>
++#include <stdlib.h>
++#include <wayland-client.h>
++#include <presentation-time-client-protocol.h>
++#include <wlr/backend/headless.h>
++#include <wlr/render/allocator.h>
++#include <wlr/render/drm_format_set.h>
++#include <wlr/render/pass.h>
++#include <wlr/render/wlr_texture.h>
++#include <wlr/types/wlr_buffer.h>
++#include <wlr/types/wlr_compositor.h>
++#include <wlr/types/wlr_output.h>
++#include <wlr/types/wlr_pointer_constraints_v1.h>
++#include <wlr/types/wlr_presentation_time.h>
++#include <wlr/types/wlr_scene.h>
++#include <wlr/types/wlr_seat.h>
++#include <wlr/types/wlr_single_pixel_buffer_v1.h>
++#include <wlr/types/wlr_subcompositor.h>
++#include <wlr/types/wlr_viewporter.h>
++#include <wlr/types/wlr_xdg_shell.h>
++#include <wlr/util/transform.h>
++
++struct mali_desktop {
++    struct wlr_renderer *renderer;
++    struct wlr_seat *seat;
++    struct wlr_backend *backend;
++    struct wlr_output *output;
++    struct wlr_allocator *allocator;
++    struct wlr_buffer *buffer;
++    struct wlr_scene *scene;
++    struct wlr_scene_tree *content, *cursor;
++    struct wlr_xdg_toplevel *toplevel;
++    struct wl_listener new_surface, new_toplevel, new_popup, top_destroy, set_cursor;
++    struct wl_list surfaces, presentations;
++    unsigned presentation_count;
++    int width, height, cursor_x, cursor_y, hotspot_x, hotspot_y;
++    void (*dirty)(void *, struct wlr_surface *);
++    void *data;
++};
++struct surface_watch {
++    struct mali_desktop *desktop;
++    struct wlr_surface *surface;
++    struct wl_list link;
++    struct wl_listener commit, destroy;
++};
++struct feedback_item {
++    struct wl_list link;
++    struct wlr_presentation_feedback *feedback;
++};
++struct presentation {
++    struct mali_desktop *desktop;
++    struct wp_presentation_feedback *outer;
++    struct wl_list link, feedback;
++};
++static void dirty(struct mali_desktop *desktop, struct wlr_surface *surface) {
++    if (desktop->dirty) desktop->dirty(desktop->data, surface);
++}
++static void configure(struct mali_desktop *desktop) {
++    wlr_xdg_toplevel_set_size(desktop->toplevel, desktop->width, desktop->height);
++    wlr_xdg_toplevel_set_fullscreen(desktop->toplevel, true);
++    wlr_xdg_toplevel_set_activated(desktop->toplevel, true);
++}
++static void surface_commit(struct wl_listener *listener, void *data) {
++    (void)data;
++    struct surface_watch *watch = wl_container_of(listener, watch, commit);
++    struct mali_desktop *desktop = watch->desktop;
++    if (desktop->toplevel && watch->surface == desktop->toplevel->base->surface) {
++        if (desktop->toplevel->base->initial_commit) configure(desktop);
++        if (watch->surface->mapped) {
++            struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(desktop->seat);
++            if (keyboard) wlr_seat_keyboard_notify_enter(desktop->seat, watch->surface,
++                keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
++        }
++    }
++    struct wlr_xdg_surface *xdg = wlr_xdg_surface_try_from_wlr_surface(watch->surface);
++    if (xdg && xdg->role == WLR_XDG_SURFACE_ROLE_POPUP && xdg->initial_commit) {
++        struct wlr_box box = { .width = desktop->width, .height = desktop->height };
++        wlr_xdg_popup_unconstrain_from_box(xdg->popup, &box);
++    }
++    dirty(desktop, watch->surface);
++}
++static void surface_destroy(struct wl_listener *listener, void *data) {
++    (void)data;
++    struct surface_watch *watch = wl_container_of(listener, watch, destroy);
++    dirty(watch->desktop, NULL);
++    wl_list_remove(&watch->commit.link);
++    wl_list_remove(&watch->destroy.link);
++    wl_list_remove(&watch->link);
++    free(watch);
++}
++static void new_surface(struct wl_listener *listener, void *data) {
++    struct mali_desktop *desktop = wl_container_of(listener, desktop, new_surface);
++    struct surface_watch *watch = calloc(1, sizeof(*watch));
++    if (!watch) { wl_client_post_no_memory(wl_resource_get_client(((struct wlr_surface *)data)->resource)); return; }
++    watch->desktop = desktop; watch->surface = data;
++    watch->commit.notify = surface_commit; watch->destroy.notify = surface_destroy;
++    wl_signal_add(&watch->surface->events.commit, &watch->commit);
++    wl_signal_add(&watch->surface->events.destroy, &watch->destroy);
++    wl_list_insert(&desktop->surfaces, &watch->link);
++}
++static void top_destroy(struct wl_listener *listener, void *data) {
++    (void)data;
++    struct mali_desktop *desktop = wl_container_of(listener, desktop, top_destroy);
++    wl_list_remove(&desktop->top_destroy.link); wl_list_init(&desktop->top_destroy.link);
++    desktop->toplevel = NULL;
++    dirty(desktop, NULL);
++}
++static void new_toplevel(struct wl_listener *listener, void *data) {
++    struct mali_desktop *desktop = wl_container_of(listener, desktop, new_toplevel);
++    struct wlr_xdg_toplevel *top = data;
++    if (desktop->toplevel) { wlr_xdg_toplevel_send_close(top); return; }
++    struct wlr_scene_tree *tree = wlr_scene_xdg_surface_create(desktop->content, top->base);
++    if (!tree) { wl_client_post_no_memory(wl_resource_get_client(top->resource)); return; }
++    top->base->data = tree;
++    desktop->toplevel = top;
++    desktop->top_destroy.notify = top_destroy;
++    wl_signal_add(&top->events.destroy, &desktop->top_destroy);
++}
++static void new_popup(struct wl_listener *listener, void *data) {
++    struct mali_desktop *desktop = wl_container_of(listener, desktop, new_popup);
++    struct wlr_xdg_popup *popup = data;
++    struct wlr_xdg_surface *parent = wlr_xdg_surface_try_from_wlr_surface(popup->parent);
++    if (!parent || !parent->data) { wlr_xdg_popup_destroy(popup); return; }
++    popup->base->data = wlr_scene_xdg_surface_create(parent->data, popup->base);
++    if (!popup->base->data) { wl_client_post_no_memory(wl_resource_get_client(popup->resource)); return; }
++}
++static void set_cursor(struct wl_listener *listener, void *data) {
++    struct mali_desktop *desktop = wl_container_of(listener, desktop, set_cursor);
++    struct wlr_seat_pointer_request_set_cursor_event *event = data;
++    if (event->seat_client != desktop->seat->pointer_state.focused_client) return;
++    struct wlr_scene_node *node, *tmp;
++    wl_list_for_each_safe(node, tmp, &desktop->cursor->children, link) wlr_scene_node_destroy(node);
++    desktop->hotspot_x = event->hotspot_x; desktop->hotspot_y = event->hotspot_y;
++    if (event->surface) wlr_scene_subsurface_tree_create(desktop->cursor, event->surface);
++    wlr_scene_node_set_position(&desktop->cursor->node,
++        desktop->cursor_x - desktop->hotspot_x, desktop->cursor_y - desktop->hotspot_y);
++    dirty(desktop, NULL);
++}
++struct mali_desktop *mali_desktop_create(struct wl_display *display, struct wlr_renderer *renderer,
++        struct wlr_compositor *compositor, struct wlr_seat *seat, int width, int height,
++        void (*notify)(void *, struct wlr_surface *), void *data) {
++    struct mali_desktop *desktop = calloc(1, sizeof(*desktop));
++    if (!desktop) return NULL;
++    desktop->renderer = renderer; desktop->seat = seat;
++    desktop->width = width; desktop->height = height; desktop->dirty = notify; desktop->data = data;
++    wl_list_init(&desktop->surfaces); wl_list_init(&desktop->presentations);
++    wl_list_init(&desktop->new_surface.link); wl_list_init(&desktop->new_toplevel.link);
++    wl_list_init(&desktop->new_popup.link); wl_list_init(&desktop->top_destroy.link); wl_list_init(&desktop->set_cursor.link);
++    // Constraints have wlroots validation/lifetimes, but remain inactive by policy.
++    struct wlr_xdg_shell *shell = wlr_xdg_shell_create(display, 3);
++    if (!shell || !wlr_subcompositor_create(display) || !wlr_single_pixel_buffer_manager_v1_create(display) ||
++            !wlr_viewporter_create(display) || !wlr_pointer_constraints_v1_create(display) ||
++            !wlr_presentation_create(display, NULL, 1)) goto fail;
++    desktop->scene = wlr_scene_create();
++    if (!desktop->scene) goto fail;
++    desktop->content = wlr_scene_tree_create(&desktop->scene->tree);
++    desktop->cursor = wlr_scene_tree_create(&desktop->scene->tree);
++    desktop->backend = wlr_headless_backend_create(wl_display_get_event_loop(display));
++    if (!desktop->content || !desktop->cursor || !desktop->backend) goto fail;
++    // This output supplies wl_output metadata only. Presentation comes from Android.
++    desktop->output = wlr_headless_add_output(desktop->backend, width, height);
++    desktop->allocator = wlr_allocator_autocreate(desktop->backend, renderer);
++    if (!desktop->output || !desktop->allocator) goto fail;
++    wlr_output_create_global(desktop->output, display);
++    struct wlr_drm_format_set formats = {0};
++    bool format_ok = wlr_drm_format_set_add(&formats, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR);
++    if (format_ok) desktop->buffer = wlr_allocator_create_buffer(desktop->allocator, width, height,
++        wlr_drm_format_set_get(&formats, DRM_FORMAT_ARGB8888));
++    wlr_drm_format_set_finish(&formats);
++    if (!desktop->buffer) goto fail;
++    desktop->new_surface.notify = new_surface; wl_signal_add(&compositor->events.new_surface, &desktop->new_surface);
++    desktop->new_toplevel.notify = new_toplevel; wl_signal_add(&shell->events.new_toplevel, &desktop->new_toplevel);
++    desktop->new_popup.notify = new_popup; wl_signal_add(&shell->events.new_popup, &desktop->new_popup);
++    desktop->set_cursor.notify = set_cursor; wl_signal_add(&seat->events.request_set_cursor, &desktop->set_cursor);
++    return desktop;
++fail:
++    mali_desktop_destroy(desktop);
++    return NULL;
++}
++struct wlr_surface *mali_desktop_surface(struct mali_desktop *desktop) {
++    return desktop->toplevel && desktop->toplevel->base->surface->mapped ? desktop->toplevel->base->surface : NULL;
++}
++struct wlr_surface *mali_desktop_pointer(struct mali_desktop *desktop, double x, double y, double *sx, double *sy) {
++    desktop->cursor_x = (int)x; desktop->cursor_y = (int)y;
++    wlr_scene_node_set_position(&desktop->cursor->node, (int)x - desktop->hotspot_x, (int)y - desktop->hotspot_y);
++    dirty(desktop, NULL);
++    struct wlr_scene_node *node = wlr_scene_node_at(&desktop->content->node, x, y, sx, sy);
++    if (!node || node->type != WLR_SCENE_NODE_BUFFER) return NULL;
++    struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node));
++    return surface ? surface->surface : NULL;
++}
++struct render {
++    struct mali_desktop *desktop;
++    struct wlr_render_pass *pass;
++    bool ok;
++};
++static void render_buffer(struct wlr_scene_buffer *node, int x, int y, void *data) {
++    struct render *render = data;
++    if (!node->buffer || node->opacity == 0) return;
++    struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(node);
++    if (surface) wlr_surface_send_enter(surface->surface, render->desktop->output);
++    struct wlr_texture *texture = wlr_texture_from_buffer(render->desktop->renderer, node->buffer);
++    if (!texture) { render->ok = false; return; }
++    int width = node->dst_width, height = node->dst_height;
++    if (!width || !height) {
++        width = texture->width; height = texture->height;
++        wlr_output_transform_coords(node->transform, &width, &height);
++    }
++    wlr_render_pass_add_texture(render->pass, &(struct wlr_render_texture_options){
++        .texture = texture, .src_box = node->src_box,
++        .dst_box = {x, y, width, height}, .alpha = &node->opacity,
++        .transform = wlr_output_transform_invert(node->transform), .filter_mode = node->filter_mode,
++    });
++    wlr_texture_destroy(texture);
++}
++struct wlr_buffer *mali_desktop_render(struct mali_desktop *desktop) {
++    struct render render = { .desktop = desktop, .ok = true,
++        .pass = wlr_renderer_begin_buffer_pass(desktop->renderer, desktop->buffer, NULL) };
++    if (!render.pass) return NULL;
++    wlr_render_pass_add_rect(render.pass, &(struct wlr_render_rect_options){
++        .box = {0, 0, desktop->width, desktop->height}, .color = {0, 0, 0, 1}, .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
++    });
++    wlr_scene_node_for_each_buffer(&desktop->scene->tree.node, render_buffer, &render);
++    bool submitted = wlr_render_pass_submit(render.pass);
++    return submitted && render.ok ? desktop->buffer : NULL;
++}
++static void frame_done(struct wlr_scene_buffer *buffer, int x, int y, void *data) {
++    (void)x; (void)y;
++    if (!buffer->buffer || buffer->opacity == 0) return;
++    struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(buffer);
++    if (surface) wlr_surface_send_frame_done(surface->surface, data);
++}
++void mali_desktop_frame_done(struct mali_desktop *desktop, const struct timespec *when) {
++    wlr_scene_node_for_each_buffer(&desktop->scene->tree.node, frame_done, (void *)when);
++}
++static void presentation_destroy(struct presentation *presentation) {
++    struct feedback_item *item, *tmp;
++    wl_list_for_each_safe(item, tmp, &presentation->feedback, link) {
++        wlr_presentation_feedback_destroy(item->feedback); wl_list_remove(&item->link); free(item);
++    }
++    wp_presentation_feedback_destroy(presentation->outer);
++    wl_list_remove(&presentation->link); --presentation->desktop->presentation_count; free(presentation);
++}
++static void sync_output(void *data, struct wp_presentation_feedback *feedback, struct wl_output *output) {
++    (void)data; (void)feedback; (void)output;
++}
++static void presented(void *data, struct wp_presentation_feedback *feedback, uint32_t sec_hi, uint32_t sec_lo,
++        uint32_t ns, uint32_t refresh, uint32_t seq_hi, uint32_t seq_lo, uint32_t flags) {
++    (void)feedback;
++    struct presentation *presentation = data;
++    struct wlr_presentation_event event = {
++        .output = presentation->desktop->output, .tv_sec = ((uint64_t)sec_hi << 32) | sec_lo,
++        .tv_nsec = ns, .refresh = refresh, .seq = ((uint64_t)seq_hi << 32) | seq_lo,
++        .flags = flags & ~WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY,
++    };
++    struct feedback_item *item;
++    wl_list_for_each(item, &presentation->feedback, link) wlr_presentation_feedback_send_presented(item->feedback, &event);
++    presentation_destroy(presentation);
++}
++static void discarded(void *data, struct wp_presentation_feedback *feedback) {
++    (void)feedback; presentation_destroy(data);
++}
++static const struct wp_presentation_feedback_listener presentation_listener = {sync_output, presented, discarded};
++static void sample(struct wlr_scene_buffer *buffer, int x, int y, void *data) {
++    (void)x; (void)y;
++    struct presentation *presentation = data;
++    if (!buffer->buffer || buffer->opacity == 0) return;
++    struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(buffer);
++    if (!surface) return;
++    struct wlr_presentation_feedback *feedback = wlr_presentation_surface_sampled(surface->surface);
++    if (!feedback) return;
++    struct feedback_item *item = calloc(1, sizeof(*item));
++    if (!item) { wlr_presentation_feedback_destroy(feedback); return; }
++    item->feedback = feedback; wl_list_insert(&presentation->feedback, &item->link);
++}
++bool mali_desktop_queue_presentation(struct mali_desktop *desktop, struct wp_presentation *outer, struct wl_surface *surface) {
++    if (!outer || desktop->presentation_count >= 64) return false;
++    struct presentation *presentation = calloc(1, sizeof(*presentation));
++    if (!presentation) return false;
++    presentation->desktop = desktop; wl_list_init(&presentation->feedback);
++    presentation->outer = wp_presentation_feedback(outer, surface);
++    if (!presentation->outer) { free(presentation); return false; }
++    wl_list_insert(&desktop->presentations, &presentation->link); ++desktop->presentation_count;
++    wp_presentation_feedback_add_listener(presentation->outer, &presentation_listener, presentation);
++    wlr_scene_node_for_each_buffer(&desktop->scene->tree.node, sample, presentation);
++    return true;
++}
++void mali_desktop_destroy(struct mali_desktop *desktop) {
++    if (!desktop) return;
++    struct presentation *presentation, *tmp;
++    wl_list_for_each_safe(presentation, tmp, &desktop->presentations, link) presentation_destroy(presentation);
++    struct surface_watch *watch, *next;
++    wl_list_for_each_safe(watch, next, &desktop->surfaces, link) surface_destroy(&watch->destroy, NULL);
++    wl_list_remove(&desktop->new_surface.link); wl_list_remove(&desktop->new_toplevel.link);
++    wl_list_remove(&desktop->new_popup.link); wl_list_remove(&desktop->top_destroy.link); wl_list_remove(&desktop->set_cursor.link);
++    if (desktop->scene) wlr_scene_node_destroy(&desktop->scene->tree.node);
++    if (desktop->buffer) wlr_buffer_drop(desktop->buffer);
++    if (desktop->allocator) wlr_allocator_destroy(desktop->allocator);
++    if (desktop->backend) wlr_backend_destroy(desktop->backend);
++    free(desktop);
++}
+diff --git a/src/mali_desktop.h b/src/mali_desktop.h
+new file mode 100644
+--- /dev/null
++++ b/src/mali_desktop.h
+@@ -0,0 +1,27 @@
++#pragma once
++#include <stdbool.h>
++#include <time.h>
++struct wl_display;
++struct wl_surface;
++struct wp_presentation;
++struct wlr_renderer;
++struct wlr_compositor;
++struct wlr_seat;
++struct wlr_surface;
++struct wlr_buffer;
++struct mali_desktop;
++#ifdef __cplusplus
++extern "C" {
++#endif
++struct mali_desktop *mali_desktop_create(struct wl_display *, struct wlr_renderer *,
++    struct wlr_compositor *, struct wlr_seat *, int width, int height,
++    void (*dirty)(void *, struct wlr_surface *), void *data);
++void mali_desktop_destroy(struct mali_desktop *);
++struct wlr_surface *mali_desktop_surface(struct mali_desktop *);
++struct wlr_surface *mali_desktop_pointer(struct mali_desktop *, double x, double y, double *sx, double *sy);
++struct wlr_buffer *mali_desktop_render(struct mali_desktop *);
++void mali_desktop_frame_done(struct mali_desktop *, const struct timespec *);
++bool mali_desktop_queue_presentation(struct mali_desktop *, struct wp_presentation *, struct wl_surface *);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/mali_normal.cpp b/src/mali_normal.cpp
+--- a/src/mali_normal.cpp
++++ b/src/mali_normal.cpp
+@@ -3,6 +3,7 @@
+  * The application is an argv child, with no diagnostic frame limit/injection. */
+ #include "mali_normal.hpp"
+ #include "mali_normal_watchdog.hpp"
++#include "mali_desktop.h"
+ #include "frame_trace.inc"
+ dd_ft_id g_maliFrameTrace{};
+ #include "normal_detail_perf.hpp"
+@@ -15,6 +16,7 @@
+ #include <wlr/types/wlr_seat.h>
+ #include <wlr/types/wlr_output.h>
+ #include <wlr/backend/headless.h>
++#include <wlr/render/pixman.h>
+ #include <wlr/xwayland/xwayland.h>
+ #include <wlr/xwayland/server.h>
+ #include <wlr/util/log.h>
+@@ -52,6 +54,7 @@
+ static std::deque<Input> inputs;
+ struct Host {
+     wl_display *display = nullptr; wl_surface *surface = nullptr; banner_ahb_v1 *manager = nullptr;
++    wp_presentation *presentation = nullptr;
+     struct Buffer { wl_buffer *buffer = nullptr; unsigned index = 0; bool busy = false; dd_ft_id trace{}; } buffers[3];
+ } host;
+ struct Server {
+@@ -60,6 +63,7 @@
+     wl_listener created{}, committed{}, destroyed{};
+     pid_t child = -1; bool pending = false;
+     bool x11 = false, x11Ready = false;
++    bool desktop = false; mali_desktop *desktopServer = nullptr;
+     pid_t childGroup = -1;
+     wlr_xwayland *xwayland = nullptr;
+     wlr_backend *x11Backend = nullptr;
+@@ -131,6 +135,11 @@
+     wl_signal_add(&server.surface->events.destroy, &server.destroyed);
+     wlr_seat_keyboard_notify_enter(server.seat, server.surface, nullptr, 0, &server.keyboard->modifiers);
+ }
++static void DesktopDirty(void *, wlr_surface *surface) {
++    if (server.desktopServer) server.surface = mali_desktop_surface(server.desktopServer);
++    if (surface) { TraceCommit(surface, 0, true); ++server.commits; }
++    server.pending = true;
++}
+ static bool Dispatch(int timeout) {
+     if (wl_event_loop_dispatch(wl_display_get_event_loop(server.display), timeout) < 0) return false;
+     std::deque<Input> queue;
+@@ -141,7 +150,10 @@
+             if (event.type == 1) {
+                 double x = std::clamp(event.x / g_nPreferredOutputWidth, 0.0, 1.0) * server.surface->current.width;
+                 double y = std::clamp(event.y / g_nPreferredOutputHeight, 0.0, 1.0) * server.surface->current.height;
+-                wlr_seat_pointer_notify_enter(server.seat, server.surface, x, y);
++                wlr_surface *target = server.surface;
++                if (server.desktopServer) target = mali_desktop_pointer(server.desktopServer, x, y, &x, &y);
++                if (!target) { wlr_seat_pointer_notify_clear_focus(server.seat); continue; }
++                wlr_seat_pointer_notify_enter(server.seat, target, x, y);
+                 wlr_seat_pointer_notify_motion(server.seat, time, x, y); ++server.motions;
+             } else if (event.type == 2) {
+                 wlr_seat_pointer_notify_button(server.seat, time, event.code, wl_pointer_button_state(event.state)); ++server.buttons;
+@@ -154,7 +166,11 @@
+     wl_display_flush_clients(server.display); return !failed;
+ }
+ static bool StartServer(char **command) {
+-    server.display = wl_display_create(); server.renderer = vulkan_renderer_create();
++    if (server.desktop && !host.presentation) {
++        std::fputs("KDE nested server requires actual Android presentation feedback\n", stderr); return false;
++    }
++    server.display = wl_display_create();
++    server.renderer = server.desktop ? wlr_pixman_renderer_create() : vulkan_renderer_create();
+     if (!server.display || !server.renderer || !wlr_renderer_init_wl_display(server.renderer, server.display)) return false;
+     auto compositor = wlr_compositor_create(server.display, 5, server.renderer);
+     server.seat = wlr_seat_create(server.display, "seat0");
+@@ -170,7 +186,13 @@
+     wlr_keyboard_set_repeat_info(server.keyboard, 25, 600);
+     wlr_seat_set_keyboard(server.seat, server.keyboard);
+     wlr_seat_set_capabilities(server.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+-    server.created.notify = NewSurface; wl_signal_add(&compositor->events.new_surface, &server.created);
++    if (server.desktop) {
++        server.desktopServer = mali_desktop_create(server.display, server.renderer, compositor, server.seat,
++            g_nPreferredOutputWidth, g_nPreferredOutputHeight, DesktopDirty, nullptr);
++        if (!server.desktopServer) return false;
++    } else {
++        server.created.notify = NewSurface; wl_signal_add(&compositor->events.new_surface, &server.created);
++    }
+     const char *socket = wl_display_add_socket_auto(server.display);
+     if (!socket) return false;
+     if (server.x11 && !StartX11(compositor)) return false;
+@@ -229,6 +251,7 @@
+     if (server.display) {
+         wl_display_destroy_clients(server.display);
+         if (server.created.link.next) wl_list_remove(&server.created.link);
++        if (server.desktopServer) { mali_desktop_destroy(server.desktopServer); server.desktopServer = nullptr; }
+         if (server.seat) wlr_seat_destroy(server.seat);
+         if (server.keyboard) { wlr_keyboard_finish(server.keyboard); free(server.keyboard); }
+         wl_display_destroy(server.display);
+@@ -245,9 +268,9 @@
+     if (inputs.size() >= 512) { mali_normal_failure("input queue overflow"); return; }
+     inputs.push_back({type, x, y, code, state});
+ }
+-bool mali_normal_bind(wl_display *display, wl_surface *surface, banner_ahb_v1 *manager) {
++bool mali_normal_bind(wl_display *display, wl_surface *surface, banner_ahb_v1 *manager, wp_presentation *presentation) {
+     if (!display || !surface || !manager) return false;
+-    host.display = display; host.surface = surface; host.manager = manager;
++    host.display = display; host.surface = surface; host.manager = manager; host.presentation = presentation;
+     return true;
+ }
+ bool mali_normal_buffer(unsigned index, uint32_t key, unsigned width, unsigned height) {
+@@ -263,6 +286,8 @@
+     if (b.busy || !b.buffer || !host.surface) { mali_normal_failure("normal output wl_buffer reused while busy"); return; }
+     b.trace = g_maliFrameTrace;
+     b.busy = true; wl_surface_attach(host.surface, b.buffer, 0, 0);
++    if (server.desktopServer && !mali_desktop_queue_presentation(server.desktopServer, host.presentation, host.surface))
++        std::fputs("KDE presentation feedback unavailable for this frame\n", stderr);
+     wl_surface_damage_buffer(host.surface, 0, 0, INT32_MAX, INT32_MAX); wl_surface_commit(host.surface);
+     dd_ft_event(DD_FT_OUTER_COMMIT, b.trace, index, 0, 0, 0);
+     if (wl_display_flush(host.display) < 0 && errno != EAGAIN) mali_normal_failure("outer Wayland commit failed");
+@@ -309,6 +334,7 @@
+     g_nPreferredOutputWidth = g_nNestedWidth = width; g_nPreferredOutputHeight = g_nNestedHeight = height;
+     g_nNestedRefresh = g_nOutputRefresh = normalPacingHz * 1000; g_bFullscreen = true; g_bBorderlessOutputWindow = true;
+     server.x11 = x11;
++    server.desktop = !server.x11 && mali_normal_desktop_child(getenv("BL_MALI_DESKTOP"), command[0], command[1]);
+     bool renderer = vulkan_mali_normal_init(width, height);
+     bool backend = renderer && gamescope::IBackend::Set<gamescope::CWaylandBackend>();
+     auto connector = backend ? gamescope::IBackend::Get()->CreateVirtualConnector(0) : nullptr;
+@@ -351,11 +377,17 @@
+             vulkan_mali_normal_frame_begin();
+             dd_ft_event(DD_FT_SHM_BEGIN, g_maliFrameTrace, 0, 0, 0, 1);
+             DDFrameScope traceLookup(DD_FT_SHM_LOOKUP_BEGIN, DD_FT_SHM_LOOKUP_END, g_maliFrameTrace);
+-            auto texture = wlr_surface_get_texture(server.surface);
++            wlr_buffer *pixels = nullptr;
++            if (server.desktopServer) {
++                pixels = mali_desktop_render(server.desktopServer);
++            } else {
++                auto texture = wlr_surface_get_texture(server.surface);
++                auto wrapped = reinterpret_cast<VulkanWlrTexture_t *>(texture);
++                pixels = wrapped ? wrapped->buf : nullptr;
++            }
+             traceLookup.finish();
+-            auto wrapped = reinterpret_cast<VulkanWlrTexture_t *>(texture);
+-            auto source = wrapped && wrapped->buf ? vulkan_create_texture_from_wlr_buffer(wrapped->buf, nullptr) : nullptr;
+-            dd_ft_event(DD_FT_SHM_END, g_maliFrameTrace, uint64_t(uintptr_t(wrapped ? wrapped->buf : nullptr)), 0, source ? 0 : -1, 1);
++            auto source = pixels ? vulkan_create_texture_from_wlr_buffer(pixels, nullptr) : nullptr;
++            dd_ft_event(DD_FT_SHM_END, g_maliFrameTrace, uint64_t(uintptr_t(pixels)), 0, source ? 0 : -1, 1);
+             vulkan_mali_normal_upload_done();
+             if (!source) { vulkan_mali_normal_frame_end(false); dd_ft_event(DD_FT_FRAME_END, g_maliFrameTrace, 0, 0, -1, 1); g_maliFrameTrace = {}; ok = false; break; }
+             MaliCpuScope sceneScope(DD_CPU_SCENE, DD_CPU_FRAME);
+@@ -371,7 +403,9 @@
+             dd_ft_event(DD_FT_FRAME_END, g_maliFrameTrace, 0, 0, result, 1);
+             if (result == 0) {
+                 traceLastRendered = g_maliFrameTrace.client;
+-                timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time); wlr_surface_send_frame_done(server.surface, &time);
++                timespec time{}; clock_gettime(CLOCK_MONOTONIC, &time);
++                if (server.desktopServer) mali_desktop_frame_done(server.desktopServer, &time);
++                else wlr_surface_send_frame_done(server.surface, &time);
+                 if (server.x11) X11Presented();
+                 if (tracePending && tracePending != g_maliFrameTrace.client) {
+                     dd_ft_id erased{}; erased.client = tracePending;
+diff --git a/src/mali_normal.hpp b/src/mali_normal.hpp
+--- a/src/mali_normal.hpp
++++ b/src/mali_normal.hpp
+@@ -9,6 +9,7 @@
+ struct wl_display;
+ struct wl_surface;
+ struct banner_ahb_v1;
++struct wp_presentation;
+ extern bool g_maliNormalSessionActive;
+ inline bool mali_normal_active() { return g_maliNormalSessionActive; }
+ inline bool mali_normal_verbose() { const char *v = getenv("MALI_VULKAN_VERBOSE"); return v && !strcmp(v, "1"); }
+@@ -21,7 +22,7 @@
+ unsigned mali_normal_pacing_hz();
+ void mali_normal_input(unsigned type, double x, double y, uint32_t code, uint32_t state);
+ void mali_normal_failure(const char *reason);
+-bool mali_normal_bind(wl_display *, wl_surface *, banner_ahb_v1 *);
++bool mali_normal_bind(wl_display *, wl_surface *, banner_ahb_v1 *, wp_presentation *);
+ bool mali_normal_buffer(unsigned index, uint32_t key, unsigned width, unsigned height);
+ void mali_normal_commit(unsigned index);
+ void mali_normal_stop_client();
+diff --git a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+--- a/src/Backends/WaylandBackend.cpp
++++ b/src/Backends/WaylandBackend.cpp
+@@ -1037,7 +1037,7 @@
+         if (mali_normal_active()) {
+             if (!m_Planes[0].Init(nullptr, nullptr)) return false;
+             libdecor_frame_set_fullscreen(m_Planes[0].GetFrame(), nullptr);
+-            return mali_normal_bind(m_pBackend->GetDisplay(), m_Planes[0].GetSurface(), m_pBackend->m_pBrokerAHB);
++            return mali_normal_bind(m_pBackend->GetDisplay(), m_Planes[0].GetSurface(), m_pBackend->m_pBrokerAHB, m_pBackend->GetPresentation());
+         }
+         for ( uint32_t i = 0; i < std::size( m_Planes ); i++ )
+         {
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -121,6 +121,7 @@
+   'rendervulkan.cpp',
+   'mali_session_wayland.cpp',
+   'mali_normal.cpp',
++  'mali_desktop.c',
+   'mali_interactive.cpp',
+   'log.cpp',
+   'ime.cpp',
+@@ -211,6 +212,7 @@
+     ],
+     install: true,
+     cpp_args: gamescope_cpp_args,
++    c_args: ['-DWLR_USE_UNSTABLE'],
+   )
+ 
+ gamescope_core_src = [
+@@ -237,3 +239,13 @@
+ executable('gamescope-type', ['Apps/gamescope_type.c'], protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
+ 
+ executable('gamescope_hotkey_example', ['Apps/gamescope_hotkey_example.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, xkbcommon, cap_dep], install: false )
++
++if get_option('enable_tests')
++  malidesktop_test = executable('mali-desktop-protocol-test',
++    ['mali_desktop.c', '../tests/mali_desktop_protocols.c'],
++    protocols_client_src, protocols_server_src,
++    dependencies: [wlroots_dep, wayland_server, dep_wayland, pixman_dep, drm_dep, xkbcommon],
++    c_args: ['-DWLR_USE_UNSTABLE', '-UNDEBUG'])
++  test('mali_desktop_protocols', malidesktop_test, timeout: 30)
++  test('mali_desktop_unconfigured', malidesktop_test, args: ['unconfigured'], timeout: 30)
++endif
+diff --git a/tests/mali_desktop_protocols.c b/tests/mali_desktop_protocols.c
+new file mode 100644
+--- /dev/null
++++ b/tests/mali_desktop_protocols.c
+@@ -0,0 +1,293 @@
++#define _GNU_SOURCE
++#include "mali_desktop.h"
++#include <assert.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <wayland-client.h>
++#include <wayland-server.h>
++#include <wlr/render/pixman.h>
++#include <wlr/types/wlr_buffer.h>
++#include <wlr/types/wlr_compositor.h>
++#include <wlr/types/wlr_seat.h>
++#include "xdg-shell-client-protocol.h"
++#include "viewporter-client-protocol.h"
++#include "single-pixel-buffer-v1-client-protocol.h"
++#include "pointer-constraints-unstable-v1-client-protocol.h"
++#include "presentation-time-client-protocol.h"
++#include "presentation-time-protocol.h"
++
++static struct wl_compositor *compositor;
++static struct wl_subcompositor *subcompositor;
++static struct wl_shm *shm;
++static struct wl_seat *seat;
++static struct xdg_wm_base *shell;
++static struct wp_viewporter *viewporter;
++static struct wp_single_pixel_buffer_manager_v1 *pixels;
++static struct zwp_pointer_constraints_v1 *constraints;
++static struct wp_presentation *presentation;
++static unsigned globals, configured, popup_configured, frame_callbacks, presented_count, discarded_count, clock_id;
++static int control;
++static void command(char c) { assert(write(control, &c, 1) == 1); char reply = 0; assert(read(control, &reply, 1) == 1 && reply == c); }
++static void global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
++    (void)data;
++    printf("nested registry: %s version=%u\n", interface, version);
++#define BIND(type, target, bit, supported) if (!strcmp(interface, #type)) { \
++    assert(version >= (supported)); target = wl_registry_bind(registry, name, &type##_interface, supported); globals |= 1u << bit; }
++    BIND(wl_compositor, compositor, 0, 4)
++    BIND(wl_subcompositor, subcompositor, 1, 1)
++    BIND(wl_shm, shm, 2, 1)
++    BIND(wl_seat, seat, 3, 1)
++    BIND(xdg_wm_base, shell, 4, 3)
++    BIND(wp_viewporter, viewporter, 5, 1)
++    BIND(wp_single_pixel_buffer_manager_v1, pixels, 6, 1)
++    BIND(zwp_pointer_constraints_v1, constraints, 7, 1)
++    BIND(wp_presentation, presentation, 8, 1)
++#undef BIND
++}
++static void removed(void *data, struct wl_registry *registry, uint32_t name) { (void)data; (void)registry; (void)name; }
++static const struct wl_registry_listener registry_listener = {global, removed};
++static void ping(void *data, struct xdg_wm_base *base, uint32_t serial) { (void)data; xdg_wm_base_pong(base, serial); }
++static const struct xdg_wm_base_listener shell_listener = {ping};
++static void configure(void *data, struct xdg_surface *surface, uint32_t serial) { (void)data; ++configured; xdg_surface_ack_configure(surface, serial); }
++static const struct xdg_surface_listener surface_listener = {configure};
++static void popup_configure(void *data, struct xdg_popup *popup, int32_t x, int32_t y, int32_t width, int32_t height) {
++    (void)data; (void)popup; (void)x; (void)y; assert(width == 2 && height == 2); ++popup_configured;
++}
++static void popup_done(void *data, struct xdg_popup *popup) { (void)data; (void)popup; }
++static const struct xdg_popup_listener popup_listener = {.configure = popup_configure, .popup_done = popup_done};
++static void top_configure(void *data, struct xdg_toplevel *top, int32_t width, int32_t height, struct wl_array *states) {
++    (void)data; (void)top; (void)states; assert(width == 8 && height == 6);
++}
++static void top_close(void *data, struct xdg_toplevel *top) { (void)data; (void)top; assert(!"unexpected close"); }
++static const struct xdg_toplevel_listener top_listener = {.configure = top_configure, .close = top_close};
++static void frame(void *data, struct wl_callback *callback, uint32_t time) { (void)data; (void)time; ++frame_callbacks; wl_callback_destroy(callback); }
++static const struct wl_callback_listener frame_listener = {frame};
++static void clock_event(void *data, struct wp_presentation *p, uint32_t id) { (void)data; (void)p; clock_id = id; }
++static const struct wp_presentation_listener clock_listener = {clock_event};
++static void feedback_output(void *data, struct wp_presentation_feedback *f, struct wl_output *output) { (void)data; (void)f; (void)output; }
++static void feedback_presented(void *data, struct wp_presentation_feedback *f, uint32_t hi, uint32_t lo, uint32_t ns,
++        uint32_t refresh, uint32_t seq_hi, uint32_t seq_lo, uint32_t flags) {
++    (void)data; assert(hi == 1 && lo == 23 && ns == 456 && refresh == 16666666);
++    assert(seq_hi == 2 && seq_lo == 42);
++    assert(flags == WP_PRESENTATION_FEEDBACK_KIND_VSYNC);
++    ++presented_count; wp_presentation_feedback_destroy(f);
++}
++static void feedback_discarded(void *data, struct wp_presentation_feedback *f) { (void)data; ++discarded_count; wp_presentation_feedback_destroy(f); }
++static const struct wp_presentation_feedback_listener feedback_listener = {feedback_output, feedback_presented, feedback_discarded};
++static struct wl_buffer *shm_buffer(uint32_t color) {
++    int fd = memfd_create("mali-desktop-test", MFD_CLOEXEC); assert(fd >= 0 && ftruncate(fd, 16) == 0);
++    uint32_t *map = mmap(NULL, 16, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); assert(map != MAP_FAILED);
++    for (int i = 0; i < 4; ++i) map[i] = color;
++    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, 16);
++    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, 2, 2, 8, WL_SHM_FORMAT_ARGB8888);
++    wl_shm_pool_destroy(pool); munmap(map, 16); close(fd); return buffer;
++}
++static void feedback_request(struct wl_surface *surface) {
++    wp_presentation_feedback_add_listener(wp_presentation_feedback(presentation, surface), &feedback_listener, NULL);
++}
++static void client(int fd, int channel, bool invalid) {
++    control = channel;
++    struct wl_display *display = wl_display_connect_to_fd(fd); assert(display);
++    struct wl_registry *registry = wl_display_get_registry(display);
++    wl_registry_add_listener(registry, &registry_listener, NULL);
++    assert(wl_display_roundtrip(display) >= 0 && globals == 511);
++    xdg_wm_base_add_listener(shell, &shell_listener, NULL);
++    wp_presentation_add_listener(presentation, &clock_listener, NULL);
++    struct wl_surface *root = wl_compositor_create_surface(compositor);
++    struct xdg_surface *xdg = xdg_wm_base_get_xdg_surface(shell, root);
++    struct xdg_toplevel *top = xdg_surface_get_toplevel(xdg);
++    xdg_surface_add_listener(xdg, &surface_listener, NULL); xdg_toplevel_add_listener(top, &top_listener, NULL);
++    struct wl_buffer *black = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(pixels, 0, 0, 0, UINT32_MAX);
++    struct wp_viewport *viewport = wp_viewporter_get_viewport(viewporter, root);
++    wp_viewport_set_destination(viewport, 8, 6);
++    if (invalid) {
++        wl_surface_attach(root, black, 0, 0); wl_surface_commit(root);
++        assert(wl_display_roundtrip(display) < 0);
++        uint32_t id; const struct wl_interface *interface;
++        assert(wl_display_get_protocol_error(display, &interface, &id) == XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER);
++        assert(interface == &xdg_surface_interface); wl_display_disconnect(display); return;
++    }
++    wl_surface_commit(root);
++    while (!configured) assert(wl_display_roundtrip(display) >= 0);
++    assert(clock_id == CLOCK_MONOTONIC);
++    wl_surface_attach(root, black, 0, 0); wl_surface_damage_buffer(root, 0, 0, 8, 6); wl_surface_commit(root);
++    assert(wl_display_roundtrip(display) >= 0); command('B');
++    struct xdg_positioner *positioner = xdg_wm_base_create_positioner(shell);
++    xdg_positioner_set_size(positioner, 2, 2); xdg_positioner_set_anchor_rect(positioner, 1, 1, 1, 1);
++    struct wl_surface *popup_surface = wl_compositor_create_surface(compositor);
++    struct xdg_surface *popup_xdg = xdg_wm_base_get_xdg_surface(shell, popup_surface);
++    xdg_surface_add_listener(popup_xdg, &surface_listener, NULL);
++    struct xdg_popup *popup = xdg_surface_get_popup(popup_xdg, xdg, positioner);
++    xdg_popup_add_listener(popup, &popup_listener, NULL); wl_surface_commit(popup_surface);
++    while (!popup_configured) assert(wl_display_roundtrip(display) >= 0);
++    xdg_popup_destroy(popup); xdg_surface_destroy(popup_xdg); wl_surface_destroy(popup_surface); xdg_positioner_destroy(positioner);
++    assert(wl_display_roundtrip(display) >= 0);
++    struct wl_surface *child = wl_compositor_create_surface(compositor);
++    struct wl_subsurface *sub = wl_subcompositor_get_subsurface(subcompositor, child, root);
++    struct wp_viewport *child_viewport = wp_viewporter_get_viewport(viewporter, child);
++    wp_viewport_set_destination(child_viewport, 4, 4); wl_subsurface_set_position(sub, 2, 1);
++    struct wl_buffer *red = shm_buffer(0xffff0000);
++    wl_surface_attach(child, red, 0, 0); wl_surface_commit(child);
++    assert(wl_display_roundtrip(display) >= 0); command('B');
++    wl_surface_commit(root); assert(wl_display_roundtrip(display) >= 0); command('R');
++    wl_subsurface_set_desync(sub);
++    struct wl_buffer *blue = shm_buffer(0xff0000ff);
++    wl_surface_attach(child, blue, 0, 0); wl_surface_commit(child);
++    assert(wl_display_roundtrip(display) >= 0); command('U');
++    wp_viewport_set_source(child_viewport, wl_fixed_from_int(1), 0, wl_fixed_from_int(1), wl_fixed_from_int(2));
++    wp_viewport_set_destination(child_viewport, 2, 4); wl_surface_commit(child);
++    assert(wl_display_roundtrip(display) >= 0); command('C');
++    struct wl_pointer *pointer = wl_seat_get_pointer(seat);
++    struct wl_region *region = wl_compositor_create_region(compositor); wl_region_add(region, 0, 0, 8, 6);
++    struct zwp_locked_pointer_v1 *lock = zwp_pointer_constraints_v1_lock_pointer(constraints, root, pointer, region,
++        ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
++    zwp_locked_pointer_v1_set_cursor_position_hint(lock, 0, 0); zwp_locked_pointer_v1_set_region(lock, region);
++    wl_surface_commit(root); assert(wl_display_roundtrip(display) >= 0);
++    zwp_locked_pointer_v1_destroy(lock); assert(wl_display_roundtrip(display) >= 0);
++    struct zwp_confined_pointer_v1 *confine = zwp_pointer_constraints_v1_confine_pointer(constraints, root, pointer, region,
++        ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
++    zwp_confined_pointer_v1_set_region(confine, region); wl_surface_commit(root); assert(wl_display_roundtrip(display) >= 0);
++    zwp_confined_pointer_v1_destroy(confine); wl_region_destroy(region);
++    struct wl_surface *cursor = wl_compositor_create_surface(compositor);
++    wl_surface_attach(cursor, red, 0, 0); wl_surface_commit(cursor);
++    wl_surface_destroy(cursor); assert(wl_display_roundtrip(display) >= 0);
++    wl_callback_add_listener(wl_surface_frame(root), &frame_listener, NULL);
++    wl_callback_add_listener(wl_surface_frame(child), &frame_listener, NULL);
++    feedback_request(root); feedback_request(child); wl_surface_commit(child); wl_surface_commit(root);
++    assert(wl_display_roundtrip(display) >= 0 && frame_callbacks == 0 && presented_count == 0);
++    command('P');
++    while (presented_count < 2 || frame_callbacks < 2) assert(wl_display_roundtrip(display) >= 0);
++    feedback_request(root); wl_surface_commit(root); assert(wl_display_roundtrip(display) >= 0); command('D');
++    while (!discarded_count) assert(wl_display_roundtrip(display) >= 0);
++    feedback_request(root); wl_surface_commit(root); assert(wl_display_roundtrip(display) >= 0); command('Q');
++    wl_surface_attach(root, NULL, 0, 0); wl_surface_commit(root); assert(wl_display_roundtrip(display) >= 0); command('N');
++    wl_subsurface_destroy(sub); wp_viewport_destroy(child_viewport); wl_surface_destroy(child);
++    wp_viewport_destroy(viewport); xdg_toplevel_destroy(top); xdg_surface_destroy(xdg); wl_surface_destroy(root);
++    wl_buffer_destroy(red); wl_buffer_destroy(blue); wl_buffer_destroy(black);
++    assert(wl_display_roundtrip(display) >= 0);
++    wl_display_disconnect(display);
++}
++
++static struct wl_list host_feedback;
++static unsigned host_commits;
++static void resource_destroy(struct wl_client *client, struct wl_resource *resource) { (void)client; wl_resource_destroy(resource); }
++static void host_commit(struct wl_client *client, struct wl_resource *surface) {
++    (void)client; (void)surface; ++host_commits;
++    struct wl_resource *feedback, *tmp;
++    wl_resource_for_each_safe(feedback, tmp, &host_feedback) {
++        if (host_commits == 1) wp_presentation_feedback_send_presented(feedback, 1, 23, 456, 16666666, 2, 42,
++            WP_PRESENTATION_FEEDBACK_KIND_VSYNC | WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY);
++        else wp_presentation_feedback_send_discarded(feedback);
++        wl_resource_destroy(feedback);
++    }
++}
++static const struct wl_surface_interface host_surface_impl = {.destroy = resource_destroy, .commit = host_commit};
++static void host_create_surface(struct wl_client *client, struct wl_resource *resource, uint32_t id) {
++    struct wl_resource *surface = wl_resource_create(client, &wl_surface_interface, wl_resource_get_version(resource), id);
++    wl_resource_set_implementation(surface, &host_surface_impl, NULL, NULL);
++}
++static const struct wl_compositor_interface host_compositor_impl = {.create_surface = host_create_surface};
++static void feedback_destroy(struct wl_resource *resource) { wl_list_remove(wl_resource_get_link(resource)); }
++static void host_feedback_request(struct wl_client *client, struct wl_resource *manager, struct wl_resource *surface, uint32_t id) {
++    (void)manager; (void)surface;
++    struct wl_resource *feedback = wl_resource_create(client, &wp_presentation_feedback_interface, 1, id);
++    wl_resource_set_implementation(feedback, NULL, NULL, feedback_destroy);
++    wl_list_insert(&host_feedback, wl_resource_get_link(feedback));
++}
++static const struct wp_presentation_interface host_presentation_impl = {.destroy = resource_destroy, .feedback = host_feedback_request};
++static void host_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
++    const struct wl_interface *interface = data;
++    struct wl_resource *resource = wl_resource_create(client, interface, version, id);
++    wl_resource_set_implementation(resource, interface == &wl_compositor_interface ?
++        (const void *)&host_compositor_impl : (const void *)&host_presentation_impl, NULL, NULL);
++    if (interface == &wp_presentation_interface) wp_presentation_send_clock_id(resource, CLOCK_MONOTONIC);
++}
++static pid_t outer_server(int *client_fd) {
++    int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
++    pid_t pid = fork(); assert(pid >= 0);
++    if (!pid) {
++        close(sockets[0]); wl_list_init(&host_feedback);
++        struct wl_display *display = wl_display_create(); assert(display && wl_client_create(display, sockets[1]));
++        assert(wl_global_create(display, &wl_compositor_interface, 4, (void *)&wl_compositor_interface, host_bind));
++        assert(wl_global_create(display, &wp_presentation_interface, 1, (void *)&wp_presentation_interface, host_bind));
++        wl_display_run(display); _Exit(0);
++    }
++    close(sockets[1]); *client_fd = sockets[0]; return pid;
++}
++static void outer_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
++    (void)data; (void)version;
++    if (!strcmp(interface, "wl_compositor")) compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
++    if (!strcmp(interface, "wp_presentation")) presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
++}
++static void check_pixels(struct mali_desktop *desktop, char command) {
++    struct wlr_buffer *buffer = mali_desktop_render(desktop); assert(buffer);
++    void *pixels; uint32_t format; size_t stride;
++    assert(wlr_buffer_begin_data_ptr_access(buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &pixels, &format, &stride));
++    for (int y = 0; y < 6; ++y) for (int x = 0; x < 8; ++x) {
++        uint32_t color = 0xff000000;
++        if (command != 'B' && x >= 2 && x < (command == 'C' ? 4 : 6) && y >= 1 && y < 5)
++            color = command == 'R' ? 0xffff0000 : 0xff0000ff;
++        assert(((uint32_t *)((char *)pixels + y * stride))[x] == color);
++    }
++    wlr_buffer_end_data_ptr_access(buffer);
++}
++int main(int argc, char **argv) {
++    (void)argv; bool invalid = argc > 1;
++    char runtime[] = "/tmp/mali-protocols-XXXXXX"; assert(mkdtemp(runtime)); assert(setenv("XDG_RUNTIME_DIR", runtime, 1) == 0);
++    struct wl_display *display = wl_display_create(); assert(display);
++    assert(wl_display_add_socket(display, "wayland-0") == 0);
++    const char *socket = wl_display_add_socket_auto(display); assert(socket && strcmp(socket, "wayland-0"));
++    struct wlr_renderer *renderer = wlr_pixman_renderer_create(); assert(renderer && wlr_renderer_init_wl_display(renderer, display));
++    struct wlr_compositor *compositor_server = wlr_compositor_create(display, 5, renderer);
++    struct wlr_seat *seat_server = wlr_seat_create(display, "test"); assert(compositor_server && seat_server);
++    wlr_seat_set_capabilities(seat_server, WL_SEAT_CAPABILITY_POINTER);
++    struct mali_desktop *desktop = mali_desktop_create(display, renderer, compositor_server, seat_server, 8, 6, NULL, NULL); assert(desktop);
++    int channel[2]; assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, channel) == 0);
++    pid_t child = fork(); assert(child >= 0);
++    if (!child) {
++        close(channel[0]);
++        struct wl_display *connection = wl_display_connect(socket); assert(connection);
++        int fd = dup(wl_display_get_fd(connection)); wl_display_disconnect(connection); assert(fd >= 0);
++        client(fd, channel[1], invalid); fflush(stdout); _Exit(0);
++    }
++    close(channel[1]);
++    int outer_fd; pid_t outer = outer_server(&outer_fd);
++    struct wl_display *outer_display = wl_display_connect_to_fd(outer_fd); assert(outer_display);
++    struct wl_registry *registry = wl_display_get_registry(outer_display);
++    const struct wl_registry_listener listener = {outer_global, removed}; wl_registry_add_listener(registry, &listener, NULL);
++    assert(wl_display_roundtrip(outer_display) >= 0 && compositor && presentation);
++    struct wl_surface *outer_surface = wl_compositor_create_surface(compositor);
++    int status;
++    while (waitpid(child, &status, WNOHANG) == 0) {
++        assert(wl_event_loop_dispatch(wl_display_get_event_loop(display), 1) >= 0); wl_display_flush_clients(display);
++        struct pollfd pollfd = {.fd = channel[0], .events = POLLIN};
++        if (poll(&pollfd, 1, 0) <= 0 || !(pollfd.revents & POLLIN)) continue;
++        char command; if (read(channel[0], &command, 1) != 1) continue;
++        if (command == 'N') assert(!mali_desktop_surface(desktop));
++        else if (command == 'P' || command == 'D' || command == 'Q') {
++            assert(mali_desktop_queue_presentation(desktop, presentation, outer_surface));
++            if (command != 'Q') {
++                wl_surface_commit(outer_surface);
++                assert(wl_display_roundtrip(outer_display) >= 0);
++            }
++            if (command == 'P') { struct timespec time; clock_gettime(CLOCK_MONOTONIC, &time); mali_desktop_frame_done(desktop, &time); }
++        } else check_pixels(desktop, command);
++        wl_display_flush_clients(display); assert(write(channel[0], &command, 1) == 1);
++    }
++    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++    wl_display_destroy_clients(display); mali_desktop_destroy(desktop); wlr_seat_destroy(seat_server);
++    wl_display_destroy(display); wlr_renderer_destroy(renderer);
++    wl_surface_destroy(outer_surface); wl_display_disconnect(outer_display);
++    kill(outer, SIGTERM); assert(waitpid(outer, &status, 0) == outer); close(channel[0]); assert(rmdir(runtime) == 0);
++    puts("KWin host protocol bind/use and lifecycle: PASS"); return 0;
++}
