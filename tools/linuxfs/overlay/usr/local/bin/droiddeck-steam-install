@@ -100,9 +100,8 @@ find "$steam_root" -depth -name '*\\*' | while read -r odd; do
   fi
 done
 chmod -R a+x "$steam_root/steamrtarm64" "$steam_root/linuxarm64" 2>/dev/null || true
-if [ -n "$sync" ]; then
-  cp -f "$work/manifest" "$steam_root/package/$manifest.manifest"
-else
+cp -f "$work/manifest" "$steam_root/package/$manifest.manifest"
+if [ -z "$sync" ]; then
   echo "$steam_channel" > "$steam_root/package/beta"
 fi
 ln -sfn "$steam_root/steamrtarm64" "$steam_root/steamrtarm32"

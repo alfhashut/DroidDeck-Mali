@@ -1,6 +1,7 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -91,6 +92,41 @@ cp "$TEST_CDN/${url##*/}" "$out"
     def test_downloads_the_deck_beta_client(self):
         self.assert_installed()
 
+    def test_normal_install_retains_the_downloaded_client_manifest(self):
+        self.assert_installed()
+        name = 'steam_client_steamdeck_publicbeta_linuxarm64'
+        self.assertEqual((self.cdn / name).read_bytes(),
+                         (self.steam / 'package' / (name + '.manifest')).read_bytes())
+        self.assertFalse((self.steam / 'package' / (name + '.installed')).exists())
+
+    def test_ready_client_with_missing_manifest_is_not_reinstalled(self):
+        self.assert_installed()
+        name = 'steam_client_steamdeck_publicbeta_linuxarm64.manifest'
+        (self.steam / 'package' / name).unlink(missing_ok=True)
+        requests = self.requests.read_text()
+        self.assertEqual(0, self.install().returncode)
+        self.assertEqual(requests, self.requests.read_text())
+
+    def test_failed_extraction_does_not_publish_manifest_or_ready_marker(self):
+        archive = self.cdn / 'steamdeck_publicbeta.zip'
+        archive.write_bytes(b'not a zip')
+        manifest = self.cdn / 'steam_client_steamdeck_publicbeta_linuxarm64'
+        text = manifest.read_text()
+        manifest.write_text(re.sub(r'("sha2" ")[^"]+',
+                                  r'\g<1>' + hashlib.sha256(archive.read_bytes()).hexdigest(), text))
+        self.assertNotEqual(0, self.install().returncode)
+        self.assertFalse((self.steam / 'package' / (manifest.name + '.manifest')).exists())
+        self.assertFalse((self.steam / 'package/droiddeck-installed').exists())
+
+    def test_sync_after_normal_install_does_not_download_client_parts_again(self):
+        self.assert_installed()
+        self.requests.unlink()
+        result = subprocess.run(['bash', str(SCRIPT), '--sync', 'steamdeck_publicbeta'],
+                                env=self.env, text=True, capture_output=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(['https://client-update.steamstatic.com/steam_client_steamdeck_publicbeta_linuxarm64'],
+                         self.requests.read_text().splitlines())
+
     def test_a_cdn_that_does_not_answer_hands_over_to_the_next_one(self):
         akamai = 'https://client-update.akamai.steamstatic.com'
         self.assert_installed(fail_host='client-update.steamstatic.com', expected=[
@@ -138,7 +174,10 @@ cp "$TEST_CDN/${url##*/}" "$out"
         self.assert_installed()
         self.assertEqual('repaired\n', (package / 'droiddeck-unconfirmed').read_text())
         self.assertFalse((self.steam / '.crash').exists())
-        self.assertEqual([], sorted(p.name for p in package.glob('steam_client_*')))
+        self.assertEqual(['steam_client_steamdeck_publicbeta_linuxarm64.manifest'],
+                         sorted(p.name for p in package.glob('steam_client_*')))
+        self.assertEqual((self.cdn / 'steam_client_steamdeck_publicbeta_linuxarm64').read_bytes(),
+                         (package / 'steam_client_steamdeck_publicbeta_linuxarm64.manifest').read_bytes())
         self.assertEqual(['bins_linuxarm64.zip.vz.', 'strings_all.zip.'],
                          sorted(p.name[:p.name.rindex('.') + 1] for p in package.glob('*.zip.*')))
 
