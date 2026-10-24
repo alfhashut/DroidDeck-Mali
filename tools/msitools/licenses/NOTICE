@@ -13,5 +13,7 @@ builds, unchanged:
                              (7zip-License, 7zip-unRarLicense); https://7-zip.org/
 
 The packages and their sources: https://github.com/Droid-Deck/DroidDeck/releases/tag/msitools-0.106-r1
-(7-Zip from Arch Linux ARM's mirror, see tools/msitools/packages.txt),
+(7-Zip is the unchanged Arch Linux ARM package retained at
+https://github.com/Droid-Deck/DroidDeck-Components/releases/tag/build-dependency-7zip-26.04-r1;
+see tools/msitools/packages.txt for the pinned download and SHA-256),
 https://github.com/archlinuxarm/PKGBUILDs. The licence texts are beside this file.
